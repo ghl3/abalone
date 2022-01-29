@@ -1,6 +1,3 @@
-
-
-
 // Representation of an Abalone board
 // Optimized for speed.
 
@@ -21,15 +18,13 @@ type Circle = u8;
 //    X X X X X X
 //     X X X X X
 pub struct Board {
-    circles: [Circle; 61]
+    circles: [Circle; 61],
 }
-
 
 // Implementation block, all `Point` associated functions & methods go in here
 impl Board {
-
     pub fn new() -> Board {
-        Board{ circles: [0; 61]}
+        Board { circles: [0; 61] }
     }
 
     pub fn row(&self) -> &[Circle] {
