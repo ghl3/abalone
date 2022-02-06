@@ -1,9 +1,4 @@
-// Representation of an Abalone board
-// Optimized for speed.
-
-//struct Row<const ROWSIZE: usize> {
-//    circles: [u8; ROWSIZE]
-//}
+// Representation of an Abalone board.
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -76,7 +71,7 @@ impl Board {
         }
     }
 
-    pub fn get_highest_column(row: &Row) -> Column {
+    pub fn get_highest_column(row: Row) -> Column {
         match row {
             Row::ONE => Column::FIVE,
             Row::TWO => Column::SIX,
@@ -188,7 +183,7 @@ impl Board {
         }
     }
 
-    pub fn row(&self, row: &Row) -> &[Circle] {
+    pub fn row(&self, row: Row) -> &[Circle] {
         match row {
             Row::ONE => &self.row1,
             Row::TWO => &self.row2,
@@ -202,11 +197,11 @@ impl Board {
         }
     }
 
-    pub fn circle(&self, row: &Row, column: &Column) -> Option<Circle> {
-        if *column > Board::get_highest_column(row) {
+    pub fn circle(&self, row: Row, column: Column) -> Option<Circle> {
+        if column > Board::get_highest_column(row) {
             Option::None
         } else {
-            Option::Some(self.row(row)[Board::column_index(*column)])
+            Option::Some(self.row(row)[Board::column_index(column)])
         }
     }
 }
