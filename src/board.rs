@@ -1,13 +1,13 @@
 // Representation of an Abalone board.
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
     EMPTY,
     BLACK,
     WHITE,
 }
 
-#[derive(Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Row {
     ONE,
     TWO,
@@ -20,7 +20,7 @@ pub enum Row {
     NINE,
 }
 
-#[derive(Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Column {
     ONE,
     TWO,
@@ -203,5 +203,27 @@ impl Board {
         } else {
             Option::Some(self.row(row)[Board::column_index(column)])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::board::{Board, Circle, Column, Row};
+
+    #[test]
+    fn get_circle() {
+        assert_eq!(
+            Board::starting_board().circle(Row::ONE, Column::ONE),
+            Some(Circle::WHITE)
+        );
+        assert_eq!(
+            Board::starting_board().circle(Row::FIVE, Column::ONE),
+            Some(Circle::EMPTY)
+        );
+        assert_eq!(
+            Board::starting_board().circle(Row::NINE, Column::ONE),
+            Some(Circle::BLACK)
+        );
+        assert_eq!(Board::starting_board().circle(Row::ONE, Column::NINE), None);
     }
 }
