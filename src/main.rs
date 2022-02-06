@@ -1,6 +1,6 @@
 mod board;
 
 fn main() {
-    let b = board::Board::new();
+    let _b = board::Board::starting_board();
     println!("Hello, world!");
 }
