@@ -1,16 +1,6 @@
 // Representation of an Abalone board.
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Color {
-    Black,
-    White,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Circle {
-    Empty,
-    Filled(Color),
-}
+use crate::pieces::{Circle, Color, Direction, PieceMove};
 
 #[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Row {
@@ -38,26 +28,22 @@ pub enum Column {
     NINE,
 }
 
-// Number of spaces:   61
-//     X X X X X       5
-//    X X X X X X      6
-//   X X X X X X X     7
-//  X X X X X X X X    8
-// X X X X X X X X X   9
-//  X X X X X X X X    8
-//   X X X X X X X     7
-//    X X X X X X      6
-//     X X X X X       5
-pub struct Board {
-    row1: [Circle; 5],
-    row2: [Circle; 6],
-    row3: [Circle; 7],
-    row4: [Circle; 8],
-    row5: [Circle; 9],
-    row6: [Circle; 8],
-    row7: [Circle; 7],
-    row8: [Circle; 6],
-    row9: [Circle; 5],
+#[derive(Debug, Clone, Copy)]
+pub struct Position {
+    pub row: Row,
+    pub column: Column,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Color {
+    Black,
+    White,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Circle {
+    Empty,
+    Filled(Color),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,13 +57,7 @@ pub enum Direction {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Position {
-    row: Row,
-    column: Column,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Span {
+pub enum PieceGroup {
     // A single circle
     Single(Color, Position),
     // Two connected circles, specified by the
@@ -88,18 +68,51 @@ pub enum Span {
     Triple(Color, Position, Direction),
 }
 
+impl PieceGroup {
+    pub fn color(&self) -> Color {
+        match self {
+            PieceGroup::Single(color, _) => color.clone(),
+            PieceGroup::Double(color, _, _) => color.clone(),
+            PieceGroup::Triple(color, _, _) => color.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PieceMove {
     // The position of the connected circles
-    span: Span,
+    pub pieces: PieceGroup,
     // The movement direction
-    direction: Direction,
+    pub direction: Direction,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum MoveResult {
     Invalid,
     Valid,
+}
+
+// Number of spaces:   61
+//     X X X X X       5
+//    X X X X X X      6
+//   X X X X X X X     7
+//  X X X X X X X X    8
+// X X X X X X X X X   9
+//  X X X X X X X X    8
+//   X X X X X X X     7
+//    X X X X X X      6
+//     X X X X X       5
+#[derive(Debug, PartialEq, Eq)]
+pub struct Board {
+    row1: [Circle; 5],
+    row2: [Circle; 6],
+    row3: [Circle; 7],
+    row4: [Circle; 8],
+    row5: [Circle; 9],
+    row6: [Circle; 8],
+    row7: [Circle; 7],
+    row8: [Circle; 6],
+    row9: [Circle; 5],
 }
 
 // Implementation block, all `Point` associated functions & methods go in here
@@ -256,16 +269,18 @@ impl Board {
         Option::None
     }
 
-    pub fn span_exists(&self, span: Span) -> bool {
-        match span {
-            Span::Single(color, position) => self.circle(position) == Some(Circle::Filled(color)),
-            Span::Double(color, position, direction) => {
+    pub fn pieces_exist(&self, pieces: PieceGroup) -> bool {
+        match pieces {
+            PieceGroup::Single(color, position) => {
+                self.circle(position) == Some(Circle::Filled(color))
+            }
+            PieceGroup::Double(color, position, direction) => {
                 match Board::get_new_position(position, direction, 1) {
                     None => false,
                     Some(new_position) => self.circle(new_position) == Some(Circle::Filled(color)),
                 }
             }
-            Span::Triple(color, position, direction) => {
+            PieceGroup::Triple(color, position, direction) => {
                 match (
                     Board::get_new_position(position, direction, 1),
                     Board::get_new_position(position, direction, 2),
