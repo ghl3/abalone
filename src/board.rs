@@ -1,38 +1,7 @@
 // Representation of an Abalone board.
 
 use crate::pieces::{Circle, Color, Direction, PieceMove};
-
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
-pub enum Row {
-    ONE,
-    TWO,
-    THREE,
-    FOUR,
-    FIVE,
-    SIX,
-    SEVEN,
-    EIGHT,
-    NINE,
-}
-
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
-pub enum Column {
-    ONE,
-    TWO,
-    THREE,
-    FOUR,
-    FIVE,
-    SIX,
-    SEVEN,
-    EIGHT,
-    NINE,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Position {
-    pub row: Row,
-    pub column: Column,
-}
+use crate::positions::{Diagonal, Position};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Color {
@@ -46,8 +15,67 @@ pub enum Circle {
     Filled(Color),
 }
 
+// The board is defined as a series of south-east to north-west diagonals,
+// by convention, whose lengths start at 5, go up to 9, and then back
+// down to 5.
+//
+//      I O O O O O
+//     H O O O O O O
+//    G + + O O O + +
+//   F + + + + + + + +
+//  E + + + + + + + + +
+//   D + + + + + + + + 9
+//    C + + @ @ @ + + 8
+//     B @ @ @ @ @ @ 7
+//      A @ @ @ @ @ 6
+//         1 2 3 4 5
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Board {
+    one: [Circle; 5],
+    two: [Circle; 6],
+    three: [Circle; 7],
+    four: [Circle; 8],
+    five: [Circle; 9],
+    six: [Circle; 8],
+    seven: [Circle; 7],
+    eight: [Circle; 6],
+    nine: [Circle; 5],
+}
+
+// https://cardgamedatabase.fandom.com/wiki/Abalone_(board_game)#Move_notation
+//
+// A popular notation: An inline move can be denoted by the movement of the
+// trailing marble. Broadside moves can be denoted by the initial positions
+// of the two extremities of the row followed by the final position of the
+// first one (thus, with this notation, each broadside move has two notations
+// possible, which could be avoided).
+//
+// https://project.dke.maastrichtuniversity.nl/games/files/msc/pcreport.pdf
+//
+// A move can also be represented using this notation. A simple notation can
+// be used for inline moves. Only the field occupied by the last marble to move
+// is noted followed by the field the marble is moved to.
+//
+// To notate a broadside move one has to refer to three fields. First of all one
+// mentions the first and the last field of marbles in a row that are moved. The
+// third field that is noted indicates the new field for the marble mentioned first.
+
 #[derive(Debug, Clone, Copy)]
-pub enum Direction {
+pub enum Movement {
+    // The first position is the starting position of the trailing marble (or
+    // possibly the only marble).  The second position is the ending point of that
+    // same marble.  The movement of all other marbles is implied.
+    RowMove(Position, Position),
+
+    // The first position is one end point of a series of marbles.  The
+    // second position is the other end point of that series of marbles.
+    // The third position is the final position of the first end point.
+    BroadsideMove(Position, Position, Position),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
     NorthEast,
     NorthWest,
     East,
@@ -56,148 +84,70 @@ pub enum Direction {
     West,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum PieceGroup {
-    // A single circle
-    Single(Color, Position),
-    // Two connected circles, specified by the
-    // position of one circle and the direction to the connected circle
-    Double(Color, Position, Direction),
-    // Three connected circles, specified by the
-    // position of one circle and the direction to the two connected circle
-    Triple(Color, Position, Direction),
+pub struct PieceGroup {
+    start: Position,
+    end: Position,
+    num_marbles: i8,
 }
 
-impl PieceGroup {
-    pub fn color(&self) -> Color {
-        match self {
-            PieceGroup::Single(color, _) => color.clone(),
-            PieceGroup::Double(color, _, _) => color.clone(),
-            PieceGroup::Triple(color, _, _) => color.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PieceMove {
-    // The position of the connected circles
+pub struct InterpretedMove {
+    pub movement: Movement,
+    pub color: Color,
     pub pieces: PieceGroup,
-    // The movement direction
     pub direction: Direction,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum MoveResult {
     Invalid,
-    Valid,
-}
-
-// Number of spaces:   61
-//     X X X X X       5
-//    X X X X X X      6
-//   X X X X X X X     7
-//  X X X X X X X X    8
-// X X X X X X X X X   9
-//  X X X X X X X X    8
-//   X X X X X X X     7
-//    X X X X X X      6
-//     X X X X X       5
-#[derive(Debug, PartialEq, Eq)]
-pub struct Board {
-    row1: [Circle; 5],
-    row2: [Circle; 6],
-    row3: [Circle; 7],
-    row4: [Circle; 8],
-    row5: [Circle; 9],
-    row6: [Circle; 8],
-    row7: [Circle; 7],
-    row8: [Circle; 6],
-    row9: [Circle; 5],
+    Valid(InterpretedMove),
 }
 
 // Implementation block, all `Point` associated functions & methods go in here
 impl Board {
-    pub fn column_index(col: Column) -> usize {
-        match col {
-            Column::ONE => 1,
-            Column::TWO => 2,
-            Column::THREE => 3,
-            Column::FOUR => 4,
-            Column::FIVE => 5,
-            Column::SIX => 6,
-            Column::SEVEN => 7,
-            Column::EIGHT => 8,
-            Column::NINE => 9,
-        }
-    }
-
-    pub fn get_highest_column(row: Row) -> Column {
-        match row {
-            Row::ONE => Column::FIVE,
-            Row::TWO => Column::SIX,
-            Row::THREE => Column::SEVEN,
-            Row::FOUR => Column::EIGHT,
-            Row::FIVE => Column::NINE,
-            Row::SIX => Column::EIGHT,
-            Row::SEVEN => Column::SEVEN,
-            Row::EIGHT => Column::SIX,
-            Row::NINE => Column::FIVE,
-        }
-    }
-
     pub fn empty_board() -> Board {
         Board {
-            row1: [Circle::Empty; 5],
-            row2: [Circle::Empty; 6],
-            row3: [Circle::Empty; 7],
-            row4: [Circle::Empty; 8],
-            row5: [Circle::Empty; 9],
-            row6: [Circle::Empty; 8],
-            row7: [Circle::Empty; 7],
-            row8: [Circle::Empty; 6],
-            row9: [Circle::Empty; 5],
+            one: [Circle::Empty; 5],
+            two: [Circle::Empty; 6],
+            three: [Circle::Empty; 7],
+            four: [Circle::Empty; 8],
+            five: [Circle::Empty; 9],
+            six: [Circle::Empty; 8],
+            seven: [Circle::Empty; 7],
+            eight: [Circle::Empty; 6],
+            nine: [Circle::Empty; 5],
         }
     }
 
+    //
+    //      I O O O O O
+    //     H O O O O O O
+    //    G + + O O O + +
+    //   F + + + + + + + +
+    //  E + + + + + + + + +
+    //   D + + + + + + + + 9
+    //    C + + @ @ @ + + 8
+    //     B @ @ @ @ @ @ 7
+    //      A @ @ @ @ @ 6
+    //         1 2 3 4 5
     pub fn starting_board() -> Board {
         Board {
-            row1: [
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-            ],
-            row2: [
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-            ],
-            row3: [
-                Circle::Empty,
-                Circle::Empty,
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Empty,
-                Circle::Empty,
-            ],
-            row4: [
-                Circle::Empty,
-                Circle::Empty,
-                Circle::Filled(Color::White),
+            one: [
                 Circle::Filled(Color::White),
                 Circle::Filled(Color::White),
                 Circle::Empty,
                 Circle::Empty,
                 Circle::Empty,
             ],
-            row5: [
+            two: [
+                Circle::Filled(Color::White),
+                Circle::Filled(Color::White),
                 Circle::Empty,
                 Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+            ],
+            three: [
                 Circle::Filled(Color::White),
                 Circle::Filled(Color::White),
                 Circle::Filled(Color::White),
@@ -206,93 +156,118 @@ impl Board {
                 Circle::Empty,
                 Circle::Empty,
             ],
-            row6: [
-                Circle::Empty,
-                Circle::Empty,
+            four: [
                 Circle::Filled(Color::White),
                 Circle::Filled(Color::White),
                 Circle::Filled(Color::White),
                 Circle::Empty,
                 Circle::Empty,
                 Circle::Empty,
+                Circle::Empty,
+                Circle::Filled(Color::Black),
             ],
-            row7: [
+            five: [
+                Circle::Filled(Color::White),
+                Circle::Filled(Color::White),
+                Circle::Filled(Color::White),
                 Circle::Empty,
                 Circle::Empty,
-                Circle::Filled(Color::Black),
-                Circle::Filled(Color::Black),
-                Circle::Filled(Color::Black),
                 Circle::Empty,
-                Circle::Empty,
-            ],
-            row8: [
-                Circle::Filled(Color::Black),
-                Circle::Filled(Color::Black),
-                Circle::Filled(Color::Black),
                 Circle::Filled(Color::Black),
                 Circle::Filled(Color::Black),
                 Circle::Filled(Color::Black),
             ],
-            row9: [
+            six: [
+                Circle::Filled(Color::Black),
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Filled(Color::White),
+                Circle::Filled(Color::White),
+                Circle::Filled(Color::White),
+            ],
+            seven: [
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
                 Circle::Filled(Color::Black),
                 Circle::Filled(Color::Black),
                 Circle::Filled(Color::Black),
+            ],
+            eight: [
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Filled(Color::Black),
+                Circle::Filled(Color::Black),
+            ],
+            nine: [
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
                 Circle::Filled(Color::Black),
                 Circle::Filled(Color::Black),
             ],
         }
     }
 
-    pub fn row(&self, row: Row) -> &[Circle] {
+    pub fn diagonal(&self, diagonal: Diagonal) -> &[Circle] {
         match row {
-            Row::ONE => &self.row1,
-            Row::TWO => &self.row2,
-            Row::THREE => &self.row3,
-            Row::FOUR => &self.row4,
-            Row::FIVE => &self.row5,
-            Row::SIX => &self.row6,
-            Row::SEVEN => &self.row8,
-            Row::EIGHT => &self.row8,
-            Row::NINE => &self.row9,
+            Diagonal::ONE => &self.one,
+            Diagonal::TWO => &self.two,
+            Diagonal::THREE => &self.three,
+            Diagonal::FOUR => &self.four,
+            Diagonal::FIVE => &self.five,
+            Diagonal::SIX => &self.six,
+            Diagonal::SEVEN => &self.seven,
+            Diagonal::EIGHT => &self.eight,
+            Diagonal::NINE => &self.nine,
         }
     }
 
-    pub fn circle(&self, Position { row, column }: Position) -> Option<Circle> {
-        if column > Board::get_highest_column(row) {
-            Option::None
-        } else {
-            Option::Some(self.row(row)[Board::column_index(column)])
+    pub fn circle(&self, position: Position) -> Circle {
+        let (diagonal, row) = position.get_diagonal_row();
+        self.diagonal(diagonal)[row.index()]
+    }
+
+    fn interpret_move(&self, movement: Movement) -> Option<InterpretedMove> {
+        match movement {
+            Movement::RowMove(starting_position, ending_position) => {
+                self.interpret_row_move(starting_position, ending_position)
+            }
+            Movement::BroadsideMove(group_start, group_end, new_position) => {
+                self.interpret_broadside_move(group_start, group_end, new_position)
+            }
         }
     }
 
-    pub fn get_new_position(position: Position, direction: Direction, num: i8) -> Option<Position> {
+    fn interpret_row_move(
+        &self,
+        starting_position: Position,
+        ending_position: Position,
+    ) -> Option<InterpretedMove> {
+        // First, we ensure there is a circle
+
+        match self.circle(starting_position) {
+            Circle::Empty => Option::None,
+
+            Option::Filled(color) => {
+                // TODO: Convert this to an InterpretedMove
+                Option::None
+            }
+        }
+    }
+
+    fn interpret_broadside_move(
+        &self,
+        group_start: Position,
+        group_end: Position,
+        new_position: Position,
+    ) -> Option<InterpretedMove> {
         Option::None
-    }
-
-    pub fn pieces_exist(&self, pieces: PieceGroup) -> bool {
-        match pieces {
-            PieceGroup::Single(color, position) => {
-                self.circle(position) == Some(Circle::Filled(color))
-            }
-            PieceGroup::Double(color, position, direction) => {
-                match Board::get_new_position(position, direction, 1) {
-                    None => false,
-                    Some(new_position) => self.circle(new_position) == Some(Circle::Filled(color)),
-                }
-            }
-            PieceGroup::Triple(color, position, direction) => {
-                match (
-                    Board::get_new_position(position, direction, 1),
-                    Board::get_new_position(position, direction, 2),
-                ) {
-                    (Some(first_position), Some(second_position)) => {
-                        self.circle(first_position) == Some(Circle::Filled(color))
-                            && self.circle(second_position) == Some(Circle::Filled(color))
-                    }
-                    _ => false,
-                }
-            }
-        }
     }
 
     pub fn apply_move(&mut self, piece_move: PieceMove) -> MoveResult {
