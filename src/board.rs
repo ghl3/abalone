@@ -28,6 +28,19 @@ pub enum Circle {
 //      A @ @ @ @ @ 6
 //         1 2 3 4 5
 
+// Or, arranged horizontally:
+//
+//     I         O O O O O
+//     H       O O O O O O
+//     G     + + O O O + +
+//     F   + + + + + + + +
+//     E + + + + + + + + +
+//     D + + + + + + + +
+//     C + + @ @ @ + +
+//     B @ @ @ @ @ @
+//     A @ @ @ @ @
+//       1 2 3 4 5 6 7 8 9
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Board {
     one: [Circle; 5],
@@ -240,9 +253,30 @@ mod tests {
             Circle::Filled(Color::White)
         );
         assert_eq!(Board::starting_board().circle(Position::D1), Circle::Empty);
-
         assert_eq!(
             Board::starting_board().circle(Position::H6),
+            Circle::Filled(Color::Black)
+        );
+        assert_eq!(Board::starting_board().circle(Position::C2), Circle::Empty);
+        assert_eq!(
+            Board::starting_board().circle(Position::C3),
+            Circle::Filled(Color::White)
+        );
+        assert_eq!(
+            Board::starting_board().circle(Position::C5),
+            Circle::Filled(Color::White)
+        );
+        assert_eq!(Board::starting_board().circle(Position::C6), Circle::Empty);
+
+        assert_eq!(Board::starting_board().circle(Position::G4), Circle::Empty);
+
+        assert_eq!(
+            Board::starting_board().circle(Position::G5),
+            Circle::Filled(Color::Black)
+        );
+
+        assert_eq!(
+            Board::starting_board().circle(Position::I5),
             Circle::Filled(Color::Black)
         );
     }
