@@ -2,10 +2,8 @@
 // Marble: A physical piece.  Has a specific color
 // Circle: A position on the board.  Defined by a Row and a Diagonal (or just a Position)
 
-use crate::piece_move::{
-    BroadsideMove, Color, Direction, InterpretedMove, PieceGroup, PieceMove, RowMove,
-};
-use crate::positions::{Diagonal, Position};
+use crate::piece_move::{BroadsideMove, Color, InterpretedMove, PieceGroup, PieceMove, RowMove};
+use crate::positions::{Diagonal, Direction, Position};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -200,10 +198,6 @@ impl Board {
         }
     }
 
-    fn get_direction_and_distance(start: Position, end: Position) -> Option<(Direction, usize)> {
-        Option::None
-    }
-
     fn interpret_row_move(&self, row_move: RowMove) -> Option<InterpretedMove> {
         // First, get the marble corresponding
         let Circle::Filled(color) = self.circle(row_move.starting_position) else {
@@ -211,7 +205,7 @@ impl Board {
         };
 
         let Option::Some((direction, distance))  =
-            Board::get_direction_and_distance(row_move.starting_position, row_move.ending_position) else {
+           row_move.starting_position.get_direction_and_distance(row_move.ending_position) else {
             return Option::None;
         };
 

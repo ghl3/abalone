@@ -16,7 +16,7 @@
 // mentions the first and the last field of marbles in a row that are moved. The
 // third field that is noted indicates the new field for the marble mentioned first.
 
-use crate::positions::Position;
+use crate::positions::{Direction, Position};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Color {
@@ -49,16 +49,6 @@ pub struct BroadsideMove {
 pub enum PieceMove {
     RowMove(RowMove),
     BroadsideMove(BroadsideMove),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Direction {
-    NorthEast,
-    NorthWest,
-    East,
-    SouthEast,
-    SouthWest,
-    West,
 }
 
 #[derive(Debug, Clone, Copy)]

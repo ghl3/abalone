@@ -54,6 +54,20 @@ pub enum Diagonal {
 }
 
 impl Diagonal {
+    pub fn index(&self) -> usize {
+        match &self {
+            Diagonal::ONE => 0,
+            Diagonal::TWO => 1,
+            Diagonal::THREE => 2,
+            Diagonal::FOUR => 3,
+            Diagonal::FIVE => 4,
+            Diagonal::SIX => 5,
+            Diagonal::SEVEN => 6,
+            Diagonal::EIGHT => 7,
+            Diagonal::NINE => 8,
+        }
+    }
+
     pub fn get_highest_row(&self) -> Row {
         match self {
             Diagonal::ONE => Row::E,
@@ -101,7 +115,17 @@ impl Diagonal {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    NorthEast,
+    NorthWest,
+    East,
+    SouthEast,
+    SouthWest,
+    West,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Position {
     A1,
     A2,
@@ -239,5 +263,150 @@ impl Position {
             Position::I8 => (Diagonal::EIGHT, Row::I),
             Position::I9 => (Diagonal::NINE, Row::I),
         }
+    }
+
+    fn row(&self) -> Row {
+        let (_, row) = self.get_diagonal_row();
+        row
+    }
+
+    fn diagonal(&self) -> Diagonal {
+        let (diagonal, _) = self.get_diagonal_row();
+        diagonal
+    }
+
+    fn has_same_row(&self, other: Position) -> bool {
+        let (_, row) = self.get_diagonal_row();
+        let (_, other_row) = other.get_diagonal_row();
+
+        row == other_row
+    }
+
+    fn has_same_diagonal(&self, other: Position) -> bool {
+        let (diagonal, row) = self.get_diagonal_row();
+        let (other_diagonal, other_row) = other.get_diagonal_row();
+
+        if diagonal == other_diagonal {
+            return true;
+        }
+
+        let (diagonal_index, row_index) = (diagonal.index(), row.index());
+        let (other_diagonal_index, other_row_index) = (other_diagonal.index(), other_row.index());
+
+        if (other_diagonal_index > diagonal_index) {
+            return other_row_index > row_index
+                && other_diagonal_index - diagonal_index == other_row_index - row_index;
+        } else {
+            return row_index > other_row_index
+                && diagonal_index - other_diagonal_index == row_index - other_row_index;
+        }
+
+        //    return other_diagonal_index - diagonal_index == other_row_index - row_index;
+    }
+
+    // Given a starting and an ending point, returns the direction and number of circles
+    // needed to traverse to go from the start to the end point.  If there is no straight line
+    // between the two, returns an empty optional.
+    pub fn get_direction_and_distance(&self, other: Position) -> Option<(Direction, usize)> {
+        if other == *self {
+            return Option::None;
+        } else if self.has_same_row(other) {
+            if self.diagonal() > other.diagonal() {
+                let delta: usize = self.diagonal().index() - other.diagonal().index();
+                Option::Some((Direction::West, delta))
+            } else {
+                let delta: usize = other.diagonal().index() - self.diagonal().index();
+                Option::Some((Direction::East, delta))
+            }
+        } else if self.has_same_diagonal(other) && self.diagonal() == other.diagonal() {
+            // They are on the same North-West to South-East Diagonal
+            if other.row() > self.row() {
+                let delta: usize = other.row().index() - self.row().index();
+                Option::Some((Direction::NorthWest, delta))
+            } else {
+                let delta: usize = self.row().index() - other.row().index();
+                Option::Some((Direction::SouthEast, delta))
+            }
+        } else if self.has_same_diagonal(other) {
+            // They are on the same North-West to South-East Diagonal
+            if other.row() > self.row() {
+                let delta: usize = other.row().index() - self.row().index();
+                Option::Some((Direction::NorthEast, delta))
+            } else {
+                let delta: usize = self.row().index() - other.row().index();
+                Option::Some((Direction::SouthWest, delta))
+            }
+        } else {
+            Option::None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::positions::{Direction, Position};
+
+    #[test]
+    fn test_same_row() {
+        assert!(Position::A1.has_same_row(Position::A2));
+        assert!(!Position::A1.has_same_row(Position::B2));
+        assert!(Position::H4.has_same_row(Position::H8));
+    }
+
+    #[test]
+    fn test_same_diagonal() {
+        assert!(Position::A1.has_same_diagonal(Position::B2));
+        assert!(Position::A3.has_same_diagonal(Position::B3));
+        assert!(Position::A1.has_same_diagonal(Position::B2));
+        assert!(Position::A1.has_same_diagonal(Position::I9));
+        assert!(Position::E1.has_same_diagonal(Position::I5));
+
+        assert!(!Position::A1.has_same_diagonal(Position::A2));
+        assert!(!Position::B2.has_same_diagonal(Position::G4));
+    }
+
+    #[test]
+    fn test_get_direction_and_distance() {
+        assert_eq!(
+            Position::A1.get_direction_and_distance(Position::A2),
+            Some((Direction::East, 1))
+        );
+
+        assert_eq!(
+            Position::A1.get_direction_and_distance(Position::A5),
+            Some((Direction::East, 4))
+        );
+
+        assert_eq!(
+            Position::F2.get_direction_and_distance(Position::F9),
+            Some((Direction::East, 7))
+        );
+
+        assert_eq!(
+            Position::E6.get_direction_and_distance(Position::E2),
+            Some((Direction::West, 4))
+        );
+
+        assert_eq!(Position::F2.get_direction_and_distance(Position::G9), None);
+
+        assert_eq!(
+            Position::A1.get_direction_and_distance(Position::B2),
+            Some((Direction::NorthEast, 1))
+        );
+
+        assert_eq!(
+            Position::B4.get_direction_and_distance(Position::G4),
+            Some((Direction::NorthWest, 5))
+        );
+
+        assert_eq!(
+            Position::H6.get_direction_and_distance(Position::E6),
+            Some((Direction::SouthEast, 3))
+        );
+
+        assert_eq!(
+            Position::B2.get_direction_and_distance(Position::A1),
+            Some((Direction::SouthWest, 1))
+        );
     }
 }
