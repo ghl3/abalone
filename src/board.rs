@@ -1,13 +1,11 @@
 // Representation of an Abalone board.
+// Marble: A physical piece.  Has a specific color
+// Circle: A position on the board.  Defined by a Row and a Diagonal (or just a Position)
 
-use crate::pieces::{Circle, Color, Direction, PieceMove};
+use crate::piece_move::{
+    BroadsideMove, Color, Direction, InterpretedMove, PieceGroup, PieceMove, RowMove,
+};
 use crate::positions::{Diagonal, Position};
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Color {
-    Black,
-    White,
-}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -43,60 +41,6 @@ pub struct Board {
     nine: [Circle; 5],
 }
 
-// https://cardgamedatabase.fandom.com/wiki/Abalone_(board_game)#Move_notation
-//
-// A popular notation: An inline move can be denoted by the movement of the
-// trailing marble. Broadside moves can be denoted by the initial positions
-// of the two extremities of the row followed by the final position of the
-// first one (thus, with this notation, each broadside move has two notations
-// possible, which could be avoided).
-//
-// https://project.dke.maastrichtuniversity.nl/games/files/msc/pcreport.pdf
-//
-// A move can also be represented using this notation. A simple notation can
-// be used for inline moves. Only the field occupied by the last marble to move
-// is noted followed by the field the marble is moved to.
-//
-// To notate a broadside move one has to refer to three fields. First of all one
-// mentions the first and the last field of marbles in a row that are moved. The
-// third field that is noted indicates the new field for the marble mentioned first.
-
-#[derive(Debug, Clone, Copy)]
-pub enum Movement {
-    // The first position is the starting position of the trailing marble (or
-    // possibly the only marble).  The second position is the ending point of that
-    // same marble.  The movement of all other marbles is implied.
-    RowMove(Position, Position),
-
-    // The first position is one end point of a series of marbles.  The
-    // second position is the other end point of that series of marbles.
-    // The third position is the final position of the first end point.
-    BroadsideMove(Position, Position, Position),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Direction {
-    NorthEast,
-    NorthWest,
-    East,
-    SouthEast,
-    SouthWest,
-    West,
-}
-
-pub struct PieceGroup {
-    start: Position,
-    end: Position,
-    num_marbles: i8,
-}
-
-pub struct InterpretedMove {
-    pub movement: Movement,
-    pub color: Color,
-    pub pieces: PieceGroup,
-    pub direction: Direction,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum MoveResult {
     Invalid,
@@ -105,6 +49,12 @@ pub enum MoveResult {
 
 // Implementation block, all `Point` associated functions & methods go in here
 impl Board {
+    pub fn circle(&self, position: Position) -> Circle {
+        let (diagonal, row) = position.get_diagonal_row();
+        let index = diagonal.get_index_of_row(row);
+        self.diagonal(diagonal)[index]
+    }
+
     pub fn empty_board() -> Board {
         Board {
             one: [Circle::Empty; 5],
@@ -178,14 +128,14 @@ impl Board {
                 Circle::Filled(Color::Black),
             ],
             six: [
+                Circle::Filled(Color::White),
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
+                Circle::Empty,
                 Circle::Filled(Color::Black),
-                Circle::Empty,
-                Circle::Empty,
-                Circle::Empty,
-                Circle::Empty,
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
-                Circle::Filled(Color::White),
+                Circle::Filled(Color::Black),
+                Circle::Filled(Color::Black),
             ],
             seven: [
                 Circle::Empty,
@@ -215,7 +165,7 @@ impl Board {
     }
 
     pub fn diagonal(&self, diagonal: Diagonal) -> &[Circle] {
-        match row {
+        match diagonal {
             Diagonal::ONE => &self.one,
             Diagonal::TWO => &self.two,
             Diagonal::THREE => &self.three,
@@ -228,45 +178,49 @@ impl Board {
         }
     }
 
-    pub fn circle(&self, position: Position) -> Circle {
-        let (diagonal, row) = position.get_diagonal_row();
-        self.diagonal(diagonal)[row.index()]
-    }
-
-    fn interpret_move(&self, movement: Movement) -> Option<InterpretedMove> {
-        match movement {
-            Movement::RowMove(starting_position, ending_position) => {
-                self.interpret_row_move(starting_position, ending_position)
-            }
-            Movement::BroadsideMove(group_start, group_end, new_position) => {
-                self.interpret_broadside_move(group_start, group_end, new_position)
+    fn interpret_move(&self, piece_move: PieceMove) -> Option<InterpretedMove> {
+        match piece_move {
+            PieceMove::RowMove(row_move) => self.interpret_row_move(row_move),
+            PieceMove::BroadsideMove(broadside_move) => {
+                self.interpret_broadside_move(broadside_move)
             }
         }
     }
 
-    fn interpret_row_move(
-        &self,
-        starting_position: Position,
-        ending_position: Position,
-    ) -> Option<InterpretedMove> {
-        // First, we ensure there is a circle
-
-        match self.circle(starting_position) {
-            Circle::Empty => Option::None,
-
-            Option::Filled(color) => {
-                // TODO: Convert this to an InterpretedMove
-                Option::None
-            }
-        }
+    fn get_direction_and_distance(start: Position, end: Position) -> Option<(Direction, usize)> {
+        Option::None
     }
 
-    fn interpret_broadside_move(
-        &self,
-        group_start: Position,
-        group_end: Position,
-        new_position: Position,
-    ) -> Option<InterpretedMove> {
+    fn interpret_row_move(&self, row_move: RowMove) -> Option<InterpretedMove> {
+        // First, get the marble corresponding
+        let Circle::Filled(color) = self.circle(row_move.starting_position) else {
+            return Option::None;
+        };
+
+        let Option::Some((direction, distance))  =
+            Board::get_direction_and_distance(row_move.starting_position, row_move.ending_position) else {
+            return Option::None;
+        };
+
+        if distance > 3 {
+            return Option::None;
+        }
+
+        // Ensure all marbles in the move have the same color and that the move is valid
+
+        Option::Some(InterpretedMove {
+            piece_move: PieceMove::RowMove(row_move),
+            color: color,
+            pieces: PieceGroup {
+                start: row_move.starting_position,
+                end: Position::A1,
+                num_marbles: 0,
+            },
+            direction: Direction::NorthEast,
+        })
+    }
+
+    fn interpret_broadside_move(&self, broadside_move: BroadsideMove) -> Option<InterpretedMove> {
         Option::None
     }
 
@@ -277,37 +231,21 @@ impl Board {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::{Board, Circle, Color, Column, Position, Row};
+    use crate::board::{Board, Circle, Color, Position};
 
     #[test]
     fn get_circle() {
+        /*
         assert_eq!(
-            Board::starting_board().circle(Position {
-                row: Row::ONE,
-                column: Column::ONE
-            }),
-            Some(Circle::Filled(Color::White))
+            Board::starting_board().circle(Position::A1),
+            Circle::Filled(Color::White)
         );
+        assert_eq!(Board::starting_board().circle(Position::D1), Circle::Empty);
+
+         */
         assert_eq!(
-            Board::starting_board().circle(Position {
-                row: Row::FIVE,
-                column: Column::ONE
-            }),
-            Some(Circle::Empty)
-        );
-        assert_eq!(
-            Board::starting_board().circle(Position {
-                row: Row::NINE,
-                column: Column::ONE
-            }),
-            Some(Circle::Filled(Color::Black))
-        );
-        assert_eq!(
-            Board::starting_board().circle(Position {
-                row: Row::ONE,
-                column: Column::NINE
-            }),
-            None
+            Board::starting_board().circle(Position::H6),
+            Circle::Filled(Color::Black)
         );
     }
 }

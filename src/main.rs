@@ -1,5 +1,8 @@
+#![feature(let_else)]
+
 mod board;
 mod game;
+mod piece_move;
 mod positions;
 
 fn main() {
