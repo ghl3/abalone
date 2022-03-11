@@ -235,14 +235,12 @@ mod tests {
 
     #[test]
     fn get_circle() {
-        /*
         assert_eq!(
             Board::starting_board().circle(Position::A1),
             Circle::Filled(Color::White)
         );
         assert_eq!(Board::starting_board().circle(Position::D1), Circle::Empty);
 
-         */
         assert_eq!(
             Board::starting_board().circle(Position::H6),
             Circle::Filled(Color::Black)
