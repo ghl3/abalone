@@ -4,6 +4,7 @@
 
 use crate::piece_move::{BroadsideMove, Color, InterpretedMove, PieceGroup, PieceMove, RowMove};
 use crate::positions::{Diagonal, Direction, Position};
+use std::thread::current;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -58,6 +59,15 @@ pub enum MoveResult {
     Valid(InterpretedMove),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RowMoveResult {
+    color: Color,
+    starting_position: Position,
+    direction: Direction,
+    num_same_color: usize,
+    num_opposite_color: usize,
+}
+
 // Implementation block, all `Point` associated functions & methods go in here
 impl Board {
     pub fn circle(&self, position: Position) -> Circle {
@@ -80,7 +90,6 @@ impl Board {
         }
     }
 
-    //
     //      I O O O O O
     //     H O O O O O O
     //    G + + O O O + +
@@ -198,10 +207,78 @@ impl Board {
         }
     }
 
-    fn can_move(&self, position: Position, direction: Direction, distance: usize) -> bool {
-        // Validate
+    fn can_move(
+        &self,
+        position: Position,
+        direction: Direction,
+        color: Color,
+    ) -> Option<RowMoveResult> {
+        // Starting at the position, we walk along the direction to see if a marble of a given
+        // color can move in that direction.
 
-        false
+        let mut current_position = position;
+
+        // We walk until we find the end
+        let mut still_same_color = true;
+        let mut num_same_colors = 1;
+        let mut num_opposite_colors = 0;
+
+        // We walk until we encounter:
+        // - A free space
+        // - The end of the board
+        // - A change in color
+        loop {
+            let Some(next_position) = current_position.neighbor(direction) else {
+                 // We encountered the end of the board
+                return None;
+            };
+
+            // Update the current position
+            current_position = next_position;
+
+            let current_circle = self.circle(current_position);
+
+            match current_circle {
+                // We found an empty space.  We can return true
+                Circle::Empty => {
+                    return Some(RowMoveResult {
+                        color: color,
+                        starting_position: position,
+                        direction: direction,
+                        num_same_color: num_same_colors,
+                        num_opposite_color: num_opposite_colors,
+                    })
+                }
+
+                Circle::Filled(current_color) => {
+                    if still_same_color && current_color == color {
+                        // We encountered the original color again.
+                        num_same_colors += 1;
+                    }
+
+                    if still_same_color && current_color != color {
+                        // We swapped colors
+
+                        num_opposite_colors += 1;
+                        still_same_color = false;
+                    }
+
+                    if !still_same_color && current_color == color {
+                        // We encountered the original color after the opposite color.
+                        // We cannot push through this.
+                        return None;
+                    }
+
+                    if num_same_colors > 3 {
+                        return None;
+                    }
+
+                    if num_opposite_colors > 3 {
+                        return None;
+                    }
+                }
+            }
+        }
     }
 
     fn interpret_row_move(&self, row_move: RowMove) -> Option<InterpretedMove> {
@@ -220,6 +297,9 @@ impl Board {
         }
 
         // Ensure all marbles in the move have the same color and that the move is valid
+        if self.can_move(row_move.starting_position, direction, color) == None {
+            return Option::None;
+        }
 
         Option::Some(InterpretedMove {
             piece_move: PieceMove::RowMove(row_move),
@@ -244,7 +324,8 @@ impl Board {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::{Board, Circle, Color, Position};
+    use crate::board::{Board, Circle, Color, Position, RowMoveResult};
+    use crate::positions::Direction;
 
     #[test]
     fn get_circle() {
@@ -278,6 +359,163 @@ mod tests {
         assert_eq!(
             Board::starting_board().circle(Position::I5),
             Circle::Filled(Color::Black)
+        );
+    }
+
+    #[test]
+    fn can_move() {
+        let board = Board::starting_board();
+
+        assert_eq!(
+            board.can_move(Position::A5, Direction::NorthWest, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::A5,
+                direction: Direction::NorthWest,
+                num_same_color: 3,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::B5, Direction::NorthWest, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::B5,
+                direction: Direction::NorthWest,
+                num_same_color: 2,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::C5, Direction::NorthWest, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::C5,
+                direction: Direction::NorthWest,
+                num_same_color: 1,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::A4, Direction::NorthEast, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::A4,
+                direction: Direction::NorthEast,
+                num_same_color: 2,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::B4, Direction::NorthEast, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::B4,
+                direction: Direction::NorthEast,
+                num_same_color: 2,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::C3, Direction::NorthEast, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::C3,
+                direction: Direction::NorthEast,
+                num_same_color: 1,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::C3, Direction::NorthWest, Color::White),
+            Some(RowMoveResult {
+                color: Color::White,
+                starting_position: Position::C3,
+                direction: Direction::NorthWest,
+                num_same_color: 1,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::B6, Direction::East, Color::White),
+            None
+        );
+
+        assert_eq!(
+            board.can_move(Position::B1, Direction::West, Color::White),
+            None
+        );
+
+        assert_eq!(
+            board.can_move(Position::I5, Direction::SouthEast, Color::Black),
+            Some(RowMoveResult {
+                color: Color::Black,
+                starting_position: Position::I5,
+                direction: Direction::SouthEast,
+                num_same_color: 3,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::I6, Direction::SouthEast, Color::Black),
+            Some(RowMoveResult {
+                color: Color::Black,
+                starting_position: Position::I6,
+                direction: Direction::SouthEast,
+                num_same_color: 3,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::H5, Direction::SouthEast, Color::Black),
+            Some(RowMoveResult {
+                color: Color::Black,
+                starting_position: Position::H5,
+                direction: Direction::SouthEast,
+                num_same_color: 2,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::F5, Direction::SouthEast, Color::Black),
+            Some(RowMoveResult {
+                color: Color::Black,
+                starting_position: Position::F5,
+                direction: Direction::SouthEast,
+                num_same_color: 1,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::H9, Direction::SouthWest, Color::Black),
+            Some(RowMoveResult {
+                color: Color::Black,
+                starting_position: Position::H9,
+                direction: Direction::SouthWest,
+                num_same_color: 1,
+                num_opposite_color: 0
+            })
+        );
+
+        assert_eq!(
+            board.can_move(Position::H9, Direction::East, Color::Black),
+            None
+        );
+
+        assert_eq!(
+            board.can_move(Position::I5, Direction::West, Color::Black),
+            None
         );
     }
 }

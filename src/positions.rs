@@ -467,7 +467,7 @@ impl Position {
         }
     }
 
-    fn neighbor(&self, direction: Direction) -> Option<Position> {
+    pub fn neighbor(&self, direction: Direction) -> Option<Position> {
         let (diagonal, row) = self.get_diagonal_row();
 
         match direction {
