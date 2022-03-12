@@ -51,6 +51,7 @@ pub enum PieceMove {
     BroadsideMove(BroadsideMove),
 }
 
+/*
 #[derive(Debug, Clone, Copy)]
 pub struct PieceGroup {
     pub start: Position,
@@ -58,12 +59,16 @@ pub struct PieceGroup {
     pub num_marbles: usize,
 }
 
+ */
+
 // The specific interpretation of an abstract PieceMove, given a game.  It provides additional
 // metadata that can be derived from a PieceMove given a game/board.
 #[derive(Debug, Clone, Copy)]
 pub struct InterpretedMove {
     pub piece_move: PieceMove,
+    pub starting_position: Position,
     pub color: Color,
-    pub pieces: PieceGroup,
     pub direction: Direction,
+    pub num_same_color: usize,
+    pub num_opposite_color: usize,
 }

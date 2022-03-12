@@ -287,7 +287,7 @@ impl Board {
             return Option::None;
         };
 
-        let Option::Some((direction, distance))  =
+        let Option::Some((direction, distance)) =
            row_move.starting_position.get_direction_and_distance(row_move.ending_position) else {
             return Option::None;
         };
@@ -297,19 +297,17 @@ impl Board {
         }
 
         // Ensure all marbles in the move have the same color and that the move is valid
-        if self.can_move(row_move.starting_position, direction, color) == None {
+        let Some(row_move_result) = self.can_move(row_move.starting_position, direction, color) else {
             return Option::None;
-        }
+        };
 
         Option::Some(InterpretedMove {
             piece_move: PieceMove::RowMove(row_move),
+            starting_position: row_move.starting_position,
             color: color,
-            pieces: PieceGroup {
-                start: row_move.starting_position,
-                end: Position::A1,
-                num_marbles: 0,
-            },
             direction: direction,
+            num_same_color: row_move_result.num_same_color,
+            num_opposite_color: row_move_result.num_opposite_color,
         })
     }
 
