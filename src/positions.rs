@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 // The notation for recording moves gives the letters A-I to the horizontal lines, and the numbers 1-9 to northwest-southeast diagonals.
 //
 //      I O O O O O
@@ -11,7 +13,7 @@
 //      A @ @ @ @ @ 6
 //         1 2 3 4 5
 
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub enum Row {
     A,
     B,
@@ -38,9 +40,37 @@ impl Row {
             Row::I => 8,
         }
     }
+
+    pub fn next(&self) -> Option<Row> {
+        match &self {
+            Row::A => Some(Row::B),
+            Row::B => Some(Row::C),
+            Row::C => Some(Row::D),
+            Row::D => Some(Row::E),
+            Row::E => Some(Row::F),
+            Row::F => Some(Row::G),
+            Row::G => Some(Row::H),
+            Row::H => Some(Row::I),
+            Row::I => None,
+        }
+    }
+
+    pub fn previous(&self) -> Option<Row> {
+        match &self {
+            Row::A => None,
+            Row::B => Some(Row::A),
+            Row::C => Some(Row::B),
+            Row::D => Some(Row::C),
+            Row::E => Some(Row::D),
+            Row::F => Some(Row::E),
+            Row::G => Some(Row::F),
+            Row::H => Some(Row::G),
+            Row::I => Some(Row::H),
+        }
+    }
 }
 
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub enum Diagonal {
     ONE,
     TWO,
@@ -65,6 +95,34 @@ impl Diagonal {
             Diagonal::SEVEN => 6,
             Diagonal::EIGHT => 7,
             Diagonal::NINE => 8,
+        }
+    }
+
+    pub fn next(&self) -> Option<Diagonal> {
+        match &self {
+            Diagonal::ONE => Some(Diagonal::TWO),
+            Diagonal::TWO => Some(Diagonal::THREE),
+            Diagonal::THREE => Some(Diagonal::FOUR),
+            Diagonal::FOUR => Some(Diagonal::FIVE),
+            Diagonal::FIVE => Some(Diagonal::SIX),
+            Diagonal::SIX => Some(Diagonal::SEVEN),
+            Diagonal::SEVEN => Some(Diagonal::EIGHT),
+            Diagonal::EIGHT => Some(Diagonal::NINE),
+            Diagonal::NINE => None,
+        }
+    }
+
+    pub fn previous(&self) -> Option<Diagonal> {
+        match &self {
+            Diagonal::ONE => None,
+            Diagonal::TWO => Some(Diagonal::ONE),
+            Diagonal::THREE => Some(Diagonal::TWO),
+            Diagonal::FOUR => Some(Diagonal::THREE),
+            Diagonal::FIVE => Some(Diagonal::FOUR),
+            Diagonal::SIX => Some(Diagonal::FIVE),
+            Diagonal::SEVEN => Some(Diagonal::SIX),
+            Diagonal::EIGHT => Some(Diagonal::SEVEN),
+            Diagonal::NINE => Some(Diagonal::EIGHT),
         }
     }
 
@@ -125,7 +183,7 @@ pub enum Direction {
     West,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Position {
     A1,
     A2,
@@ -265,6 +323,74 @@ impl Position {
         }
     }
 
+    pub fn get_position(row: Row, diagonal: Diagonal) -> Option<Position> {
+        match (diagonal, row) {
+            (Diagonal::ONE, Row::A) => Some(Position::A1),
+            (Diagonal::TWO, Row::A) => Some(Position::A2),
+            (Diagonal::THREE, Row::A) => Some(Position::A3),
+            (Diagonal::FOUR, Row::A) => Some(Position::A4),
+            (Diagonal::FIVE, Row::A) => Some(Position::A5),
+            (Diagonal::ONE, Row::B) => Some(Position::B1),
+            (Diagonal::TWO, Row::B) => Some(Position::B2),
+            (Diagonal::THREE, Row::B) => Some(Position::B3),
+            (Diagonal::FOUR, Row::B) => Some(Position::B4),
+            (Diagonal::FIVE, Row::B) => Some(Position::B5),
+            (Diagonal::SIX, Row::B) => Some(Position::B6),
+            (Diagonal::ONE, Row::C) => Some(Position::C1),
+            (Diagonal::TWO, Row::C) => Some(Position::C2),
+            (Diagonal::THREE, Row::C) => Some(Position::C3),
+            (Diagonal::FOUR, Row::C) => Some(Position::C4),
+            (Diagonal::FIVE, Row::C) => Some(Position::C5),
+            (Diagonal::SIX, Row::C) => Some(Position::C6),
+            (Diagonal::SEVEN, Row::C) => Some(Position::C7),
+            (Diagonal::ONE, Row::D) => Some(Position::D1),
+            (Diagonal::TWO, Row::D) => Some(Position::D2),
+            (Diagonal::THREE, Row::D) => Some(Position::D3),
+            (Diagonal::FOUR, Row::D) => Some(Position::D4),
+            (Diagonal::FIVE, Row::D) => Some(Position::D5),
+            (Diagonal::SIX, Row::D) => Some(Position::D6),
+            (Diagonal::SEVEN, Row::D) => Some(Position::D7),
+            (Diagonal::EIGHT, Row::D) => Some(Position::D8),
+            (Diagonal::ONE, Row::E) => Some(Position::E1),
+            (Diagonal::TWO, Row::E) => Some(Position::E2),
+            (Diagonal::THREE, Row::E) => Some(Position::E3),
+            (Diagonal::FOUR, Row::E) => Some(Position::E4),
+            (Diagonal::FIVE, Row::E) => Some(Position::E5),
+            (Diagonal::SIX, Row::E) => Some(Position::E6),
+            (Diagonal::SEVEN, Row::E) => Some(Position::E7),
+            (Diagonal::EIGHT, Row::E) => Some(Position::E8),
+            (Diagonal::NINE, Row::E) => Some(Position::E9),
+            (Diagonal::TWO, Row::F) => Some(Position::F2),
+            (Diagonal::THREE, Row::F) => Some(Position::F3),
+            (Diagonal::FOUR, Row::F) => Some(Position::F4),
+            (Diagonal::FIVE, Row::F) => Some(Position::F5),
+            (Diagonal::SIX, Row::F) => Some(Position::F6),
+            (Diagonal::SEVEN, Row::F) => Some(Position::F7),
+            (Diagonal::EIGHT, Row::F) => Some(Position::F8),
+            (Diagonal::NINE, Row::F) => Some(Position::F9),
+            (Diagonal::THREE, Row::G) => Some(Position::G3),
+            (Diagonal::FOUR, Row::G) => Some(Position::G4),
+            (Diagonal::FIVE, Row::G) => Some(Position::G5),
+            (Diagonal::SIX, Row::G) => Some(Position::G6),
+            (Diagonal::SEVEN, Row::G) => Some(Position::G7),
+            (Diagonal::EIGHT, Row::G) => Some(Position::G8),
+            (Diagonal::NINE, Row::G) => Some(Position::G9),
+            (Diagonal::FOUR, Row::H) => Some(Position::H4),
+            (Diagonal::FIVE, Row::H) => Some(Position::H5),
+            (Diagonal::SIX, Row::H) => Some(Position::H6),
+            (Diagonal::SEVEN, Row::H) => Some(Position::H7),
+            (Diagonal::EIGHT, Row::H) => Some(Position::H8),
+            (Diagonal::NINE, Row::H) => Some(Position::H9),
+            (Diagonal::FIVE, Row::I) => Some(Position::I5),
+            (Diagonal::SIX, Row::I) => Some(Position::I6),
+            (Diagonal::SEVEN, Row::I) => Some(Position::I7),
+            (Diagonal::EIGHT, Row::I) => Some(Position::I8),
+            (Diagonal::NINE, Row::I) => Some(Position::I9),
+            // All actual cases are enumerated above
+            _ => None,
+        }
+    }
+
     fn row(&self) -> Row {
         let (_, row) = self.get_diagonal_row();
         row
@@ -340,11 +466,94 @@ impl Position {
             Option::None
         }
     }
+
+    fn neighbor(&self, direction: Direction) -> Option<Position> {
+        let (diagonal, row) = self.get_diagonal_row();
+
+        match direction {
+            Direction::NorthEast => Position::get_position(row.next()?, diagonal.next()?),
+            Direction::NorthWest => Position::get_position(row.next()?, diagonal),
+            Direction::East => Position::get_position(row, diagonal.next()?),
+            Direction::SouthEast => Position::get_position(row.previous()?, diagonal),
+            Direction::SouthWest => Position::get_position(row.previous()?, diagonal.previous()?),
+            Direction::West => Position::get_position(row, diagonal.previous()?),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::positions::{Direction, Position};
+    use crate::positions::{Diagonal, Direction, Position, Row};
+
+    #[test]
+    fn test_position_to_row_diagonal() {
+        assert_eq!(Position::A1.get_diagonal_row(), (Diagonal::ONE, Row::A));
+        assert_eq!(Position::I9.get_diagonal_row(), (Diagonal::NINE, Row::I));
+    }
+
+    #[test]
+    fn test_row_diagonal_to_position() {
+        assert_eq!(
+            Position::get_position(Row::A, Diagonal::ONE),
+            Some(Position::A1)
+        );
+        assert_eq!(
+            Position::get_position(Row::B, Diagonal::TWO),
+            Some(Position::B2)
+        );
+        assert_eq!(Position::get_position(Row::A, Diagonal::NINE), None);
+    }
+
+    #[test]
+    fn test_neighbor() {
+        assert_eq!(Position::A1.neighbor(Direction::East), Some(Position::A2));
+        assert_eq!(Position::A5.neighbor(Direction::East), None);
+
+        assert_eq!(Position::A1.neighbor(Direction::West), None);
+        assert_eq!(Position::A5.neighbor(Direction::West), Some(Position::A4));
+
+        assert_eq!(
+            Position::A1.neighbor(Direction::NorthEast),
+            Some(Position::B2)
+        );
+        assert_eq!(
+            Position::C3.neighbor(Direction::NorthEast),
+            Some(Position::D4)
+        );
+        assert_eq!(Position::I6.neighbor(Direction::NorthEast), None);
+
+        assert_eq!(
+            Position::A1.neighbor(Direction::NorthWest),
+            Some(Position::B1)
+        );
+        assert_eq!(
+            Position::A5.neighbor(Direction::NorthWest),
+            Some(Position::B5)
+        );
+        assert_eq!(Position::I5.neighbor(Direction::NorthWest), None);
+
+        assert_eq!(Position::A1.neighbor(Direction::SouthEast), None);
+
+        assert_eq!(
+            Position::C3.neighbor(Direction::SouthEast),
+            Some(Position::B3)
+        );
+
+        assert_eq!(
+            Position::I6.neighbor(Direction::SouthEast),
+            Some(Position::H6)
+        );
+
+        assert_eq!(Position::A1.neighbor(Direction::SouthWest), None);
+        assert_eq!(
+            Position::C5.neighbor(Direction::SouthWest),
+            Some(Position::B4)
+        );
+        assert_eq!(
+            Position::I5.neighbor(Direction::SouthWest),
+            Some(Position::H4)
+        );
+    }
 
     #[test]
     fn test_same_row() {

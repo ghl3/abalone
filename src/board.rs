@@ -198,6 +198,12 @@ impl Board {
         }
     }
 
+    fn can_move(&self, position: Position, direction: Direction, distance: usize) -> bool {
+        // Validate
+
+        false
+    }
+
     fn interpret_row_move(&self, row_move: RowMove) -> Option<InterpretedMove> {
         // First, get the marble corresponding
         let Circle::Filled(color) = self.circle(row_move.starting_position) else {
@@ -209,7 +215,7 @@ impl Board {
             return Option::None;
         };
 
-        if distance > 3 {
+        if distance != 1 {
             return Option::None;
         }
 
@@ -223,7 +229,7 @@ impl Board {
                 end: Position::A1,
                 num_marbles: 0,
             },
-            direction: Direction::NorthEast,
+            direction: direction,
         })
     }
 
