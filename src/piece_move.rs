@@ -27,7 +27,7 @@ pub enum Color {
 // The first position is the starting position of the trailing marble (or
 // possibly the only marble).  The second position is the ending point of that
 // same marble.  The movement of all other marbles is implied.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowMove {
     pub starting_position: Position,
     pub ending_position: Position,
@@ -36,7 +36,7 @@ pub struct RowMove {
 // The first position is one end point of a series of marbles.  The
 // second position is the other end point of that series of marbles.
 // The third position is the final position of the first end point.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BroadsideMove {
     pub group_start: Position,
     pub group_end: Position,
@@ -45,7 +45,7 @@ pub struct BroadsideMove {
 
 // A PieceMove is the simplest representation of an abstract move.  It exists outside of a
 // board or game.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceMove {
     RowMove(RowMove),
     BroadsideMove(BroadsideMove),
@@ -63,7 +63,7 @@ pub struct PieceGroup {
 
 // The specific interpretation of an abstract PieceMove, given a game.  It provides additional
 // metadata that can be derived from a PieceMove given a game/board.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterpretedMove {
     pub piece_move: PieceMove,
     pub starting_position: Position,

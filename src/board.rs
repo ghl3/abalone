@@ -2,9 +2,10 @@
 // Marble: A physical piece.  Has a specific color
 // Circle: A position on the board.  Defined by a Row and a Diagonal (or just a Position)
 
-use crate::piece_move::{BroadsideMove, Color, InterpretedMove, PieceGroup, PieceMove, RowMove};
+use crate::piece_move::{
+    BroadsideMove, Color, InterpretedMove, PieceMove, RowMove,
+};
 use crate::positions::{Diagonal, Direction, Position};
-use std::thread::current;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -229,7 +230,7 @@ impl Board {
         // - A change in color
         loop {
             let Some(next_position) = current_position.neighbor(direction) else {
-                 // We encountered the end of the board
+                // We encountered the end of the board
                 return None;
             };
 
@@ -247,7 +248,7 @@ impl Board {
                         direction: direction,
                         num_same_color: num_same_colors,
                         num_opposite_color: num_opposite_colors,
-                    })
+                    });
                 }
 
                 Circle::Filled(current_color) => {
@@ -288,7 +289,7 @@ impl Board {
         };
 
         let Option::Some((direction, distance)) =
-           row_move.starting_position.get_direction_and_distance(row_move.ending_position) else {
+            row_move.starting_position.get_direction_and_distance(row_move.ending_position) else {
             return Option::None;
         };
 
@@ -311,7 +312,54 @@ impl Board {
         })
     }
 
-    fn interpret_broadside_move(&self, broadside_move: BroadsideMove) -> Option<InterpretedMove> {
+    fn interpret_broadside_move(
+        &self,
+        broadside_move: BroadsideMove,
+    ) -> Option<InterpretedMove> {
+        // We need to confirm the following:
+        // - All pieces in the starting position are of the same color
+        // - There are no pieces in the terminal position
+
+        // First, get the marble corresponding to the starting position
+        let Circle::Filled(color) = self.circle(broadside_move.group_start) else {
+            return Option::None;
+        };
+
+        // Then, get the distance and direction to the final position.
+        // This determines the direction of the shift
+        let Option::Some((shift_direction, shift_distance)) =
+            broadside_move.group_start.get_direction_and_distance(
+                broadside_move.group_start_final_position) else {
+            return Option::None;
+        };
+
+        // The distance must only be 1 since shifts can only be one space
+        if shift_distance != 1 {
+            return Option::None;
+        }
+
+        // Then, get the distance and direction to the final position.
+        // This determines the direction of the shift
+        let Option::Some((group_direction, group_distance)) =
+            broadside_move.group_start.get_direction_and_distance(
+                broadside_move.group_start_final_position) else {
+            return Option::None;
+        };
+
+        // The group can only be 3 elements (1 element + 2 distance = 3)
+        if group_distance > 2 {
+            return Option::None;
+        }
+
+        // Now, we check that all the circles are empty
+        if !squares_empty(
+            broadside_move.group_end,
+            group_direction,
+            group_distance,
+        ) {
+            return Option::None;
+        }
+
         Option::None
     }
 
@@ -323,6 +371,7 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use crate::board::{Board, Circle, Color, Position, RowMoveResult};
+    use crate::piece_move::{InterpretedMove, PieceMove, RowMove};
     use crate::positions::Direction;
 
     #[test]
@@ -361,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn can_move() {
+    fn test_can_move() {
         let board = Board::starting_board();
 
         assert_eq!(
@@ -371,7 +420,7 @@ mod tests {
                 starting_position: Position::A5,
                 direction: Direction::NorthWest,
                 num_same_color: 3,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -382,7 +431,7 @@ mod tests {
                 starting_position: Position::B5,
                 direction: Direction::NorthWest,
                 num_same_color: 2,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -393,7 +442,7 @@ mod tests {
                 starting_position: Position::C5,
                 direction: Direction::NorthWest,
                 num_same_color: 1,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -404,7 +453,7 @@ mod tests {
                 starting_position: Position::A4,
                 direction: Direction::NorthEast,
                 num_same_color: 2,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -415,7 +464,7 @@ mod tests {
                 starting_position: Position::B4,
                 direction: Direction::NorthEast,
                 num_same_color: 2,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -426,7 +475,7 @@ mod tests {
                 starting_position: Position::C3,
                 direction: Direction::NorthEast,
                 num_same_color: 1,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -437,7 +486,7 @@ mod tests {
                 starting_position: Position::C3,
                 direction: Direction::NorthWest,
                 num_same_color: 1,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -458,7 +507,7 @@ mod tests {
                 starting_position: Position::I5,
                 direction: Direction::SouthEast,
                 num_same_color: 3,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -469,7 +518,7 @@ mod tests {
                 starting_position: Position::I6,
                 direction: Direction::SouthEast,
                 num_same_color: 3,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -480,7 +529,7 @@ mod tests {
                 starting_position: Position::H5,
                 direction: Direction::SouthEast,
                 num_same_color: 2,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -491,7 +540,7 @@ mod tests {
                 starting_position: Position::F5,
                 direction: Direction::SouthEast,
                 num_same_color: 1,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -502,7 +551,7 @@ mod tests {
                 starting_position: Position::H9,
                 direction: Direction::SouthWest,
                 num_same_color: 1,
-                num_opposite_color: 0
+                num_opposite_color: 0,
             })
         );
 
@@ -514,6 +563,28 @@ mod tests {
         assert_eq!(
             board.can_move(Position::I5, Direction::West, Color::Black),
             None
+        );
+    }
+
+    #[test]
+    fn test_interpret_row_move() {
+        let board = Board::starting_board();
+        assert_eq!(
+            board.interpret_row_move(RowMove {
+                starting_position: Position::A5,
+                ending_position: Position::B5,
+            }),
+            Some(InterpretedMove {
+                piece_move: PieceMove::RowMove(RowMove {
+                    starting_position: Position::A5,
+                    ending_position: Position::B5,
+                }),
+                starting_position: Position::A5,
+                color: Color::White,
+                direction: Direction::NorthWest,
+                num_same_color: 3,
+                num_opposite_color: 0,
+            })
         );
     }
 }
