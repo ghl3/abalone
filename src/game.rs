@@ -33,7 +33,7 @@ impl Game {
             return MoveResult::Invalid;
         };
 
-        if interpreted_move.color != self.turn {
+        if interpreted_move.move_directive.color != self.turn {
             return MoveResult::Invalid;
         };
 

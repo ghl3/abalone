@@ -477,6 +477,18 @@ impl Position {
         }
     }
 
+    pub fn shift(
+        &self,
+        direction: Direction,
+        distance: usize,
+    ) -> Option<Position> {
+        let mut position: Position = self.clone();
+        for _ in 0..distance {
+            position = position.neighbor(direction)?;
+        }
+        Some(position)
+    }
+
     pub fn neighbor(&self, direction: Direction) -> Option<Position> {
         let (diagonal, row) = self.get_diagonal_row();
 

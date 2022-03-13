@@ -24,6 +24,15 @@ pub enum Color {
     White,
 }
 
+impl Color {
+    pub fn opposite(&self) -> Color {
+        match self {
+            Color::White => Color::Black,
+            Color::Black => Color::White,
+        }
+    }
+}
+
 // The first position is the starting position of the trailing marble (or
 // possibly the only marble).  The second position is the ending point of that
 // same marble.  The movement of all other marbles is implied.
@@ -63,6 +72,7 @@ pub struct PieceGroup {
 
 // The specific interpretation of an abstract PieceMove, given a game.  It provides additional
 // metadata that can be derived from a PieceMove given a game/board.
+/*
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterpretedMove {
     pub piece_move: PieceMove,
@@ -71,4 +81,29 @@ pub struct InterpretedMove {
     pub direction: Direction,
     pub num_same_color: usize,
     pub num_opposite_color: usize,
+}
+
+ */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieceGroup {
+    pub start: Position,
+    pub direction: Direction,
+    pub num_marbles: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveDirective {
+    pub starting_group: PieceGroup,
+    pub ending_group: PieceGroup,
+    pub color: Color,
+}
+
+// The specific interpretation of an abstract PieceMove, given a game.  It provides additional
+// metadata that can be derived from a PieceMove given a game/board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterpretedMove {
+    pub move_directive: MoveDirective,
+    pub opponent_move_directive: Option<MoveDirective>,
+    pub opponent_marbles_dropped: bool,
 }

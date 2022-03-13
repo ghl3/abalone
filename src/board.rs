@@ -3,10 +3,10 @@
 // Circle: A position on the board.  Defined by a Row and a Diagonal (or just a Position)
 
 use crate::piece_move::{
-    BroadsideMove, Color, InterpretedMove, PieceMove, RowMove,
+    BroadsideMove, Color, InterpretedMove, MoveDirective, PieceGroup,
+    PieceMove, RowMove,
 };
 use crate::positions::{Diagonal, Direction, Position};
-use std::thread::current;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -61,14 +61,14 @@ pub enum MoveResult {
     Valid(InterpretedMove),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct RowMoveResult {
-    color: Color,
-    starting_position: Position,
-    direction: Direction,
-    num_same_color: usize,
-    num_opposite_color: usize,
-}
+//#[derive(Debug, PartialEq, Eq)]
+//struct RowMoveResult {
+//    color: Color,
+//    starting_position: Position,
+//    direction: Direction,
+//    num_same_color: usize,
+//    num_opposite_color: usize,
+//}
 
 // Implementation block, all `Point` associated functions & methods go in here
 impl Board {
@@ -76,6 +76,12 @@ impl Board {
         let (diagonal, row) = position.get_diagonal_row();
         let index = diagonal.get_index_of_row(row);
         self.diagonal(diagonal)[index]
+    }
+
+    pub fn set_circle(&mut self, position: Position, circle: Circle) {
+        let (diagonal, row) = position.get_diagonal_row();
+        let index = diagonal.get_index_of_row(row);
+        self.mutable_diagonal(diagonal)[index] = circle;
     }
 
     pub fn empty_board() -> Board {
@@ -200,6 +206,20 @@ impl Board {
         }
     }
 
+    fn mutable_diagonal(&mut self, diagonal: Diagonal) -> &mut [Circle] {
+        match diagonal {
+            Diagonal::ONE => &mut self.one[..],
+            Diagonal::TWO => &mut self.two[..],
+            Diagonal::THREE => &mut self.three[..],
+            Diagonal::FOUR => &mut self.four[..],
+            Diagonal::FIVE => &mut self.five[..],
+            Diagonal::SIX => &mut self.six[..],
+            Diagonal::SEVEN => &mut self.seven[..],
+            Diagonal::EIGHT => &mut self.eight[..],
+            Diagonal::NINE => &mut self.nine[..],
+        }
+    }
+
     fn interpret_move(&self, piece_move: PieceMove) -> Option<InterpretedMove> {
         match piece_move {
             PieceMove::RowMove(row_move) => self.interpret_row_move(row_move),
@@ -214,7 +234,7 @@ impl Board {
         position: Position,
         direction: Direction,
         color: Color,
-    ) -> Option<RowMoveResult> {
+    ) -> Option<InterpretedMove> {
         // Starting at the position, we walk along the direction to see if a marble of a given
         // color can move in that direction.
 
@@ -231,8 +251,45 @@ impl Board {
         // - A change in color
         loop {
             let Some(next_position) = current_position.neighbor(direction) else {
-                // We encountered the end of the board
+                if still_same_color {
+                    // We can't push our own marbles off the board
                 return None;
+                } else {
+                    // We encountered the end of the board, so we push
+                    // the opponent's marble off.
+                    return Some(InterpretedMove {
+                        move_directive: MoveDirective {
+                            starting_group: PieceGroup{
+                                start: position,
+                                direction: direction,
+                                num_marbles: num_same_colors,
+                            },
+                            ending_group: PieceGroup{
+                                start: position.neighbor(direction)?,
+                                direction: direction,
+                                num_marbles: num_same_colors,
+                            },
+                            color: color
+                        },
+                        opponent_move_directive: Some(MoveDirective {
+                            starting_group: PieceGroup {
+                                start: position
+                                    .shift(direction, num_same_colors)?,
+                                direction: direction,
+                                num_marbles: num_opposite_colors,
+                            },
+                            ending_group: PieceGroup {
+                                start: position
+                                    .shift(direction, num_same_colors)?
+                                    .neighbor(direction)?,
+                                direction: direction,
+                                num_marbles: num_opposite_colors,
+                            },
+                            color: color.opposite(),
+                        }),
+                        opponent_marbles_dropped: true,
+                    });
+                }
             };
 
             // Update the current position
@@ -243,12 +300,41 @@ impl Board {
             match current_circle {
                 // We found an empty space.  We can return true
                 Circle::Empty => {
-                    return Some(RowMoveResult {
-                        color: color,
-                        starting_position: position,
-                        direction: direction,
-                        num_same_color: num_same_colors,
-                        num_opposite_color: num_opposite_colors,
+                    return Some(InterpretedMove {
+                        move_directive: MoveDirective {
+                            starting_group: PieceGroup {
+                                start: position,
+                                direction: direction,
+                                num_marbles: num_same_colors,
+                            },
+                            ending_group: PieceGroup {
+                                start: position.neighbor(direction)?,
+                                direction: direction,
+                                num_marbles: num_same_colors,
+                            },
+                            color: color,
+                        },
+                        opponent_move_directive: if (num_opposite_colors > 0) {
+                            Some(MoveDirective {
+                                starting_group: PieceGroup {
+                                    start: position
+                                        .shift(direction, num_same_colors)?,
+                                    direction: direction,
+                                    num_marbles: num_opposite_colors,
+                                },
+                                ending_group: PieceGroup {
+                                    start: position
+                                        .shift(direction, num_same_colors)?
+                                        .neighbor(direction)?,
+                                    direction: direction,
+                                    num_marbles: num_opposite_colors,
+                                },
+                                color: color.opposite(),
+                            })
+                        } else {
+                            None
+                        },
+                        opponent_marbles_dropped: false,
                     });
                 }
 
@@ -298,19 +384,8 @@ impl Board {
             return Option::None;
         }
 
-        // Ensure all marbles in the move have the same color and that the move is valid
-        let Some(row_move_result) = self.can_move(row_move.starting_position, direction, color) else {
-            return Option::None;
-        };
-
-        Option::Some(InterpretedMove {
-            piece_move: PieceMove::RowMove(row_move),
-            starting_position: row_move.starting_position,
-            color: color,
-            direction: direction,
-            num_same_color: row_move_result.num_same_color,
-            num_opposite_color: row_move_result.num_opposite_color,
-        })
+        // Try to execute the row move
+        self.can_move(row_move.starting_position, direction, color)
     }
 
     fn squares_empty(
@@ -429,25 +504,85 @@ impl Board {
         }
 
         Some(InterpretedMove {
-            piece_move: PieceMove::BroadsideMove(broadside_move),
-            starting_position: broadside_move.group_start,
-            color,
-            direction: group_direction,
-            num_same_color: group_distance,
-            num_opposite_color: 0,
+            move_directive: MoveDirective {
+                starting_group: PieceGroup {
+                    start: broadside_move.group_start,
+                    direction: group_direction,
+                    num_marbles: group_distance,
+                },
+                ending_group: PieceGroup {
+                    start: broadside_move.group_start_final_position,
+                    direction: group_direction,
+                    num_marbles: group_distance,
+                },
+                color,
+            },
+            // Broadside moves to not move or drop opponent marbles
+            opponent_move_directive: None,
+            opponent_marbles_dropped: false,
         })
     }
 
+    // Doesn't break if the group goes past the board
+    fn clear_circles(&mut self, pieces: PieceGroup) {
+        let mut current_position = pieces.start.clone();
+        for _ in 0..pieces.num_marbles {
+            self.set_circle(current_position, Circle::Empty);
+            match current_position.neighbor(pieces.direction) {
+                Some(position) => current_position = position,
+                _ => break,
+            }
+        }
+    }
+
+    // Doesn't break if the group goes past the board
+    fn fill_circles(&mut self, pieces: PieceGroup, color: Color) {
+        let mut current_position = pieces.start.clone();
+        for _ in 0..pieces.num_marbles {
+            self.set_circle(current_position, Circle::Filled(color));
+            match current_position.neighbor(pieces.direction) {
+                Some(position) => current_position = position,
+                _ => break,
+            }
+        }
+    }
+
+    fn apply_interpreted_move(&mut self, interpreted_move: InterpretedMove) {
+        // Clear the starting circles
+        // Fill the new circles
+        // Don't forget to record any dropped marbles
+        self.clear_circles(interpreted_move.move_directive.starting_group);
+        self.fill_circles(
+            interpreted_move.move_directive.ending_group,
+            interpreted_move.move_directive.color,
+        );
+
+        // Now, update the opponent's circles
+        if let Some(move_directive) = interpreted_move.opponent_move_directive {
+            self.clear_circles(move_directive.starting_group);
+            self.fill_circles(
+                move_directive.ending_group,
+                move_directive.color,
+            );
+        }
+    }
+
     pub fn apply_move(&mut self, piece_move: PieceMove) -> MoveResult {
-        MoveResult::Invalid
+        let Some(interpreted_move) = self.interpret_move(piece_move) else {
+            return  MoveResult::Invalid;
+        };
+
+        self.apply_interpreted_move(interpreted_move);
+        MoveResult::Valid(interpreted_move)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::board::{Board, Circle, Color, Position, RowMoveResult};
+    use crate::board::{Board, Circle, Color, Position};
     use crate::piece_move::{
-        BroadsideMove, InterpretedMove, PieceMove, RowMove,
+        BroadsideMove, InterpretedMove, MoveDirective, PieceGroup, PieceMove,
+        RowMove,
     };
     use crate::positions::Direction;
 
@@ -486,18 +621,17 @@ mod tests {
         );
     }
 
+    /*
     #[test]
     fn test_can_move() {
         let board = Board::starting_board();
 
         assert_eq!(
             board.can_move(Position::A5, Direction::NorthWest, Color::White),
-            Some(RowMoveResult {
-                color: Color::White,
-                starting_position: Position::A5,
-                direction: Direction::NorthWest,
-                num_same_color: 3,
-                num_opposite_color: 0,
+            Some(InterpretedMove {
+                move_directive: MoveDirective {},
+                opponent_move_directive: None,
+                opponent_marbles_dropped: false
             })
         );
 
@@ -643,6 +777,8 @@ mod tests {
         );
     }
 
+     */
+
     #[test]
     fn test_squares_empty() {
         let board = Board::starting_board();
@@ -663,15 +799,21 @@ mod tests {
                 ending_position: Position::B5,
             }),
             Some(InterpretedMove {
-                piece_move: PieceMove::RowMove(RowMove {
-                    starting_position: Position::A5,
-                    ending_position: Position::B5,
-                }),
-                starting_position: Position::A5,
-                color: Color::White,
-                direction: Direction::NorthWest,
-                num_same_color: 3,
-                num_opposite_color: 0,
+                move_directive: MoveDirective {
+                    starting_group: PieceGroup {
+                        start: Position::A5,
+                        direction: Direction::NorthWest,
+                        num_marbles: 3
+                    },
+                    ending_group: PieceGroup {
+                        start: Position::B5,
+                        direction: Direction::NorthWest,
+                        num_marbles: 3
+                    },
+                    color: Color::White,
+                },
+                opponent_move_directive: None,
+                opponent_marbles_dropped: false,
             })
         );
     }
@@ -686,16 +828,21 @@ mod tests {
                 group_start_final_position: Position::D4
             }),
             Some(InterpretedMove {
-                piece_move: PieceMove::BroadsideMove(BroadsideMove {
-                    group_start: Position::C3,
-                    group_end: Position::C5,
-                    group_start_final_position: Position::D4,
-                }),
-                starting_position: Position::C3,
-                color: Color::White,
-                direction: Direction::NorthEast,
-                num_same_color: 1,
-                num_opposite_color: 0
+                move_directive: MoveDirective {
+                    starting_group: PieceGroup {
+                        start: Position::C3,
+                        direction: Direction::NorthEast,
+                        num_marbles: 1
+                    },
+                    ending_group: PieceGroup {
+                        start: Position::D4,
+                        direction: Direction::NorthEast,
+                        num_marbles: 1
+                    },
+                    color: Color::White
+                },
+                opponent_move_directive: None,
+                opponent_marbles_dropped: false
             })
         );
     }
