@@ -417,14 +417,17 @@ impl Position {
         }
 
         let (diagonal_index, row_index) = (diagonal.index(), row.index());
-        let (other_diagonal_index, other_row_index) = (other_diagonal.index(), other_row.index());
+        let (other_diagonal_index, other_row_index) =
+            (other_diagonal.index(), other_row.index());
 
         if (other_diagonal_index > diagonal_index) {
             return other_row_index > row_index
-                && other_diagonal_index - diagonal_index == other_row_index - row_index;
+                && other_diagonal_index - diagonal_index
+                    == other_row_index - row_index;
         } else {
             return row_index > other_row_index
-                && diagonal_index - other_diagonal_index == row_index - other_row_index;
+                && diagonal_index - other_diagonal_index
+                    == row_index - other_row_index;
         }
 
         //    return other_diagonal_index - diagonal_index == other_row_index - row_index;
@@ -433,18 +436,25 @@ impl Position {
     // Given a starting and an ending point, returns the direction and number of circles
     // needed to traverse to go from the start to the end point.  If there is no straight line
     // between the two, returns an empty optional.
-    pub fn get_direction_and_distance(&self, other: Position) -> Option<(Direction, usize)> {
+    pub fn get_direction_and_distance(
+        &self,
+        other: Position,
+    ) -> Option<(Direction, usize)> {
         if other == *self {
             return Option::None;
         } else if self.has_same_row(other) {
             if self.diagonal() > other.diagonal() {
-                let delta: usize = self.diagonal().index() - other.diagonal().index();
+                let delta: usize =
+                    self.diagonal().index() - other.diagonal().index();
                 Option::Some((Direction::West, delta))
             } else {
-                let delta: usize = other.diagonal().index() - self.diagonal().index();
+                let delta: usize =
+                    other.diagonal().index() - self.diagonal().index();
                 Option::Some((Direction::East, delta))
             }
-        } else if self.has_same_diagonal(other) && self.diagonal() == other.diagonal() {
+        } else if self.has_same_diagonal(other)
+            && self.diagonal() == other.diagonal()
+        {
             // They are on the same North-West to South-East Diagonal
             if other.row() > self.row() {
                 let delta: usize = other.row().index() - self.row().index();
@@ -471,12 +481,22 @@ impl Position {
         let (diagonal, row) = self.get_diagonal_row();
 
         match direction {
-            Direction::NorthEast => Position::get_position(row.next()?, diagonal.next()?),
-            Direction::NorthWest => Position::get_position(row.next()?, diagonal),
+            Direction::NorthEast => {
+                Position::get_position(row.next()?, diagonal.next()?)
+            }
+            Direction::NorthWest => {
+                Position::get_position(row.next()?, diagonal)
+            }
             Direction::East => Position::get_position(row, diagonal.next()?),
-            Direction::SouthEast => Position::get_position(row.previous()?, diagonal),
-            Direction::SouthWest => Position::get_position(row.previous()?, diagonal.previous()?),
-            Direction::West => Position::get_position(row, diagonal.previous()?),
+            Direction::SouthEast => {
+                Position::get_position(row.previous()?, diagonal)
+            }
+            Direction::SouthWest => {
+                Position::get_position(row.previous()?, diagonal.previous()?)
+            }
+            Direction::West => {
+                Position::get_position(row, diagonal.previous()?)
+            }
         }
     }
 }

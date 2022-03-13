@@ -6,6 +6,7 @@ use crate::piece_move::{
     BroadsideMove, Color, InterpretedMove, PieceMove, RowMove,
 };
 use crate::positions::{Diagonal, Direction, Position};
+use std::thread::current;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Circle {
@@ -312,6 +313,64 @@ impl Board {
         })
     }
 
+    fn squares_empty(
+        &self,
+        starting_position: Position,
+        direction: Direction,
+        distance: usize,
+    ) -> bool {
+        let mut num_steps = 1;
+        let mut current_position = starting_position;
+
+        loop {
+            if self.circle(current_position) != Circle::Empty {
+                return false;
+            }
+
+            if num_steps == distance {
+                return true;
+            }
+
+            let Some(next_position) = current_position.neighbor(direction) else {
+                // We have gone off the board, so we return false
+                return false;
+            };
+
+            current_position = next_position;
+            num_steps += 1;
+        }
+    }
+
+    // TODO: Merge with 'squares_empty'
+    fn squares_filled_with_color(
+        &self,
+        starting_position: Position,
+        direction: Direction,
+        distance: usize,
+        color: Color,
+    ) -> bool {
+        let mut num_steps = 1;
+        let mut current_position = starting_position;
+
+        loop {
+            if self.circle(current_position) != Circle::Filled(color) {
+                return false;
+            }
+
+            if num_steps == distance {
+                return true;
+            }
+
+            let Some(next_position) = current_position.neighbor(direction) else {
+                // We have gone off the board, so we return false
+                return false;
+            };
+
+            current_position = next_position;
+            num_steps += 1;
+        }
+    }
+
     fn interpret_broadside_move(
         &self,
         broadside_move: BroadsideMove,
@@ -327,7 +386,7 @@ impl Board {
 
         // Then, get the distance and direction to the final position.
         // This determines the direction of the shift
-        let Option::Some((shift_direction, shift_distance)) =
+        let Option::Some((_, shift_distance)) =
             broadside_move.group_start.get_direction_and_distance(
                 broadside_move.group_start_final_position) else {
             return Option::None;
@@ -338,8 +397,7 @@ impl Board {
             return Option::None;
         }
 
-        // Then, get the distance and direction to the final position.
-        // This determines the direction of the shift
+        //
         let Option::Some((group_direction, group_distance)) =
             broadside_move.group_start.get_direction_and_distance(
                 broadside_move.group_start_final_position) else {
@@ -351,16 +409,33 @@ impl Board {
             return Option::None;
         }
 
-        // Now, we check that all the circles are empty
-        if !squares_empty(
-            broadside_move.group_end,
+        // Then, we check that the starting circles all have the same color.
+        if !self.squares_filled_with_color(
+            broadside_move.group_start,
+            group_direction,
+            group_distance,
+            color,
+        ) {
+            return Option::None;
+        }
+
+        // Now, we check that all the target circles are empty
+        if !self.squares_empty(
+            broadside_move.group_start_final_position,
             group_direction,
             group_distance,
         ) {
             return Option::None;
         }
 
-        Option::None
+        Some(InterpretedMove {
+            piece_move: PieceMove::BroadsideMove(broadside_move),
+            starting_position: broadside_move.group_start,
+            color,
+            direction: group_direction,
+            num_same_color: group_distance,
+            num_opposite_color: 0,
+        })
     }
 
     pub fn apply_move(&mut self, piece_move: PieceMove) -> MoveResult {
@@ -371,7 +446,9 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use crate::board::{Board, Circle, Color, Position, RowMoveResult};
-    use crate::piece_move::{InterpretedMove, PieceMove, RowMove};
+    use crate::piece_move::{
+        BroadsideMove, InterpretedMove, PieceMove, RowMove,
+    };
     use crate::positions::Direction;
 
     #[test]
@@ -567,6 +644,17 @@ mod tests {
     }
 
     #[test]
+    fn test_squares_empty() {
+        let board = Board::starting_board();
+
+        assert!(board.squares_empty(Position::C1, Direction::NorthWest, 3));
+        assert!(board.squares_empty(Position::C2, Direction::NorthWest, 1));
+
+        assert!(!board.squares_empty(Position::A1, Direction::NorthWest, 1));
+        assert!(!board.squares_empty(Position::E7, Direction::NorthWest, 3));
+    }
+
+    #[test]
     fn test_interpret_row_move() {
         let board = Board::starting_board();
         assert_eq!(
@@ -584,6 +672,30 @@ mod tests {
                 direction: Direction::NorthWest,
                 num_same_color: 3,
                 num_opposite_color: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_interpret_broadside_move() {
+        let board = Board::starting_board();
+        assert_eq!(
+            board.interpret_broadside_move(BroadsideMove {
+                group_start: Position::C3,
+                group_end: Position::C5,
+                group_start_final_position: Position::D4
+            }),
+            Some(InterpretedMove {
+                piece_move: PieceMove::BroadsideMove(BroadsideMove {
+                    group_start: Position::C3,
+                    group_end: Position::C5,
+                    group_start_final_position: Position::D4,
+                }),
+                starting_position: Position::C3,
+                color: Color::White,
+                direction: Direction::NorthEast,
+                num_same_color: 1,
+                num_opposite_color: 0
             })
         );
     }
