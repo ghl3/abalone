@@ -1,0 +1,20 @@
+[package]
+name = "abalone-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+autobenches = false
+
+[lib]
+name = "abalone_engine"
+path = "src/lib.rs"
+
+[dependencies]
+arrayvec = "0.7"
+
+[[bin]]
+name = "movegen-bench"
+path = "benches/movegen.rs"
+
+[lints]
+workspace = true
