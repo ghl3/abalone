@@ -308,6 +308,18 @@ pub fn move_notation(idx: u16) -> String {
     format!("{}", decode(idx))
 }
 
+/// Direction of motion for a move index, returned as the engine `Dir`
+/// index `0..6` (matches `DIR_SHIFTS` and `DIR_PIXEL` on the JS side).
+/// For inline moves, this is the inline direction; for broadside, it's
+/// the move_dir (perpendicular slide).
+#[wasm_bindgen]
+pub fn move_motion_dir(idx: u16) -> u8 {
+    match decode(idx) {
+        Move::Inline { dir, .. } => dir as u8,
+        Move::Broadside { move_dir, .. } => move_dir as u8,
+    }
+}
+
 impl Default for WasmGame {
     fn default() -> Self {
         Self::new()
