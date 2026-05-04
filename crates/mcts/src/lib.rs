@@ -1,18 +1,21 @@
-//! Monte Carlo Tree Search with PUCT selection and uniform-random playout
-//! evaluation. Designed so the eventual neural-network swap (NN-supplied
-//! priors + value) replaces only the leaf evaluator; the tree code stays
-//! unchanged.
+//! Monte Carlo Tree Search with PUCT selection. The leaf evaluator is
+//! pluggable: pass a closure `Fn(&Game, &mut R) -> f32` that returns a
+//! value in `[-1, 1]` from the leaf's `to_move` perspective. Two
+//! batteries-included evaluators live alongside:
+//!
+//!   * [`random_rollout`] — simulate to terminal with uniform-random moves.
+//!   * [`heuristic`] — hand-crafted positional eval (capture differential,
+//!     centrality, cohesion). See [`mod@eval`].
+//!
+//! The eventual NN evaluator slots in the same way: a closure that calls
+//! the model.
 //!
 //! # Conventions
 //!
-//! Each node stores `total_value` from its own `to_move`'s perspective. So
-//! `Q(child) = child.total_value / child.n_visits` is the average return
-//! the player at `child` would expect — which means *the parent player*
-//! wants to maximise `-Q(child)` (their opponent's expected return is
-//! their loss). Selection negates Q accordingly.
-//!
-//! Backprop walks leaf → root, alternating sign at each step because
-//! `to_move` flips ply by ply.
+//! Each node stores `total_value` from its own `to_move`'s perspective.
+//! Selection at a parent computes `score = -Q(child) + U(child)` (negate
+//! because child's POV is opposite of parent's). Backprop walks leaf →
+//! root, alternating sign at each step because `to_move` flips ply by ply.
 //!
 //! # PUCT
 //!
@@ -20,9 +23,11 @@
 //! score(child) = -Q(child) + c_puct * P(child) * sqrt(N(parent)) / (1 + N(child))
 //! ```
 //!
-//! With uniform priors `P(child) = 1 / num_legal_children_at_parent`. The
-//! `sqrt(N(parent))` term uses `max(N, 1)` to avoid the all-zero degenerate
-//! score on the very first traversal after expansion.
+//! With uniform priors `P(child) = 1 / num_legal_at_parent`. The
+//! `sqrt(N(parent))` term uses `max(N, 1)` to avoid the all-zero score on
+//! the first traversal after expansion.
+
+pub mod eval;
 
 use abalone_engine::{Game, GameState, Move, Side};
 use rand::Rng;
@@ -60,11 +65,18 @@ pub struct SearchResult {
     pub visits: Vec<(Move, u32)>,
 }
 
-pub fn search<R: Rng + ?Sized>(
+/// Run MCTS from `game` for `cfg.simulations` iterations using `eval_fn`
+/// to evaluate non-terminal leaves. Returns `None` if `game` is terminal.
+pub fn search<R, F>(
     game: &Game,
     cfg: &SearchConfig,
     rng: &mut R,
-) -> Option<SearchResult> {
+    mut eval_fn: F,
+) -> Option<SearchResult>
+where
+    R: Rng + ?Sized,
+    F: FnMut(&Game, &mut R) -> f32,
+{
     if game.is_terminal() {
         return None;
     }
@@ -105,7 +117,7 @@ pub fn search<R: Rng + ?Sized>(
         let v = if leaf_state.is_terminal() {
             outcome_from_pov(leaf_state.turn, &leaf_state)
         } else {
-            let v = rollout(leaf_state, rng);
+            let v = eval_fn(&leaf_state, rng);
             expand(&mut nodes, current);
             v
         };
@@ -120,7 +132,6 @@ pub fn search<R: Rng + ?Sized>(
         }
     }
 
-    // ----- Pick the most-visited move at the root -----
     let visits: Vec<(Move, u32)> = nodes[root as usize]
         .children
         .iter()
@@ -132,6 +143,18 @@ pub fn search<R: Rng + ?Sized>(
         .map(|&(mv, _)| mv)
         .expect("non-empty children after expansion");
     Some(SearchResult { best, visits })
+}
+
+/// Random-rollout evaluator: simulate to terminal with uniform-random moves
+/// and return the outcome from `game.turn`'s POV.
+pub fn random_rollout<R: Rng + ?Sized>(game: &Game, rng: &mut R) -> f32 {
+    simulate_random(*game, rng)
+}
+
+/// Heuristic evaluator with the default weights. For custom weights pass
+/// a closure that calls [`eval::evaluate`] directly.
+pub fn heuristic<R: Rng + ?Sized>(game: &Game, _rng: &mut R) -> f32 {
+    eval::evaluate(&game.board, game.turn, &eval::Weights::default())
 }
 
 fn expand(nodes: &mut Vec<Node>, parent: NodeId) {
@@ -182,7 +205,7 @@ fn select_child(nodes: &[Node], parent: NodeId, c_puct: f32) -> NodeId {
     p.children[best_idx].1
 }
 
-fn rollout<R: Rng + ?Sized>(state: Game, rng: &mut R) -> f32 {
+fn simulate_random<R: Rng + ?Sized>(state: Game, rng: &mut R) -> f32 {
     let leaf_pov = state.turn;
     let mut g = state;
     while !g.is_terminal() {
@@ -220,10 +243,10 @@ mod tests {
     #[test]
     fn terminal_returns_none() {
         let mut g = Game::new_standard();
-        g.ply = MAX_PLIES; // forces Draw
+        g.ply = MAX_PLIES;
         assert!(g.is_terminal());
         let mut rng = SmallRng::seed_from_u64(0);
-        assert!(search(&g, &SearchConfig::default(), &mut rng).is_none());
+        assert!(search(&g, &SearchConfig::default(), &mut rng, random_rollout).is_none());
     }
 
     #[test]
@@ -234,7 +257,7 @@ mod tests {
             c_puct: 1.4,
         };
         let mut rng = SmallRng::seed_from_u64(7);
-        let r = search(&g, &cfg, &mut rng).expect("non-terminal => some move");
+        let r = search(&g, &cfg, &mut rng, random_rollout).unwrap();
         let legal: Vec<Move> = g.legal_moves().iter().copied().collect();
         assert!(legal.contains(&r.best));
         let total_visits: u32 = r.visits.iter().map(|&(_, n)| n).sum();
@@ -250,8 +273,8 @@ mod tests {
         };
         let mut rng1 = SmallRng::seed_from_u64(42);
         let mut rng2 = SmallRng::seed_from_u64(42);
-        let r1 = search(&g, &cfg, &mut rng1).unwrap();
-        let r2 = search(&g, &cfg, &mut rng2).unwrap();
+        let r1 = search(&g, &cfg, &mut rng1, random_rollout).unwrap();
+        let r2 = search(&g, &cfg, &mut rng2, random_rollout).unwrap();
         assert_eq!(r1.best, r2.best);
         assert_eq!(r1.visits, r2.visits);
     }
@@ -268,26 +291,36 @@ mod tests {
             if g.is_terminal() {
                 break;
             }
-            let r = search(&g, &cfg, &mut rng).unwrap();
+            let r = search(&g, &cfg, &mut rng, random_rollout).unwrap();
             g.apply(r.best);
         }
         assert_eq!(g.ply, 6);
     }
 
     #[test]
-    fn child_visits_sum_matches_simulations_minus_one() {
-        // Each simulation traverses to a leaf and increments every node on
-        // the path — including a child of the root. So the root's children's
-        // visit counts must sum to exactly `simulations` (every iteration
-        // descends through exactly one root-child).
+    fn root_visits_sum_to_simulations() {
         let g = Game::new_standard();
         let cfg = SearchConfig {
             simulations: 40,
             c_puct: 1.4,
         };
         let mut rng = SmallRng::seed_from_u64(99);
-        let r = search(&g, &cfg, &mut rng).unwrap();
+        let r = search(&g, &cfg, &mut rng, random_rollout).unwrap();
         let sum: u32 = r.visits.iter().map(|&(_, n)| n).sum();
         assert_eq!(sum, cfg.simulations);
+    }
+
+    #[test]
+    fn heuristic_search_runs() {
+        // Smoke test: heuristic eval drops in cleanly and produces a legal move.
+        let g = Game::new_standard();
+        let cfg = SearchConfig {
+            simulations: 30,
+            c_puct: 1.4,
+        };
+        let mut rng = SmallRng::seed_from_u64(0);
+        let r = search(&g, &cfg, &mut rng, heuristic).unwrap();
+        let legal: Vec<Move> = g.legal_moves().iter().copied().collect();
+        assert!(legal.contains(&r.best));
     }
 }
