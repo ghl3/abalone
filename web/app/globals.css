@@ -6,9 +6,15 @@
   --muted: #8893a0;
   --accent: #5dadec;
   --accent-soft: #1e3a52;
-  --black: #1a1a1a;
-  --white: #f4ede0;
+  /* Marbles: black is now a slate-blue so it stands out against the dark
+     panel; white stays warm cream. Both have explicit stroke colors. */
+  --black: #4f5b73;
+  --black-stroke: #1d2330;
+  --white: #f0e9d8;
+  --white-stroke: #9c937c;
   --highlight: #f6c343;
+  --legal: #62d35e;
+  --illegal: #e25c5c;
 }
 
 * {

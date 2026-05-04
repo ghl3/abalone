@@ -136,6 +136,25 @@ impl WasmGame {
         self.inner.apply(m);
     }
 
+    /// Hypothetically apply `idx` to a clone of the current position and
+    /// return the resulting cell array (parallel to [`Self::cell`]). Does not
+    /// mutate `self`. JS uses this to render a full preview (own destinations,
+    /// pushed opponents, captures) while the user is mid-drag.
+    pub fn move_preview(&self, idx: u16) -> Vec<i8> {
+        let m = decode(idx);
+        let mut tmp = self.inner;
+        tmp.apply(m);
+        let mut out = vec![-1i8; 81];
+        for c in 0..81u8 {
+            match tmp.board.at(c) {
+                None => out[c as usize] = -1,
+                Some(Side::Black) => out[c as usize] = 0,
+                Some(Side::White) => out[c as usize] = 1,
+            }
+        }
+        out
+    }
+
     /// Find the legal move whose source cells equal `cells` (any order) and
     /// whose direction of motion is `dir_idx` (0..6, matching `Dir`). Returns
     /// the move index, or -1 if no such move exists.

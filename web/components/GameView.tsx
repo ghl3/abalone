@@ -1,27 +1,22 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import HexBoard, { isValid } from "./HexBoard";
+import HexBoard, {
+  cellCenter,
+  DIR_PIXEL,
+  DIR_SHIFTS,
+  HEX_SIZE,
+  isValid,
+  type MovingState,
+} from "./HexBoard";
 
 type WasmModule = typeof import("abalone-wasm");
 
-const DRAG_THRESHOLD = 10; // px, below which we treat the gesture as a click
+const DRAG_THRESHOLD = 10; // px below which a release is treated as a click
+const SNAP_RADIUS = HEX_SIZE * 0.85; // px from the ideal cell center to engage snap
 
-// Engine `Dir` order: E=0, NE=1, NW=2, W=3, SW=4, SE=5
-const DIR_SHIFTS: number[] = [1, 10, 9, -1, -10, -9];
 // Positive directions used to validate a 2/3-marble line group.
 const POSITIVE_DIR_SHIFTS = [1, 10, 9];
-
-/** Snap a pixel delta to one of 6 hex directions, or null if too small. */
-function nearestDirIdx(dx: number, dy: number): number | null {
-  const r = Math.hypot(dx, dy);
-  if (r < DRAG_THRESHOLD) return null;
-  const theta = Math.atan2(dy, dx); // (-π, π]
-  // 6 sextants, 60° each. Sextant 0 = E, 1 = SE, 2 = SW, 3 = W, 4 = NW, 5 = NE.
-  const sextant = ((Math.round(theta / (Math.PI / 3)) % 6) + 6) % 6;
-  // Map to engine Dir index: E=0, NE=1, NW=2, W=3, SW=4, SE=5
-  return [0, 5, 4, 3, 2, 1][sextant];
-}
 
 /** Cells form a contiguous line in one of the 3 hex axes (or a single cell). */
 function isValidGroup(cells: number[]): boolean {
@@ -39,6 +34,32 @@ function isValidGroup(cells: number[]): boolean {
     if (ok) return true;
   }
   return false;
+}
+
+interface SnapResult {
+  dirIdx: number;
+  moveIdx: number;
+  dist: number;
+}
+
+/** Pick the closest legal-move snap candidate (by Euclidean distance from the
+ *  ideal pixel offset). Returns null if no legal move in any direction. */
+function findSnap(
+  game: InstanceType<WasmModule["WasmGame"]>,
+  movingCells: number[],
+  dx: number,
+  dy: number
+): SnapResult | null {
+  let best: SnapResult | null = null;
+  for (let dirIdx = 0; dirIdx < 6; dirIdx++) {
+    const moveIdx = game.find_move(new Uint8Array(movingCells), dirIdx);
+    if (moveIdx < 0) continue;
+    const sd = Math.hypot(dx - DIR_PIXEL[dirIdx].dx, dy - DIR_PIXEL[dirIdx].dy);
+    if (!best || sd < best.dist) {
+      best = { dirIdx, moveIdx, dist: sd };
+    }
+  }
+  return best;
 }
 
 export default function GameView() {
@@ -79,12 +100,15 @@ export default function GameView() {
     const cells = new Int8Array(81);
     for (let c = 0; c < 81; c++) cells[c] = game.cell(c);
     const turn = game.turn() as 0 | 1;
-    const state = game.state();
-    const ply = game.ply();
-    const lostBlack = game.lost(wasm.WasmSide.Black);
-    const lostWhite = game.lost(wasm.WasmSide.White);
-    const legalCount = game.legal_indices().length;
-    return { cells, turn, state, ply, lostBlack, lostWhite, legalCount };
+    return {
+      cells,
+      turn,
+      state: game.state(),
+      ply: game.ply(),
+      lostBlack: game.lost(wasm.WasmSide.Black),
+      lostWhite: game.lost(wasm.WasmSide.White),
+      legalCount: game.legal_indices().length,
+    };
     // tick triggers re-derive after mutation
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wasm, game, tick]);
@@ -104,7 +128,6 @@ export default function GameView() {
       const owner = snapshot.cells[d.startCell];
       const cur = selectionRef.current;
       if (owner !== snapshot.turn) {
-        // Clicked empty or opponent: clear selection.
         setSelection([]);
       } else if (cur.includes(d.startCell)) {
         setSelection(cur.filter((c) => c !== d.startCell));
@@ -115,23 +138,19 @@ export default function GameView() {
         setSelection(isValidGroup(next) ? next : [d.startCell]);
       }
     } else {
-      // Drag: try to apply a move.
-      const dirIdx = nearestDirIdx(dx, dy);
-      if (dirIdx != null) {
-        const cur = selectionRef.current;
-        const movingCells = cur.includes(d.startCell) ? cur : [d.startCell];
-        const idx = game.find_move(new Uint8Array(movingCells), dirIdx);
-        if (idx >= 0) {
-          game.apply_index(idx);
-          setSelection([]);
-          setTick((t) => t + 1);
-        }
+      // Drag: apply if currently snapped to a legal target.
+      const cur = selectionRef.current;
+      const movingCells = cur.includes(d.startCell) ? cur : [d.startCell];
+      const snap = findSnap(game, movingCells, dx, dy);
+      if (snap && snap.dist < SNAP_RADIUS) {
+        game.apply_index(snap.moveIdx);
+        setSelection([]);
+        setTick((t) => t + 1);
       }
     }
     setDrag(null);
   }, [game, snapshot]);
 
-  // Window-level move/up listeners while dragging.
   useEffect(() => {
     if (!drag) return;
     const onMove = (e: PointerEvent) => {
@@ -150,29 +169,93 @@ export default function GameView() {
     };
   }, [drag, finalizeGesture]);
 
-  const ghost = useMemo(() => {
+  const moving: MovingState | null = useMemo(() => {
     if (!drag || !game || !snapshot) return null;
     const dx = drag.currentX - drag.startX;
     const dy = drag.currentY - drag.startY;
     if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return null;
-    const dirIdx = nearestDirIdx(dx, dy);
-    if (dirIdx == null) return null;
+
+    const turnSide = snapshot.turn;
+    const oppSide = (turnSide === 0 ? 1 : 0) as 0 | 1;
+    if (snapshot.cells[drag.startCell] !== turnSide) return null;
 
     const movingCells = selection.includes(drag.startCell)
       ? selection
       : [drag.startCell];
-    const shift = DIR_SHIFTS[dirIdx];
-    const destCells = movingCells
-      .map((c) => c + shift)
-      .filter((c) => isValid(c));
-    const legal =
-      destCells.length === movingCells.length &&
-      game.find_move(new Uint8Array(movingCells), dirIdx) >= 0;
+
+    const snap = findSnap(game, movingCells, dx, dy);
+
+    if (!snap || snap.dist >= SNAP_RADIUS) {
+      // Free-drag: marbles trail the cursor.
+      const ownPositions = movingCells.map((c) => {
+        const center = cellCenter(c);
+        return { x: center.x + dx, y: center.y + dy };
+      });
+      return {
+        ownerColor: turnSide,
+        oppColor: oppSide,
+        ownFromCells: movingCells,
+        ownPositions,
+        snapped: false,
+        ownToCells: [],
+        oppFromCells: [],
+        oppToPositions: [],
+      };
+    }
+
+    // Snapped: compute the full sumito preview from a hypothetical apply.
+    const dirShift = DIR_SHIFTS[snap.dirIdx];
+    const ownToCells = movingCells.map((c) => c + dirShift);
+    const ownPositions = ownToCells.map(cellCenter);
+
+    const post = game.move_preview(snap.moveIdx);
+
+    const oppFromCells: number[] = [];
+    const oppToCells: number[] = [];
+    let preOppCount = 0;
+    let postOppCount = 0;
+    for (let c = 0; c < 81; c++) {
+      const wasOpp = snapshot.cells[c] === oppSide;
+      const isOpp = post[c] === oppSide;
+      if (wasOpp) preOppCount++;
+      if (isOpp) postOppCount++;
+      if (wasOpp && !isOpp) oppFromCells.push(c);
+      if (!wasOpp && isOpp) oppToCells.push(c);
+    }
+
+    const oppToPositions = oppToCells.map((c) => ({
+      ...cellCenter(c),
+      offBoard: false,
+    }));
+
+    // Pushed off: walk forward from any opp_from cell to find the front-most
+    // pre-state opp marble, then render past the front edge.
+    const pushedOff = preOppCount - postOppCount;
+    if (pushedOff > 0 && oppFromCells.length > 0) {
+      let front = oppFromCells[0];
+      while (
+        isValid(front + dirShift) &&
+        snapshot.cells[front + dirShift] === oppSide
+      ) {
+        front += dirShift;
+      }
+      const fc = cellCenter(front);
+      oppToPositions.push({
+        x: fc.x + DIR_PIXEL[snap.dirIdx].dx,
+        y: fc.y + DIR_PIXEL[snap.dirIdx].dy,
+        offBoard: true,
+      });
+    }
+
     return {
-      sourceCells: movingCells,
-      destCells,
-      legal,
-      movingOwner: snapshot.turn,
+      ownerColor: turnSide,
+      oppColor: oppSide,
+      ownFromCells: movingCells,
+      ownPositions,
+      snapped: true,
+      ownToCells,
+      oppFromCells,
+      oppToPositions,
     };
   }, [drag, game, selection, snapshot]);
 
@@ -200,7 +283,11 @@ export default function GameView() {
     setTick((t) => t + 1);
   };
 
-  const onCellPointerDown = (cell: number, clientX: number, clientY: number) => {
+  const onCellPointerDown = (
+    cell: number,
+    clientX: number,
+    clientY: number
+  ) => {
     setDrag({
       startCell: cell,
       startX: clientX,
@@ -252,13 +339,15 @@ export default function GameView() {
       <HexBoard
         cells={snapshot.cells}
         selection={selection}
-        ghost={ghost}
+        moving={moving}
         onCellPointerDown={onCellPointerDown}
       />
-      <div style={{ color: "var(--muted)", fontSize: 12 }}>
-        Click a marble to select (up to 3 in a line). Drag a selected marble in
-        any of the 6 hex directions to move. Drag from an unselected own marble
-        to move just that marble.
+      <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.5 }}>
+        Click a marble to select; click more in line for a 2- or 3-piece group.
+        Drag any selected marble — the group drifts with your cursor and snaps
+        onto a legal landing when you get close. Releasing while snapped applies
+        the move; releasing elsewhere returns the marbles. Pushed opponents
+        appear at their new positions; captured marbles fade past the edge.
       </div>
     </div>
   );
