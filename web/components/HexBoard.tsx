@@ -1,22 +1,26 @@
 "use client";
 
 const HEX_SIZE = 30;
-const W = Math.sqrt(3) * HEX_SIZE; // ~51.96 — horizontal step (E direction)
-const H = 1.5 * HEX_SIZE; // 45 — vertical step
+const W = Math.sqrt(3) * HEX_SIZE; // horizontal step (E direction)
+const H = 1.5 * HEX_SIZE; // vertical step (NW/NE rows)
 const PAD = HEX_SIZE + 4;
 
-// Total board: r = 0..8 (9 rows), q = 0..8 (varies per row).
-// At row E (r=4), q ∈ 0..=8 spans the widest x-range. Cells offset by indent r/2.
-// Convert (q, r) to pixel center; r=8 (I) at top of screen.
 function cellCenter(q: number, r: number) {
-  // Shift x by +2*W so the row-E leftmost cell sits at x=0.
+  // r=8 (row I) at top; row E (r=4) at center.
   const x = W * (q - r / 2 + 2) + PAD;
   const y = H * (8 - r) + PAD;
   return { x, y };
 }
 
+export function isValid(c: number): boolean {
+  if (c < 0 || c >= 81) return false;
+  const r = Math.floor(c / 9);
+  const q = c % 9;
+  return q >= 0 && q < 9 && r < 9 && Math.abs(q - r) <= 4;
+}
+
 function hexPath(cx: number, cy: number, size: number): string {
-  // Pointy-top hex: 6 vertices at angles -90°, -30°, 30°, 90°, 150°, 210°.
+  // Pointy-top hex: vertices at angles -90°, -30°, 30°, 90°, 150°, 210°.
   const pts: string[] = [];
   for (let i = 0; i < 6; i++) {
     const a = (-Math.PI / 2) + (Math.PI / 3) * i;
@@ -25,25 +29,30 @@ function hexPath(cx: number, cy: number, size: number): string {
   return pts.join(" ");
 }
 
-function isValid(q: number, r: number): boolean {
-  return q >= 0 && q < 9 && r >= 0 && r < 9 && Math.abs(q - r) <= 4;
-}
-
-const VIEW_W = W * 8 + 4 * W + PAD * 2; // generous; we'll recompute from cells
-const VIEW_H = H * 8 + PAD * 2;
-
 interface Props {
   cells: Int8Array;
-  highlightedSources: number[];
+  selection: number[];
+  ghost: {
+    sourceCells: number[];
+    destCells: number[];
+    legal: boolean;
+    movingOwner: 0 | 1;
+  } | null;
+  onCellPointerDown: (cell: number, clientX: number, clientY: number) => void;
 }
 
-export default function HexBoard({ cells, highlightedSources }: Props) {
+export default function HexBoard({
+  cells,
+  selection,
+  ghost,
+  onCellPointerDown,
+}: Props) {
   // Compute exact bounds for SVG viewBox.
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   const positions: { q: number; r: number; x: number; y: number; c: number }[] = [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let r = 0; r < 9; r++) {
     for (let q = 0; q < 9; q++) {
-      if (!isValid(q, r)) continue;
+      if (Math.abs(q - r) > 4) continue;
       const { x, y } = cellCenter(q, r);
       positions.push({ q, r, x, y, c: r * 9 + q });
       minX = Math.min(minX, x - HEX_SIZE);
@@ -54,31 +63,102 @@ export default function HexBoard({ cells, highlightedSources }: Props) {
   }
   const width = maxX - minX;
   const height = maxY - minY;
-  const highlight = new Set(highlightedSources);
+
+  const selSet = new Set(selection);
+  const ghostSrc = new Set(ghost?.sourceCells ?? []);
+  const ghostDst = new Set(ghost?.destCells ?? []);
+  const ghostColor = ghost?.movingOwner === 0 ? "var(--black)" : "var(--white)";
+  const ghostStrokeColor = ghost?.movingOwner === 0 ? "#444" : "#666";
+  const targetRing = ghost?.legal ? "#62d35e" : "#e25c5c";
 
   return (
     <svg
       width={width}
       height={height}
       viewBox={`${minX} ${minY} ${width} ${height}`}
-      style={{ background: "var(--panel)", borderRadius: 12 }}
+      style={{
+        background: "var(--panel)",
+        borderRadius: 12,
+        userSelect: "none",
+        touchAction: "none",
+      }}
     >
-      {positions.map(({ q, r, x, y, c }) => {
-        const owner = cells[c]; // -1 empty, 0 black, 1 white
-        const isHighlighted = highlight.has(c);
+      {positions.map(({ x, y, c }) => {
+        const owner = cells[c]; // -1, 0, 1
+        const isSelected = selSet.has(c);
+        const isGhostSrc = ghostSrc.has(c);
+        const isGhostDst = ghostDst.has(c);
+        const marbleOpacity = isGhostSrc ? 0.25 : 1;
         return (
           <g key={c}>
             <polygon
               points={hexPath(x, y, HEX_SIZE)}
-              fill={isHighlighted ? "var(--accent-soft)" : "var(--bg)"}
-              stroke={isHighlighted ? "var(--highlight)" : "var(--border)"}
-              strokeWidth={isHighlighted ? 2 : 1}
+              fill="var(--bg)"
+              stroke="var(--border)"
+              strokeWidth={1}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                onCellPointerDown(c, e.clientX, e.clientY);
+              }}
+              style={{ cursor: owner >= 0 ? "grab" : "default" }}
             />
             {owner === 0 && (
-              <circle cx={x} cy={y} r={HEX_SIZE * 0.62} fill="var(--black)" stroke="#444" strokeWidth={1} />
+              <circle
+                cx={x}
+                cy={y}
+                r={HEX_SIZE * 0.62}
+                fill="var(--black)"
+                stroke="#444"
+                strokeWidth={1}
+                opacity={marbleOpacity}
+                pointerEvents="none"
+              />
             )}
             {owner === 1 && (
-              <circle cx={x} cy={y} r={HEX_SIZE * 0.62} fill="var(--white)" stroke="#666" strokeWidth={1} />
+              <circle
+                cx={x}
+                cy={y}
+                r={HEX_SIZE * 0.62}
+                fill="var(--white)"
+                stroke="#666"
+                strokeWidth={1}
+                opacity={marbleOpacity}
+                pointerEvents="none"
+              />
+            )}
+            {isGhostDst && ghost && (
+              <>
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={HEX_SIZE * 0.62}
+                  fill={ghostColor}
+                  stroke={ghostStrokeColor}
+                  strokeWidth={1}
+                  opacity={0.55}
+                  pointerEvents="none"
+                />
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={HEX_SIZE * 0.78}
+                  fill="none"
+                  stroke={targetRing}
+                  strokeWidth={2}
+                  pointerEvents="none"
+                />
+              </>
+            )}
+            {isSelected && (
+              <circle
+                cx={x}
+                cy={y}
+                r={HEX_SIZE * 0.78}
+                fill="none"
+                stroke="var(--highlight)"
+                strokeWidth={2.5}
+                pointerEvents="none"
+              />
             )}
             <text
               x={x}
@@ -88,8 +168,8 @@ export default function HexBoard({ cells, highlightedSources }: Props) {
               textAnchor="middle"
               style={{ pointerEvents: "none", userSelect: "none" }}
             >
-              {String.fromCharCode(65 + r)}
-              {q + 1}
+              {String.fromCharCode(65 + Math.floor(c / 9))}
+              {(c % 9) + 1}
             </text>
           </g>
         );

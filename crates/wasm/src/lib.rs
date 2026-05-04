@@ -136,6 +136,49 @@ impl WasmGame {
         self.inner.apply(m);
     }
 
+    /// Find the legal move whose source cells equal `cells` (any order) and
+    /// whose direction of motion is `dir_idx` (0..6, matching `Dir`). Returns
+    /// the move index, or -1 if no such move exists.
+    ///
+    /// "Direction of motion" is the inline direction for inline moves, or
+    /// the move_dir for broadside moves.
+    pub fn find_move(&self, cells: Vec<u8>, dir_idx: u8) -> i32 {
+        if dir_idx >= 6 {
+            return -1;
+        }
+        let want_dir = abalone_engine::Dir::from_idx(dir_idx);
+
+        let mut want_set: u128 = 0;
+        for &c in &cells {
+            if (c as usize) >= 81 {
+                return -1;
+            }
+            want_set |= 1u128 << c;
+        }
+
+        for m in self.inner.legal_moves() {
+            let motion = match m {
+                Move::Inline { dir, .. } => dir,
+                Move::Broadside { move_dir, .. } => move_dir,
+            };
+            if motion as u8 != want_dir as u8 {
+                continue;
+            }
+            // Build the source-cell bitset for this move and compare.
+            let src = self.move_source_cells(encode(m));
+            let mut got_set: u128 = 0;
+            for &c in &src {
+                if c != 0xFF {
+                    got_set |= 1u128 << c;
+                }
+            }
+            if got_set == want_set {
+                return encode(m) as i32;
+            }
+        }
+        -1
+    }
+
     pub fn debug_render(&self) -> String {
         format!("{}", self.inner.board)
     }
