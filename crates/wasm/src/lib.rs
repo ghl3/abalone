@@ -7,6 +7,10 @@
 //!   * Cells cross as `u8` indices `0..81`; JS computes (q, r) by `(c % 9, c / 9)`.
 
 use abalone_game::{decode, encode, Game, GameState, Move, Side};
+use abalone_mcts::eval::{evaluate, Weights};
+use abalone_mcts::{heuristic, search, SearchConfig};
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -200,6 +204,101 @@ impl WasmGame {
 
     pub fn debug_render(&self) -> String {
         format!("{}", self.inner.board)
+    }
+
+    /// Heuristic eval of the current position from White's POV (positive
+    /// = White advantage, negative = Black advantage). Range [-1, 1].
+    /// O(1); useful as the eval-bar value when the analysis panel is off
+    /// or while MCTS is computing.
+    pub fn eval_white_pov(&self) -> f32 {
+        let pov_to_move = evaluate(&self.inner.board, self.inner.turn, &Weights::default());
+        match self.inner.turn {
+            Side::White => pov_to_move,
+            Side::Black => -pov_to_move,
+        }
+    }
+
+    /// Run heuristic-MCTS for `simulations` iterations from the current
+    /// position and return ranked children with their Q-values (white POV)
+    /// and visit counts. Returns `None` if the game is terminal.
+    pub fn analyze(&self, simulations: u32) -> Option<AnalysisResult> {
+        if self.inner.is_terminal() {
+            return None;
+        }
+        let cfg = SearchConfig {
+            simulations: simulations.max(1),
+            c_puct: 1.4,
+        };
+        // Heuristic eval is deterministic given a position; rng is only
+        // needed to satisfy the search signature.
+        let mut rng = SmallRng::seed_from_u64(0);
+        let res = search(&self.inner, &cfg, &mut rng, heuristic)?;
+
+        let to_white_sign = if self.inner.turn == Side::White {
+            1.0f32
+        } else {
+            -1.0f32
+        };
+
+        let n = res.visits.len();
+        let mut indices = Vec::with_capacity(n);
+        let mut evals = Vec::with_capacity(n);
+        let mut visits = Vec::with_capacity(n);
+        for (&(mv, v), &q) in res.visits.iter().zip(res.q_parent_pov.iter()) {
+            indices.push(encode(mv));
+            evals.push(q * to_white_sign);
+            visits.push(v);
+        }
+
+        // Root eval: the Q-value of the most-visited child (the engine's
+        // recommended line) from white POV. This gives the eval bar a
+        // search-derived value, not just a static heuristic snapshot.
+        let root_eval = res
+            .visits
+            .iter()
+            .zip(res.q_parent_pov.iter())
+            .max_by_key(|((_, v), _)| *v)
+            .map(|(_, q)| *q * to_white_sign)
+            .unwrap_or(0.0);
+
+        Some(AnalysisResult {
+            indices,
+            evals,
+            visits,
+            root_eval,
+        })
+    }
+}
+
+/// Result of a single MCTS analysis pass. Fields are exposed via getters
+/// so JS can pull out parallel arrays in one allocation each.
+#[wasm_bindgen]
+pub struct AnalysisResult {
+    indices: Vec<u16>,
+    evals: Vec<f32>,
+    visits: Vec<u32>,
+    root_eval: f32,
+}
+
+#[wasm_bindgen]
+impl AnalysisResult {
+    /// Move indices for every legal move, in the same order as
+    /// [`evals`](Self::evals) and [`visits`](Self::visits).
+    pub fn indices(&self) -> Vec<u16> {
+        self.indices.clone()
+    }
+    /// Q-value of each move from White's POV (positive = White advantage).
+    pub fn evals(&self) -> Vec<f32> {
+        self.evals.clone()
+    }
+    /// MCTS visit count of each move.
+    pub fn visits(&self) -> Vec<u32> {
+        self.visits.clone()
+    }
+    /// Engine's evaluation of the current root position (white POV) — the
+    /// Q-value of the most-visited child.
+    pub fn root_eval(&self) -> f32 {
+        self.root_eval
     }
 }
 

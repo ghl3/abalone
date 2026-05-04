@@ -9,16 +9,16 @@ import HexBoard, {
   isValid,
   type MovingState,
 } from "./HexBoard";
+import EvalBar from "./EvalBar";
+import AnalysisPanel, { type AnalysisMove } from "./AnalysisPanel";
 
 type WasmModule = typeof import("abalone-wasm");
 
-const DRAG_THRESHOLD = 10; // px below which a release is treated as a click
-const SNAP_RADIUS = HEX_SIZE * 0.85; // px from the ideal cell center to engage snap
-
-// Positive directions used to validate a 2/3-marble line group.
+const DRAG_THRESHOLD = 10;
+const SNAP_RADIUS = HEX_SIZE * 0.85;
 const POSITIVE_DIR_SHIFTS = [1, 10, 9];
+const ANALYSIS_TOP_N = 5;
 
-/** Cells form a contiguous line in one of the 3 hex axes (or a single cell). */
 function isValidGroup(cells: number[]): boolean {
   if (cells.length <= 1) return true;
   if (cells.length > 3) return false;
@@ -42,8 +42,6 @@ interface SnapResult {
   dist: number;
 }
 
-/** Pick the closest legal-move snap candidate (by Euclidean distance from the
- *  ideal pixel offset). Returns null if no legal move in any direction. */
 function findSnap(
   game: InstanceType<WasmModule["WasmGame"]>,
   movingCells: number[],
@@ -62,6 +60,80 @@ function findSnap(
   return best;
 }
 
+/** Build a snapped MovingState from a move idx — used for hover preview
+ *  on an analysis row. Mirrors the snap-state branch of the drag preview
+ *  but doesn't depend on cursor position. */
+function buildHoverPreview(
+  game: InstanceType<WasmModule["WasmGame"]>,
+  cells: Int8Array,
+  turnSide: 0 | 1,
+  moveIdx: number
+): MovingState {
+  const oppSide = (turnSide === 0 ? 1 : 0) as 0 | 1;
+  const srcRaw = Array.from(game.move_source_cells(moveIdx));
+  const ownFromCells = srcRaw.filter((c) => c !== 0xff);
+  const post = game.move_preview(moveIdx);
+
+  const ownToCells: number[] = [];
+  const oppFromCells: number[] = [];
+  const oppToCells: number[] = [];
+  let preOppCount = 0,
+    postOppCount = 0;
+  for (let c = 0; c < 81; c++) {
+    const wasOwn = cells[c] === turnSide;
+    const isOwn = post[c] === turnSide;
+    const wasOpp = cells[c] === oppSide;
+    const isOpp = post[c] === oppSide;
+    if (wasOpp) preOppCount++;
+    if (isOpp) postOppCount++;
+    if (!wasOwn && isOwn) ownToCells.push(c);
+    if (wasOpp && !isOpp) oppFromCells.push(c);
+    if (!wasOpp && isOpp) oppToCells.push(c);
+  }
+
+  const ownPositions = ownToCells.map(cellCenter);
+  const oppToPositions = oppToCells.map((c) => ({
+    ...cellCenter(c),
+    offBoard: false,
+  }));
+
+  // Pushed off: walk forward along the implied push direction. We can
+  // infer the direction from any (own_from, own_to) pair via DIR_SHIFTS.
+  if (preOppCount > postOppCount && oppFromCells.length > 0 && ownFromCells.length > 0) {
+    const dirShift =
+      ownToCells.length > 0 && ownFromCells.length > 0
+        ? ownToCells[0] - ownFromCells[0]
+        : null;
+    const dirIdx = dirShift == null ? -1 : DIR_SHIFTS.indexOf(dirShift);
+    if (dirIdx >= 0) {
+      let front = oppFromCells[0];
+      while (
+        isValid(front + DIR_SHIFTS[dirIdx]) &&
+        cells[front + DIR_SHIFTS[dirIdx]] === oppSide
+      ) {
+        front += DIR_SHIFTS[dirIdx];
+      }
+      const fc = cellCenter(front);
+      oppToPositions.push({
+        x: fc.x + DIR_PIXEL[dirIdx].dx,
+        y: fc.y + DIR_PIXEL[dirIdx].dy,
+        offBoard: true,
+      });
+    }
+  }
+
+  return {
+    ownerColor: turnSide,
+    oppColor: oppSide,
+    ownFromCells,
+    ownPositions,
+    snapped: true,
+    ownToCells,
+    oppFromCells,
+    oppToPositions,
+  };
+}
+
 export default function GameView() {
   const [wasm, setWasm] = useState<WasmModule | null>(null);
   const [game, setGame] = useState<InstanceType<WasmModule["WasmGame"]> | null>(
@@ -77,6 +149,12 @@ export default function GameView() {
     currentX: number;
     currentY: number;
   } | null>(null);
+
+  const [showEngine, setShowEngine] = useState(true);
+  const [simulations, setSimulations] = useState(500);
+  const [hoveredAnalysisIdx, setHoveredAnalysisIdx] = useState<number | null>(
+    null
+  );
 
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
@@ -99,10 +177,9 @@ export default function GameView() {
     if (!wasm || !game) return null;
     const cells = new Int8Array(81);
     for (let c = 0; c < 81; c++) cells[c] = game.cell(c);
-    const turn = game.turn() as 0 | 1;
     return {
       cells,
-      turn,
+      turn: game.turn() as 0 | 1,
       state: game.state(),
       ply: game.ply(),
       lostBlack: game.lost(wasm.WasmSide.Black),
@@ -112,6 +189,30 @@ export default function GameView() {
     // tick triggers re-derive after mutation
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wasm, game, tick]);
+
+  // Compute MCTS analysis. Wasm-side `AnalysisResult` is freed before
+  // useMemo returns; we keep only plain JS data.
+  const analysis = useMemo(() => {
+    if (!wasm || !game || !snapshot || !showEngine) return null;
+    if (snapshot.legalCount === 0) return null;
+    const r = game.analyze(simulations);
+    if (!r) return null;
+    const indices = Array.from(r.indices());
+    const evals = Array.from(r.evals());
+    const visits = Array.from(r.visits());
+    const rootEval = r.root_eval();
+    r.free();
+    const moves: AnalysisMove[] = indices.map((idx, i) => ({
+      idx,
+      notation: wasm.move_notation(idx),
+      evalWhite: evals[i],
+      visits: visits[i],
+    }));
+    moves.sort((a, b) => b.visits - a.visits);
+    const totalVisits = visits.reduce((s, v) => s + v, 0);
+    return { rootEval, topMoves: moves.slice(0, ANALYSIS_TOP_N), totalVisits };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wasm, game, snapshot, showEngine, simulations, tick]);
 
   const finalizeGesture = useCallback(() => {
     const d = dragRef.current;
@@ -124,7 +225,6 @@ export default function GameView() {
     const dist = Math.hypot(dx, dy);
 
     if (dist < DRAG_THRESHOLD) {
-      // Click: toggle selection.
       const owner = snapshot.cells[d.startCell];
       const cur = selectionRef.current;
       if (owner !== snapshot.turn) {
@@ -138,13 +238,13 @@ export default function GameView() {
         setSelection(isValidGroup(next) ? next : [d.startCell]);
       }
     } else {
-      // Drag: apply if currently snapped to a legal target.
       const cur = selectionRef.current;
       const movingCells = cur.includes(d.startCell) ? cur : [d.startCell];
       const snap = findSnap(game, movingCells, dx, dy);
       if (snap && snap.dist < SNAP_RADIUS) {
         game.apply_index(snap.moveIdx);
         setSelection([]);
+        setHoveredAnalysisIdx(null);
         setTick((t) => t + 1);
       }
     }
@@ -169,7 +269,7 @@ export default function GameView() {
     };
   }, [drag, finalizeGesture]);
 
-  const moving: MovingState | null = useMemo(() => {
+  const dragMoving: MovingState | null = useMemo(() => {
     if (!drag || !game || !snapshot) return null;
     const dx = drag.currentX - drag.startX;
     const dy = drag.currentY - drag.startY;
@@ -186,7 +286,6 @@ export default function GameView() {
     const snap = findSnap(game, movingCells, dx, dy);
 
     if (!snap || snap.dist >= SNAP_RADIUS) {
-      // Free-drag: marbles trail the cursor.
       const ownPositions = movingCells.map((c) => {
         const center = cellCenter(c);
         return { x: center.x + dx, y: center.y + dy };
@@ -203,17 +302,15 @@ export default function GameView() {
       };
     }
 
-    // Snapped: compute the full sumito preview from a hypothetical apply.
     const dirShift = DIR_SHIFTS[snap.dirIdx];
     const ownToCells = movingCells.map((c) => c + dirShift);
     const ownPositions = ownToCells.map(cellCenter);
-
     const post = game.move_preview(snap.moveIdx);
 
     const oppFromCells: number[] = [];
     const oppToCells: number[] = [];
-    let preOppCount = 0;
-    let postOppCount = 0;
+    let preOppCount = 0,
+      postOppCount = 0;
     for (let c = 0; c < 81; c++) {
       const wasOpp = snapshot.cells[c] === oppSide;
       const isOpp = post[c] === oppSide;
@@ -222,16 +319,12 @@ export default function GameView() {
       if (wasOpp && !isOpp) oppFromCells.push(c);
       if (!wasOpp && isOpp) oppToCells.push(c);
     }
-
     const oppToPositions = oppToCells.map((c) => ({
       ...cellCenter(c),
       offBoard: false,
     }));
 
-    // Pushed off: walk forward from any opp_from cell to find the front-most
-    // pre-state opp marble, then render past the front edge.
-    const pushedOff = preOppCount - postOppCount;
-    if (pushedOff > 0 && oppFromCells.length > 0) {
+    if (preOppCount > postOppCount && oppFromCells.length > 0) {
       let front = oppFromCells[0];
       while (
         isValid(front + dirShift) &&
@@ -259,6 +352,19 @@ export default function GameView() {
     };
   }, [drag, game, selection, snapshot]);
 
+  const hoverPreview: MovingState | null = useMemo(() => {
+    if (drag) return null;
+    if (hoveredAnalysisIdx == null || !game || !snapshot) return null;
+    return buildHoverPreview(
+      game,
+      snapshot.cells,
+      snapshot.turn,
+      hoveredAnalysisIdx
+    );
+  }, [drag, hoveredAnalysisIdx, game, snapshot]);
+
+  const moving = dragMoving ?? hoverPreview;
+
   if (!wasm || !game || !snapshot) {
     return <div style={{ color: "var(--muted)" }}>Loading engine…</div>;
   }
@@ -273,6 +379,14 @@ export default function GameView() {
           ? "White wins"
           : "Draw";
 
+  // Eval bar source: prefer MCTS root eval; fall back to static heuristic.
+  const evalForBar =
+    showEngine && analysis
+      ? analysis.rootEval
+      : showEngine
+        ? game.eval_white_pov()
+        : 0;
+
   const reset = (kind: "standard" | "belgian") => {
     game.free();
     setGame(
@@ -280,6 +394,7 @@ export default function GameView() {
     );
     setSelection([]);
     setDrag(null);
+    setHoveredAnalysisIdx(null);
     setTick((t) => t + 1);
   };
 
@@ -297,14 +412,31 @@ export default function GameView() {
     });
   };
 
+  const applyAnalysisMove = (idx: number) => {
+    game.apply_index(idx);
+    setSelection([]);
+    setDrag(null);
+    setHoveredAnalysisIdx(null);
+    setTick((t) => t + 1);
+  };
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div
+    <div
+      style={{
+        maxWidth: 1100,
+        margin: "0 auto",
+        display: "flex",
+        flexDirection: "column",
+        gap: 16,
+      }}
+    >
+      <header
         style={{
           display: "flex",
           gap: 24,
           alignItems: "center",
           flexWrap: "wrap",
+          padding: "4px 0",
         }}
       >
         <div>
@@ -323,32 +455,79 @@ export default function GameView() {
         <div style={{ fontSize: 13 }}>
           <span style={{ color: "var(--muted)" }}>State</span> {stateLabel}
         </div>
-        <div style={{ fontSize: 13 }}>
-          <span style={{ color: "var(--muted)" }}>Legal moves</span>{" "}
-          {snapshot.legalCount}
-        </div>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            fontSize: 13,
+            cursor: "pointer",
+            marginLeft: "auto",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={showEngine}
+            onChange={(e) => setShowEngine(e.target.checked)}
+          />
+          Engine analysis
+        </label>
+        <div style={{ display: "flex", gap: 8 }}>
           <button onClick={() => reset("standard")} style={btnSecondary}>
-            Reset (Standard)
+            Standard
           </button>
           <button onClick={() => reset("belgian")} style={btnSecondary}>
             Belgian Daisy
           </button>
         </div>
+      </header>
+
+      <div
+        style={{
+          display: "flex",
+          gap: 16,
+          alignItems: "stretch",
+          justifyContent: "center",
+        }}
+      >
+        {showEngine && <EvalBar evalWhitePov={evalForBar} />}
+        <HexBoard
+          cells={snapshot.cells}
+          selection={selection}
+          moving={moving}
+          onCellPointerDown={onCellPointerDown}
+        />
+        {showEngine && (
+          <AnalysisPanel
+            topMoves={analysis?.topMoves ?? []}
+            totalVisits={analysis?.totalVisits ?? 0}
+            turnLabel={turnLabel}
+            hoveredIdx={hoveredAnalysisIdx}
+            onHover={setHoveredAnalysisIdx}
+            onApply={applyAnalysisMove}
+            simulations={simulations}
+            onSimulationsChange={setSimulations}
+          />
+        )}
       </div>
-      <HexBoard
-        cells={snapshot.cells}
-        selection={selection}
-        moving={moving}
-        onCellPointerDown={onCellPointerDown}
-      />
-      <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.5 }}>
+
+      <p
+        style={{
+          color: "var(--muted)",
+          fontSize: 12,
+          lineHeight: 1.5,
+          margin: 0,
+          maxWidth: 620,
+          alignSelf: "center",
+          textAlign: "center",
+        }}
+      >
         Click a marble to select; click more in line for a 2- or 3-piece group.
         Drag any selected marble — the group drifts with your cursor and snaps
         onto a legal landing when you get close. Releasing while snapped applies
         the move; releasing elsewhere returns the marbles. Pushed opponents
         appear at their new positions; captured marbles fade past the edge.
-      </div>
+      </p>
     </div>
   );
 }

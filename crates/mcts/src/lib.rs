@@ -63,6 +63,10 @@ pub struct SearchResult {
     pub best: Move,
     /// `(move, visit_count)` for every legal child of the root.
     pub visits: Vec<(Move, u32)>,
+    /// Q-value of each child from the root player's POV, parallel to
+    /// `visits`. Sign convention: positive = good for the side to move at
+    /// the root. Children with zero visits are reported as `0.0`.
+    pub q_parent_pov: Vec<f32>,
 }
 
 /// Run MCTS from `game` for `cfg.simulations` iterations using `eval_fn`
@@ -132,17 +136,33 @@ where
         }
     }
 
-    let visits: Vec<(Move, u32)> = nodes[root as usize]
-        .children
+    let root_children = &nodes[root as usize].children;
+    let visits: Vec<(Move, u32)> = root_children
         .iter()
         .map(|&(mv, cid)| (mv, nodes[cid as usize].n_visits))
+        .collect();
+    let q_parent_pov: Vec<f32> = root_children
+        .iter()
+        .map(|&(_, cid)| {
+            let c = &nodes[cid as usize];
+            if c.n_visits == 0 {
+                0.0
+            } else {
+                // child stores from child's POV; root sees the negation.
+                -(c.total_value / c.n_visits as f32)
+            }
+        })
         .collect();
     let best = visits
         .iter()
         .max_by_key(|&&(_, n)| n)
         .map(|&(mv, _)| mv)
         .expect("non-empty children after expansion");
-    Some(SearchResult { best, visits })
+    Some(SearchResult {
+        best,
+        visits,
+        q_parent_pov,
+    })
 }
 
 /// Random-rollout evaluator: simulate to terminal with uniform-random moves
