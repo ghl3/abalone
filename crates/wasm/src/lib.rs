@@ -1,4 +1,4 @@
-//! WebAssembly wrapper around `abalone-engine` for the React frontend.
+//! WebAssembly wrapper around `abalone-game` for the React frontend.
 //!
 //! The boundary is kept narrow on purpose:
 //!   * `Game` is opaque to JS (a handle wrapping a Rust struct).
@@ -6,7 +6,7 @@
 //!     index list, picks one, and applies it back. No serde, no JSON.
 //!   * Cells cross as `u8` indices `0..81`; JS computes (q, r) by `(c % 9, c / 9)`.
 
-use abalone_engine::{decode, encode, Game, GameState, Move, Side};
+use abalone_game::{decode, encode, Game, GameState, Move, Side};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -165,7 +165,7 @@ impl WasmGame {
         if dir_idx >= 6 {
             return -1;
         }
-        let want_dir = abalone_engine::Dir::from_idx(dir_idx);
+        let want_dir = abalone_game::Dir::from_idx(dir_idx);
 
         let mut want_set: u128 = 0;
         for &c in &cells {

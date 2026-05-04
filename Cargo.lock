@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "abalone-engine"
+name = "abalone-game"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
@@ -13,7 +13,7 @@ dependencies = [
 name = "abalone-mcts"
 version = "0.1.0"
 dependencies = [
- "abalone-engine",
+ "abalone-game",
  "rand",
 ]
 
@@ -21,7 +21,7 @@ dependencies = [
 name = "abalone-wasm"
 version = "0.1.0"
 dependencies = [
- "abalone-engine",
+ "abalone-game",
  "wasm-bindgen",
 ]
 

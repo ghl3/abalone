@@ -1,12 +1,12 @@
 [package]
-name = "abalone-engine"
+name = "abalone-game"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 autobenches = false
 
 [lib]
-name = "abalone_engine"
+name = "abalone_game"
 path = "src/lib.rs"
 
 [dependencies]

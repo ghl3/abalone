@@ -29,7 +29,7 @@
 
 pub mod eval;
 
-use abalone_engine::{Game, GameState, Move, Side};
+use abalone_game::{Game, GameState, Move, Side};
 use rand::Rng;
 
 type NodeId = u32;
@@ -236,7 +236,7 @@ fn outcome_from_pov(pov: Side, g: &Game) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abalone_engine::game::MAX_PLIES;
+    use abalone_game::game::MAX_PLIES;
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 

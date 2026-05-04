@@ -4,7 +4,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use abalone_engine::{
+use abalone_game::{
     Board, Game, GameState, Side,
     moves::legal_moves,
 };
@@ -75,7 +75,7 @@ fn fmt_rate(per_sec: f64) -> String {
 }
 
 fn main() {
-    println!("== abalone-engine micro-bench ==");
+    println!("== abalone-game micro-bench ==");
 
     let standard = Board::standard();
     let belgian = Board::belgian_daisy();

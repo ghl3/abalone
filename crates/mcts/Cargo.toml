@@ -10,7 +10,7 @@ name = "abalone_mcts"
 path = "src/lib.rs"
 
 [dependencies]
-abalone-engine = { path = "../engine" }
+abalone-game = { path = "../game" }
 rand = { version = "0.8", features = ["small_rng"] }
 
 [[bin]]

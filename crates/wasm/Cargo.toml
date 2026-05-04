@@ -8,7 +8,7 @@ authors.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-abalone-engine = { path = "../engine" }
+abalone-game = { path = "../game" }
 wasm-bindgen = "0.2"
 
 [lints]

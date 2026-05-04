@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use abalone_engine::{Game, GameState, Move, Side};
+use abalone_game::{Game, GameState, Move, Side};
 use abalone_mcts::eval::Weights;
 use abalone_mcts::{eval, heuristic, random_rollout, search, SearchConfig, SearchResult};
 use rand::rngs::SmallRng;

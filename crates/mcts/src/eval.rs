@@ -12,8 +12,8 @@
 //!    counted along the three positive hex axes (so each pair counted
 //!    once). Cohesive groups resist push attacks.
 
-use abalone_engine::bitboard::{popcount, shift, BB};
-use abalone_engine::{Board, Side, POSITIVE_DIRS};
+use abalone_game::bitboard::{popcount, shift, BB};
+use abalone_game::{Board, Side, POSITIVE_DIRS};
 
 #[derive(Clone, Debug)]
 pub struct Weights {
@@ -117,7 +117,7 @@ pub fn evaluate(board: &Board, to_move: Side, w: &Weights) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abalone_engine::cell::parse;
+    use abalone_game::cell::parse;
 
     #[test]
     fn centerness_is_4_at_e5() {
