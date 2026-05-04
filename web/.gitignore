@@ -1,0 +1,13 @@
+# Next.js
+.next/
+out/
+next-env.d.ts
+
+# Dependencies
+node_modules/
+
+# Generated wasm pkg (rebuilt by `npm run build:wasm`)
+wasm/
+
+# Build artifacts
+*.tsbuildinfo

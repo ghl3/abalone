@@ -1,0 +1,25 @@
+{
+  "name": "abalone-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "build:wasm": "wasm-pack build ../crates/wasm --target bundler --out-dir ../../web/wasm",
+    "prebuild": "npm run build:wasm",
+    "predev": "npm run build:wasm"
+  },
+  "dependencies": {
+    "abalone-wasm": "file:./wasm",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5"
+  }
+}

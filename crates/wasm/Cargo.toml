@@ -1,0 +1,15 @@
+[package]
+name = "abalone-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abalone-engine = { path = "../engine" }
+wasm-bindgen = "0.2"
+
+[lints]
+workspace = true
