@@ -1,3 +1,18 @@
 /target
 .idea
 .claude
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# Training artifacts (run-specific; reproducible from config)
+runs/
+checkpoints/
+
+# Sandbox files
+*.tmp
