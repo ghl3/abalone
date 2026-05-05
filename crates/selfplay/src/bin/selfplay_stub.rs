@@ -1,12 +1,12 @@
 //! End-to-end self-play smoke test: heuristic-MCTS as the leaf evaluator,
-//! writing a binary shard. Run with:
+//! writing a parquet shard. Run with:
 //!
 //!     cargo run --release -p abalone-selfplay --bin selfplay-stub -- \
-//!         --games 4 --simulations 100 --out /tmp/abalone_shard_stub.bin
+//!         --games 4 --simulations 100 --out /tmp/abalone_shard_stub.parquet
 //!
-//! The output shard is then consumable by the Python training-side
-//! reader (to be written) and lets us verify the format independently
-//! of the NN bridge.
+//! The output shard is consumable by `pyarrow.parquet.read_table` on
+//! the Python side and lets us verify the format independently of the
+//! NN bridge.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -19,7 +19,7 @@ use rand::SeedableRng;
 fn parse_args() -> (u32, u32, PathBuf, u64) {
     let mut games = 4u32;
     let mut simulations = 100u32;
-    let mut out = PathBuf::from("/tmp/abalone_shard_stub.bin");
+    let mut out = PathBuf::from("/tmp/abalone_shard_stub.parquet");
     let mut seed = 0u64;
 
     let mut args = std::env::args().skip(1);
@@ -54,7 +54,7 @@ fn main() {
         temperature: 1.0,
     };
 
-    let mut writer = ShardWriter::create(&out, simulations).expect("create shard");
+    let mut writer = ShardWriter::create(&out).expect("create shard");
     let t = Instant::now();
 
     for i in 0..games {
@@ -73,13 +73,12 @@ fn main() {
         );
     }
 
-    let entries = writer.entries_written;
-    let bytes = writer.bytes_written;
-    writer.finish().expect("finish");
+    let entries = writer.finish().expect("finish");
+    let on_disk = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
 
     let dt = t.elapsed();
     println!(
         "wrote {} entries / {} bytes in {:?}  ({} games)",
-        entries, bytes, dt, games
+        entries, on_disk, dt, games
     );
 }

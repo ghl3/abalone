@@ -13,6 +13,12 @@ path = "src/lib.rs"
 abalone-game = { path = "../game" }
 abalone-mcts = { path = "../mcts" }
 rand = { version = "0.8", features = ["small_rng"] }
+# Arrow IPC + Parquet for shard files. Picked over a hand-rolled binary
+# format because (a) pyarrow gives Python zero-copy numpy reads, (b)
+# columnar layout + snappy compresses our low-entropy bitboards 2-5x,
+# (c) schema evolution is documented.
+arrow = "55"
+parquet = { version = "55", features = ["arrow"] }
 
 [[bin]]
 name = "selfplay-stub"
