@@ -15,14 +15,11 @@ self_play:
   dirichlet_alpha: 0.3
   dirichlet_eps: 0.25
   worker_threads: 2
-  inference_batch_size: 4
-  inference_batch_timeout_us: 1000
 
 train:
   steps_per_gen: 10
   batch_size: 32
   learning_rate: 1.0e-3
-  lr_warmup_steps: 0
   weight_decay: 1.0e-4
   value_loss_weight: 0.5
   value_target_blend_start: 0.5

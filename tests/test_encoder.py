@@ -33,7 +33,6 @@ from model.encoder import (
     NUM_CELLS,
     NUM_DIRS,
     NUM_SYMS,
-    NUM_VALID,
     POSITIVE_DIRS,
     SYM_MATS,
     VALID_CELL_MASK,
@@ -45,7 +44,6 @@ from model.encoder import (
     encode_broadside,
     encode_inline,
 )
-
 
 # ----- helpers ---------------------------------------------------------------
 

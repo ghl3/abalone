@@ -20,14 +20,6 @@ Phase = Literal[
     "self_play", "training", "export", "gate", "heuristic_eval", "random_eval", "complete"
 ]
 
-PHASES_IN_ORDER: tuple[Phase, ...] = (
-    "self_play",
-    "training",
-    "export",
-    "gate",
-    "heuristic_eval",
-    "random_eval",
-)
 
 
 @dataclass
@@ -98,25 +90,10 @@ class RunState:
                 pass
             raise
 
-    # Phase advancement helpers.
-
-    def advance_phase(self) -> None:
-        if self.current_phase == "complete":
-            self._roll_to_next_gen()
-            return
-        idx = PHASES_IN_ORDER.index(self.current_phase)
-        if idx + 1 < len(PHASES_IN_ORDER):
-            self.current_phase = PHASES_IN_ORDER[idx + 1]
-        else:
-            self.current_phase = "complete"
-
-    def _roll_to_next_gen(self) -> None:
-        self.current_gen += 1
-        self.current_phase = "self_play"
-
     def begin_next_gen(self) -> None:
         """Call after the current gen's `complete` phase to move on."""
-        self._roll_to_next_gen()
+        self.current_gen += 1
+        self.current_phase = "self_play"
 
     def append_history(self, record: GenRecord) -> None:
         self.history.append(record)

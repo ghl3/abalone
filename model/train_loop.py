@@ -31,11 +31,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
 from model.abalone_net import AbaloneNet
 from model.config import RunConfig
-from model.eval import run_eval_match, run_self_play
+from model.eval import run_eval_match, start_self_play
 from model.export_onnx import export as export_onnx
 from model.replay_buffer import ReplayBuffer, find_shards_for_gen
 from model.run_id import generate_unique
@@ -57,13 +56,6 @@ def _resolve_run_dir(cfg: RunConfig, run_id: str) -> Path:
     return REPO_ROOT / cfg.runs_root / run_id
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
-
-
 def _save_ckpt(model: AbaloneNet, optimizer: torch.optim.Optimizer, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -81,33 +73,6 @@ def _load_ckpt(path: Path, model: AbaloneNet, optimizer: torch.optim.Optimizer) 
     state = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
-
-
-def _bootstrap_initial_model(
-    run_dir: Path, cfg: RunConfig
-) -> tuple[Path, Path, AbaloneNet, torch.optim.Optimizer]:
-    """Generation 0 setup: a randomly-initialized model exported to
-    ONNX so self-play has something to load. Saves both .pt and
-    .onnx as `gen_000.{pt,onnx}` and points `best.onnx` at the .onnx."""
-    ckpt_dir = run_dir / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    pt_path = ckpt_dir / "gen_000.pt"
-    onnx_path = ckpt_dir / "gen_000.onnx"
-
-    model = AbaloneNet().to(_device())
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.train.learning_rate,
-        weight_decay=cfg.train.weight_decay,
-    )
-
-    if not pt_path.exists():
-        _save_ckpt(model, optimizer, pt_path)
-    if not onnx_path.exists():
-        export_onnx(model, onnx_path)
-        _link_or_copy(onnx_path, ckpt_dir / "best.onnx")
-
-    return pt_path, onnx_path, model, optimizer
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -306,7 +271,7 @@ def _setup_signal_handlers(state: list[subprocess.Popen | None]) -> None:
     """Make sure subprocesses die when the parent does. `state[0]` is
     the currently-running self-play subprocess (if any)."""
 
-    def handler(signum, frame):
+    def handler(signum, _frame):
         proc = state[0]
         if proc is not None and proc.poll() is None:
             try:
@@ -463,36 +428,22 @@ def main(argv: list[str] | None = None) -> int:
         shards_dir = run_dir / "shards" / f"gen_{new_gen:03d}"
         shards_dir.mkdir(parents=True, exist_ok=True)
         sp_t = time.time()
-        sp_cmd = [
-            "target/release/selfplay-batch",
-            "--model",
-            str(run_dir / state.current_onnx),
-            "--out-dir",
-            str(shards_dir),
-            "--games",
-            str(cfg.self_play.games_per_gen),
-            "--simulations",
-            str(cfg.self_play.simulations_per_move),
-            "--c-puct",
-            str(cfg.self_play.c_puct),
-            "--temperature-plies",
-            str(cfg.self_play.temperature_plies),
-            "--temperature",
-            str(cfg.self_play.temperature),
-            "--dirichlet-alpha",
-            str(cfg.self_play.dirichlet_alpha),
-            "--dirichlet-eps",
-            str(cfg.self_play.dirichlet_eps),
-            "--shard-games",
-            str(cfg.self_play.shard_games_per_file),
-            "--seed",
-            str((cfg.seed + new_gen) & 0xFFFF_FFFF),
-        ]
-        if cfg.self_play.worker_threads is not None:
-            sp_cmd += ["--threads", str(cfg.self_play.worker_threads)]
-        print(f"[train_loop] launching self-play: {sp_cmd[0]}")
-        sp_proc = subprocess.Popen(
-            sp_cmd, cwd=REPO_ROOT, stdout=sys.stdout, stderr=sys.stderr
+        print("[train_loop] launching self-play subprocess")
+        sp_proc = start_self_play(
+            model_onnx=run_dir / state.current_onnx,
+            out_dir=shards_dir,
+            games=cfg.self_play.games_per_gen,
+            simulations=cfg.self_play.simulations_per_move,
+            c_puct=cfg.self_play.c_puct,
+            temperature_plies=cfg.self_play.temperature_plies,
+            temperature=cfg.self_play.temperature,
+            dirichlet_alpha=cfg.self_play.dirichlet_alpha,
+            dirichlet_eps=cfg.self_play.dirichlet_eps,
+            shard_games=cfg.self_play.shard_games_per_file,
+            threads=cfg.self_play.worker_threads,
+            seed=(cfg.seed + new_gen) & 0xFFFF_FFFF,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
         )
         sp_state[0] = sp_proc
 
@@ -500,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
         state.current_phase = "training"
         state.save_atomic(run_dir / "state.json")
         train_t = time.time()
-        steps, last_metrics = _train_phase(
+        _, last_metrics = _train_phase(
             model=model,
             optimizer=optimizer,
             buffer=buffer,

@@ -32,8 +32,6 @@ class SelfPlayConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
     worker_threads: int | None = None  # null = (cores - 1)
-    inference_batch_size: int = 16
-    inference_batch_timeout_us: int = 1000
 
 
 @dataclass
@@ -41,7 +39,6 @@ class TrainConfig:
     steps_per_gen: int = 1000
     batch_size: int = 256
     learning_rate: float = 1.0e-3
-    lr_warmup_steps: int = 200
     weight_decay: float = 1.0e-4
     value_loss_weight: float = 0.5
     # Value target blends MCTS-Q with terminal-z. At gen 0 we lean

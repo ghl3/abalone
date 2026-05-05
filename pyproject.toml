@@ -35,7 +35,13 @@ extend-exclude = ["target", "web", "crates"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
-ignore = ["E501"]  # line length handled by formatter
+ignore = [
+    "E501", # line length handled by formatter
+    # Allow Unicode in docstrings/comments — `×` and en-dashes are
+    # intentional ("4×64 ResNet" reads better than "4x64").
+    "RUF002",
+    "RUF003",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -44,4 +50,6 @@ python_files = ["test_*.py"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "ruff>=0.15.12",
+    "vulture>=2.16",
 ]

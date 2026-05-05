@@ -16,8 +16,6 @@ Architecture sized for fast training on M1 MPS and small ONNX export
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,32 +36,6 @@ VALUE_HIDDEN = 256
 # Must match `abalone_game::move_index::MOVE_SPACE`. Hardcoded here
 # because there's no compelling reason to plumb it through config.
 MOVE_SPACE = 2562
-
-
-@dataclass(frozen=True)
-class ArchSpec:
-    """Pure-data record of the architecture in use. Embedded in
-    checkpoints so we can detect arch drift on resume."""
-
-    input_channels: int
-    blocks: int
-    channels: int
-    policy_head_channels: int
-    value_head_channels: int
-    value_hidden: int
-    move_space: int
-
-
-def current_arch() -> ArchSpec:
-    return ArchSpec(
-        input_channels=INPUT_CHANNELS,
-        blocks=NUM_RES_BLOCKS,
-        channels=CHANNELS,
-        policy_head_channels=POLICY_HEAD_CHANNELS,
-        value_head_channels=VALUE_HEAD_CHANNELS,
-        value_hidden=VALUE_HIDDEN,
-        move_space=MOVE_SPACE,
-    )
 
 
 # ----- building blocks -------------------------------------------------------

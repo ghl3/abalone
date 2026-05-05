@@ -51,7 +51,7 @@ class MatchResult:
         return cls(**d)
 
 
-def run_self_play(
+def start_self_play(
     *,
     model_onnx: Path,
     out_dir: Path,
@@ -65,9 +65,12 @@ def run_self_play(
     shard_games: int,
     threads: int | None,
     seed: int,
-) -> int:
-    """Spawn `selfplay-batch`. Blocks until the subprocess exits.
-    Returns its exit code (raises on non-zero)."""
+    stdout=None,
+    stderr=None,
+) -> subprocess.Popen:
+    """Spawn `selfplay-batch` as a non-blocking child process. Returns
+    the `Popen` so the caller can poll/wait while doing other work
+    (the training loop streams shard files as they appear)."""
     cmd = [
         str(_bin("selfplay-batch")),
         "--model", str(model_onnx),
@@ -84,8 +87,7 @@ def run_self_play(
     ]
     if threads is not None:
         cmd += ["--threads", str(threads)]
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, check=True)
-    return proc.returncode
+    return subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=stdout, stderr=stderr)
 
 
 def _format_player(spec: str | Path) -> str:
