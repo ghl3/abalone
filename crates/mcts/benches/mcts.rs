@@ -12,7 +12,9 @@ use std::time::Instant;
 
 use abalone_game::{Game, GameState, Move, Side};
 use abalone_mcts::eval::Weights;
-use abalone_mcts::{eval, heuristic, random_rollout, search, SearchConfig, SearchResult};
+use abalone_mcts::{
+    eval, heuristic, random_rollout, search, LeafEval, SearchConfig, SearchResult,
+};
 use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -40,9 +42,11 @@ fn pick_mcts_with_weights(
     rng: &mut SmallRng,
     weights: &Weights,
 ) -> Move {
-    search(g, cfg, rng, |gg, _| eval::evaluate(&gg.board, gg.turn, weights))
-        .expect("non-terminal => some move")
-        .best
+    search(g, cfg, rng, |gg, _| {
+        LeafEval::from_value(eval::evaluate(&gg.board, gg.turn, weights))
+    })
+    .expect("non-terminal => some move")
+    .best
 }
 
 #[derive(Default, Debug)]
@@ -126,7 +130,7 @@ where
 
 fn time_search<F>(label: &str, eval_fn: F)
 where
-    F: FnMut(&Game, &mut SmallRng) -> f32,
+    F: FnMut(&Game, &mut SmallRng) -> LeafEval,
 {
     let g = Game::new_standard();
     let cfg = SearchConfig {
