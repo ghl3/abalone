@@ -1,26 +1,28 @@
 //! Self-play game generation. Drives MCTS with a pluggable leaf
 //! evaluator, produces (state, child_visits, z, q) trajectories, and
-//! writes them to a flat binary shard format.
+//! writes them to a parquet shard format.
 
+pub mod encoder;
+pub mod ort_eval;
 pub mod shard;
 
 use abalone_game::{encode, Game, GameState, Move};
 use abalone_mcts::{search, LeafEval, SearchConfig};
 use rand::Rng;
+use rand_distr::{Distribution, Gamma};
 
-/// Self-play hyperparameters. Defaults match the values discussed in the
-/// training plan: 200 sims, 1.4 c_puct, sample by visits for the first
-/// 50 plies (temperature = 1.0), then argmax.
+/// Self-play hyperparameters.
 #[derive(Clone, Debug)]
 pub struct SelfPlayConfig {
     pub simulations: u32,
     pub c_puct: f32,
-    /// Plies during which we sample from the visit distribution. Set to 0
-    /// to always argmax (e.g. gating matches).
     pub temperature_plies: u32,
-    /// Sampling temperature applied to visit counts: `p_i ∝ N_i^(1/temp)`.
-    /// `1.0` is visit-proportional; `< 1.0` sharpens toward argmax.
     pub temperature: f32,
+    /// Dirichlet noise mixing parameters at the root of each search.
+    /// Set `dirichlet_eps` to 0 to disable. Standard AlphaZero values
+    /// for ~50-move branching: alpha = 0.3, eps = 0.25.
+    pub dirichlet_alpha: f32,
+    pub dirichlet_eps: f32,
 }
 
 impl Default for SelfPlayConfig {
@@ -30,7 +32,30 @@ impl Default for SelfPlayConfig {
             c_puct: 1.4,
             temperature_plies: 50,
             temperature: 1.0,
+            dirichlet_alpha: 0.3,
+            dirichlet_eps: 0.25,
         }
+    }
+}
+
+/// Mix `dirichlet_eps` of Dirichlet(`alpha`) noise into `priors` in place.
+/// Standard AlphaZero exploration trick applied at the root only; lets
+/// search visit moves the network underweighted but might be learnable.
+pub fn mix_dirichlet<R: Rng + ?Sized>(priors: &mut [f32], alpha: f32, eps: f32, rng: &mut R) {
+    if priors.is_empty() || eps <= 0.0 {
+        return;
+    }
+    let gamma = Gamma::new(alpha as f64, 1.0).expect("alpha > 0");
+    let samples: Vec<f32> = (0..priors.len())
+        .map(|_| gamma.sample(rng) as f32)
+        .collect();
+    let total: f32 = samples.iter().sum();
+    if total <= 0.0 {
+        return;
+    }
+    for (p, g) in priors.iter_mut().zip(samples.iter()) {
+        let dirichlet = g / total;
+        *p = (1.0 - eps) * (*p) + eps * dirichlet;
     }
 }
 
@@ -127,8 +152,26 @@ where
     };
 
     while !g.is_terminal() {
-        let res = search(&g, &search_cfg, rng, &mut eval_fn)
-            .expect("non-terminal => search returns Some");
+        // Wrap the eval_fn so the FIRST call (root expansion) gets
+        // Dirichlet noise mixed into its priors. Subsequent calls
+        // (leaf expansions) are passed through unchanged.
+        let alpha = cfg.dirichlet_alpha;
+        let eps = cfg.dirichlet_eps;
+        let mut first_call = true;
+        let res = {
+            let mut wrapped = |state: &Game, rng_inner: &mut R| -> LeafEval {
+                let mut e = eval_fn(state, rng_inner);
+                if first_call && eps > 0.0 {
+                    first_call = false;
+                    if let Some(p) = e.priors.as_mut() {
+                        mix_dirichlet(p, alpha, eps, rng_inner);
+                    }
+                }
+                e
+            };
+            search(&g, &search_cfg, rng, &mut wrapped)
+                .expect("non-terminal => search returns Some")
+        };
 
         let chosen_idx = if g.ply < cfg.temperature_plies {
             sample_by_visits(&res.visits, cfg.temperature, rng)
@@ -184,6 +227,8 @@ mod tests {
             c_puct: 1.4,
             temperature_plies: 4,
             temperature: 1.0,
+            dirichlet_alpha: 0.3,
+            dirichlet_eps: 0.0,
         };
         let mut rng = SmallRng::seed_from_u64(0);
         let outcome = play_game(&cfg, &mut rng, heuristic);
@@ -214,6 +259,8 @@ mod tests {
             c_puct: 1.4,
             temperature_plies: 4,
             temperature: 1.0,
+            dirichlet_alpha: 0.3,
+            dirichlet_eps: 0.0,
         };
         let mut rng = SmallRng::seed_from_u64(1);
         let outcome = play_game(&cfg, &mut rng, heuristic);

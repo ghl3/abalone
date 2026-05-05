@@ -13,16 +13,33 @@ path = "src/lib.rs"
 abalone-game = { path = "../game" }
 abalone-mcts = { path = "../mcts" }
 rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
 # Arrow IPC + Parquet for shard files. Picked over a hand-rolled binary
 # format because (a) pyarrow gives Python zero-copy numpy reads, (b)
 # columnar layout + snappy compresses our low-entropy bitboards 2-5x,
 # (c) schema evolution is documented.
 arrow = "55"
 parquet = { version = "55", features = ["arrow"] }
+# ONNX Runtime via the `ort` crate. `download-binaries` pulls the
+# appropriate runtime .dylib at build time so users don't have to
+# install ORT themselves.
+ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
+ndarray = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
 
 [[bin]]
 name = "selfplay-stub"
 path = "src/bin/selfplay_stub.rs"
+
+[[bin]]
+name = "selfplay-batch"
+path = "src/bin/selfplay_batch.rs"
+
+[[bin]]
+name = "eval-match"
+path = "src/bin/eval_match.rs"
 
 [lints]
 workspace = true

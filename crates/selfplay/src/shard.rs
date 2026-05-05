@@ -241,6 +241,8 @@ mod tests {
             c_puct: 1.4,
             temperature_plies: 4,
             temperature: 1.0,
+            dirichlet_alpha: 0.3,
+            dirichlet_eps: 0.0,
         };
         let mut rng = SmallRng::seed_from_u64(0);
         let outcome = play_game(&cfg, &mut rng, heuristic);

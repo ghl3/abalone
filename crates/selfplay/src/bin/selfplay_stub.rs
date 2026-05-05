@@ -52,6 +52,8 @@ fn main() {
         c_puct: 1.4,
         temperature_plies: 50,
         temperature: 1.0,
+        dirichlet_alpha: 0.3,
+        dirichlet_eps: 0.0, // disabled in stub (heuristic priors are uniform anyway)
     };
 
     let mut writer = ShardWriter::create(&out).expect("create shard");
