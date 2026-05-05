@@ -1,0 +1,22 @@
+[package]
+name = "abalone-selfplay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+autobenches = false
+
+[lib]
+name = "abalone_selfplay"
+path = "src/lib.rs"
+
+[dependencies]
+abalone-game = { path = "../game" }
+abalone-mcts = { path = "../mcts" }
+rand = { version = "0.8", features = ["small_rng"] }
+
+[[bin]]
+name = "selfplay-stub"
+path = "src/bin/selfplay_stub.rs"
+
+[lints]
+workspace = true

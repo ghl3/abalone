@@ -18,6 +18,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "abalone-selfplay"
+version = "0.1.0"
+dependencies = [
+ "abalone-game",
+ "abalone-mcts",
+ "rand",
+]
+
+[[package]]
 name = "abalone-wasm"
 version = "0.1.0"
 dependencies = [
