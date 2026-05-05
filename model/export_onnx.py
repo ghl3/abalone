@@ -31,11 +31,15 @@ OUTPUT_VALUE_NAME = "value"
 
 
 def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
-    """Export `model` to `out_path` (atomic via temp + rename)."""
+    """Export `model` to `out_path` (atomic via temp + rename). The
+    model's `training` flag and device are restored before returning."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model = model.eval().to("cpu")
+    # Remember and restore so the caller doesn't have to.
+    was_training = model.training
+    orig_device = next(model.parameters()).device
+    model.eval().to("cpu")
     dummy = torch.zeros(1, INPUT_CHANNELS, BOARD_H, BOARD_W, dtype=torch.float32)
 
     # Write to a temp file in the same directory, then atomic rename.
@@ -46,6 +50,12 @@ def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
 
     os.close(fd)
     try:
+        # `dynamo=False` selects the legacy exporter, which emits a
+        # single self-contained .onnx (weights inlined). The newer
+        # dynamo-based exporter writes weights to a sidecar `.data`
+        # file, which doesn't survive our temp + rename pattern. Our
+        # 4×64 model is ~28 MB — far under the 2 GB protobuf limit
+        # where external-data becomes mandatory.
         torch.onnx.export(
             model,
             dummy,
@@ -59,6 +69,7 @@ def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
             },
             opset_version=opset,
             do_constant_folding=True,
+            dynamo=False,
         )
         os.replace(tmp_name, out_path)
     except Exception:
@@ -67,6 +78,10 @@ def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
         except OSError:
             pass
         raise
+    finally:
+        model.to(orig_device)
+        if was_training:
+            model.train()
 
 
 if __name__ == "__main__":

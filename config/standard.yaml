@@ -1,0 +1,52 @@
+# Standard training run. ~30 min/gen on M1 Pro; expect first usable
+# model around gen 10-20, plateau eval-vs-heuristic around gen 30+.
+seed: 0
+gens: 50
+runs_root: runs
+web_export_path: web/public/models/best.onnx
+
+self_play:
+  games_per_gen: 200
+  shard_games_per_file: 8
+  simulations_per_move: 200
+  c_puct: 1.4
+  temperature_plies: 50
+  temperature: 1.0
+  dirichlet_alpha: 0.3
+  dirichlet_eps: 0.25
+  worker_threads: null  # null = (cores - 1)
+  inference_batch_size: 16
+  inference_batch_timeout_us: 1000
+
+train:
+  steps_per_gen: 1000
+  batch_size: 256
+  learning_rate: 1.0e-3
+  lr_warmup_steps: 200
+  weight_decay: 1.0e-4
+  value_loss_weight: 0.5
+  # Ramp from "trust MCTS Q a lot" early to "trust terminal z fully" late.
+  value_target_blend_start: 0.5
+  value_target_blend_end: 1.0
+  value_target_blend_done_by_gen: 20
+  replay_buffer_gens: 20
+  replay_buffer_min_size: 1000
+  symmetry_augment: true
+  poll_interval_ms: 250
+
+eval:
+  gate_every_gens: 1
+  gate_games: 21
+  gate_simulations: 200
+  gate_threshold: 0.55
+  heuristic_every_gens: 5
+  heuristic_games: 21
+  heuristic_simulations: 200
+  random_every_gens: 10
+  random_games: 11
+
+retention:
+  keep_last_checkpoints: 5
+  keep_last_onnx: 25
+  keep_last_shard_gens: 25
+  web_export_on_promotion: true
