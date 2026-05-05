@@ -17,7 +17,6 @@
 
 use crate::cell::{in_board, Cell, Dir, BROADSIDE_DIRS, N_CELLS, N_VALID, POSITIVE_DIRS};
 use crate::moves::Move;
-use crate::symmetry::Sym;
 
 pub const MOVE_SPACE: usize = 2562;
 pub const INLINE_OFFSET: usize = 0;
@@ -136,18 +135,12 @@ pub fn decode(idx: u16) -> Move {
     }
 }
 
-/// Apply a symmetry to an encoded index: `sym_index(s, encode(m)) == encode(s.apply(m))`.
-pub fn sym_index(s: Sym, idx: u16) -> u16 {
-    encode(s.apply(decode(idx)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::board::Board;
     use crate::cell::Side;
     use crate::moves::legal_moves;
-    use crate::symmetry::{transform_board, ALL_SYMS};
     use std::collections::HashSet;
 
     #[test]
@@ -196,47 +189,6 @@ mod tests {
                     let idx = encode(m) as usize;
                     assert!(idx < BROADSIDE_OFFSET);
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn sym_index_matches_apply_then_encode() {
-        for &b in &[Board::standard(), Board::belgian_daisy()] {
-            for side in [Side::Black, Side::White] {
-                for m in legal_moves(&b, side) {
-                    let idx = encode(m);
-                    for s in ALL_SYMS {
-                        let via_index = sym_index(s, idx);
-                        let via_move = encode(s.apply(m));
-                        assert_eq!(
-                            via_index, via_move,
-                            "sym {} on move {:?}",
-                            s.idx(),
-                            m
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn legal_index_set_is_equivariant() {
-        // The set { encode(m) : m in legal_moves(b) } maps to
-        // { sym_index(s, idx) : idx in original } and equals
-        // { encode(m) : m in legal_moves(transform_board(s, b)) }.
-        let b = Board::standard();
-        for side in [Side::Black, Side::White] {
-            let originals: HashSet<u16> =
-                legal_moves(&b, side).iter().map(|&m| encode(m)).collect();
-            for s in ALL_SYMS {
-                let bt = transform_board(s, &b);
-                let actual: HashSet<u16> =
-                    legal_moves(&bt, side).iter().map(|&m| encode(m)).collect();
-                let expected: HashSet<u16> =
-                    originals.iter().map(|&i| sym_index(s, i)).collect();
-                assert_eq!(actual, expected, "index set not equivariant under sym {}", s.idx());
             }
         }
     }

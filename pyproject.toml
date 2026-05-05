@@ -30,7 +30,17 @@ packages = ["model"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["target", "web", "crates"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
 ignore = ["E501"]  # line length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
