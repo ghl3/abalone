@@ -36,7 +36,7 @@
 //! batches every `BATCH_ROWS` rows. The parquet writer applies snappy
 //! compression and dictionary encoding to the columns where it helps.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -90,6 +90,11 @@ pub fn schema() -> Arc<Schema> {
 pub struct ShardWriter {
     writer: ArrowWriter<std::fs::File>,
     schema: Arc<Schema>,
+    /// Final destination path. We write to `<final>.tmp` and rename in
+    /// `finish()` so the trainer never sees a partial-but-named file
+    /// (which would fail `pq.read_table` and spam the log).
+    final_path: PathBuf,
+    tmp_path: PathBuf,
     own_bb_lo: UInt64Builder,
     own_bb_hi: UInt64Builder,
     opp_bb_lo: UInt64Builder,
@@ -110,7 +115,10 @@ pub struct ShardWriter {
 
 impl ShardWriter {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self, parquet::errors::ParquetError> {
-        let file = std::fs::File::create(path.as_ref())?;
+        let final_path = path.as_ref().to_path_buf();
+        let mut tmp_path = final_path.clone();
+        tmp_path.set_extension("parquet.tmp");
+        let file = std::fs::File::create(&tmp_path)?;
         let schema = schema();
         // zstd at a low level: faster than snappy on writes but compresses
         // bitboards substantially better. Level 3 is the standard "fast" tier.
@@ -123,6 +131,8 @@ impl ShardWriter {
         Ok(Self {
             writer,
             schema,
+            final_path,
+            tmp_path,
             own_bb_lo: UInt64Builder::new(),
             own_bb_hi: UInt64Builder::new(),
             opp_bb_lo: UInt64Builder::new(),
@@ -221,6 +231,10 @@ impl ShardWriter {
     pub fn finish(mut self) -> Result<u64, parquet::errors::ParquetError> {
         self.flush_batch()?;
         let _meta = self.writer.close()?;
+        // Atomic rename — the trainer's poll loop only ever sees the
+        // .parquet name once the footer has been written.
+        std::fs::rename(&self.tmp_path, &self.final_path)
+            .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
         Ok(self.entries_written)
     }
 }

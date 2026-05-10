@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from model.abalone_net import BOARD_H, BOARD_W, INPUT_CHANNELS, AbaloneNet
 from model.config import RunConfig
@@ -164,13 +165,17 @@ def _train_phase(
     cfg: RunConfig,
     rng: np.random.Generator,
     device: torch.device,
+    writer: SummaryWriter | None = None,
 ) -> tuple[int, StepMetrics | None]:
     """Train while self-play runs (if `sp_proc` is alive). Continue
     training after self-play exits until we've done `steps_per_gen` SGD
     steps total. Returns (steps_done, mean_metrics).
 
     `mean_metrics` is the running mean over all SGD steps in this gen
-    (loss_total/policy/value, grad_norm), or None if we never trained."""
+    (loss_total/policy/value, grad_norm), or None if we never trained.
+
+    If `writer` is provided, per-step scalars are written under tags
+    `train/step_*` with global step `(new_gen - 1) * steps_per_gen + i`."""
 
     z_w = value_target_blend_weight(
         new_gen,
@@ -178,6 +183,7 @@ def _train_phase(
         cfg.train.value_target_blend_end,
         cfg.train.value_target_blend_done_by_gen,
     )
+    step_offset = (new_gen - 1) * cfg.train.steps_per_gen
 
     steps_done = 0
     sum_loss_total = 0.0
@@ -237,6 +243,12 @@ def _train_phase(
             sum_loss_value += m.loss_value
             sum_grad_norm += m.grad_norm
             steps_done += 1
+            if writer is not None:
+                gs = step_offset + steps_done
+                writer.add_scalar("train/step_loss_total", m.loss_total, gs)
+                writer.add_scalar("train/step_loss_policy", m.loss_policy, gs)
+                writer.add_scalar("train/step_loss_value", m.loss_value, gs)
+                writer.add_scalar("train/step_grad_norm", m.grad_norm, gs)
             if steps_done >= cfg.train.steps_per_gen:
                 break
 
@@ -327,25 +339,60 @@ def _maybe_eval(
     return gate_winrate, heuristic_winrate, random_winrate
 
 
-def _setup_signal_handlers(state: list[subprocess.Popen | None]) -> None:
-    """Make sure subprocesses die when the parent does. `state[0]` is
-    the currently-running self-play subprocess (if any)."""
+def _setup_signal_handlers(*slots: list[subprocess.Popen | None]) -> None:
+    """Make sure tracked subprocesses die when the parent does. Each
+    slot is a single-element mutable list containing the current Popen
+    (or None). Used for both the self-play subprocess and the TB server."""
 
     def handler(signum, _frame):
-        proc = state[0]
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
+        for slot in slots:
+            proc = slot[0] if slot else None
+            if proc is not None and proc.poll() is None:
                 try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            except Exception:
-                pass
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                except Exception:
+                    pass
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
+
+
+def _start_tensorboard(runs_root: Path, port: int) -> subprocess.Popen | None:
+    """Spawn `tensorboard --logdir <runs_root>` so the user can browse
+    training scalars live at http://localhost:<port>/.
+
+    Pointing at `runs_root` (not just the current run dir) lets TB show
+    all runs side-by-side for comparison. Invoked via `python -m
+    tensorboard.main` to avoid PATH dependence on the venv binary.
+    Returns the Popen; None if spawning failed."""
+    log_path = runs_root / ".tensorboard.log"
+    cmd = [
+        sys.executable,
+        "-m",
+        "tensorboard.main",
+        "--logdir",
+        str(runs_root),
+        "--port",
+        str(port),
+        "--bind_all",
+    ]
+    try:
+        runs_root.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        print(
+            f"[train_loop] tensorboard: http://localhost:{port}/  "
+            f"(logs: {log_path})"
+        )
+        return proc
+    except (FileNotFoundError, OSError) as e:
+        print(f"[train_loop] failed to start tensorboard: {e}", file=sys.stderr)
+        return None
 
 
 def _resolve_resume(
@@ -394,6 +441,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--no-resume", action="store_true", help="start fresh even if state exists"
+    )
+    parser.add_argument(
+        "--tb-port", type=int, default=6006,
+        help="port for the auto-spawned tensorboard server (default 6006)",
+    )
+    parser.add_argument(
+        "--no-tensorboard", action="store_true",
+        help="don't spawn the tensorboard server (still writes events)",
     )
     args = parser.parse_args(argv)
 
@@ -478,8 +533,59 @@ def main(argv: list[str] | None = None) -> int:
 
     rng = np.random.default_rng(cfg.seed + state.current_gen)
     sp_state: list[subprocess.Popen | None] = [None]
-    _setup_signal_handlers(sp_state)
+    tb_state: list[subprocess.Popen | None] = [None]
+    _setup_signal_handlers(sp_state, tb_state)
 
+    # TensorBoard: SummaryWriter writes events to runs/<id>/tb/. The
+    # server (if not disabled) is spawned at runs/ root so cross-run
+    # comparison works in the UI.
+    runs_root = REPO_ROOT / cfg.runs_root
+    writer = SummaryWriter(str(run_dir / "tb"))
+    if not args.no_tensorboard:
+        tb_state[0] = _start_tensorboard(runs_root, port=args.tb_port)
+
+    try:
+        return _run_outer_loop(
+            cfg=cfg,
+            state=state,
+            model=model,
+            optimizer=optimizer,
+            buffer=buffer,
+            rng=rng,
+            device=device,
+            run_dir=run_dir,
+            ckpt_dir=ckpt_dir,
+            sp_state=sp_state,
+            writer=writer,
+        )
+    finally:
+        writer.close()
+        tb_proc = tb_state[0]
+        if tb_proc is not None and tb_proc.poll() is None:
+            try:
+                tb_proc.terminate()
+                try:
+                    tb_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    tb_proc.kill()
+            except Exception:
+                pass
+
+
+def _run_outer_loop(
+    *,
+    cfg: RunConfig,
+    state: RunState,
+    model: AbaloneNet,
+    optimizer: torch.optim.Optimizer,
+    buffer: ReplayBuffer,
+    rng: np.random.Generator,
+    device: torch.device,
+    run_dir: Path,
+    ckpt_dir: Path,
+    sp_state: list[subprocess.Popen | None],
+    writer: SummaryWriter,
+) -> int:
     # Outer loop.
     while state.current_gen < cfg.gens:
         new_gen = state.current_gen + 1
@@ -524,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg=cfg,
             rng=rng,
             device=device,
+            writer=writer,
         )
         sp_state[0] = None
         train_seconds = time.time() - train_t
@@ -592,9 +699,34 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # Per-gen metrics jsonl entry (for plotting / wandb later).
+        record = state.history[-1]
         metrics_path = run_dir / "metrics.jsonl"
         with metrics_path.open("a") as f:
-            f.write(json.dumps(asdict(state.history[-1])) + "\n")
+            f.write(json.dumps(asdict(record)) + "\n")
+
+        # Per-gen TB scalars. Mirrors metrics.jsonl fields with `gen/`
+        # prefix so they sort cleanly alongside the per-step `train/`
+        # scalars in TensorBoard.
+        if writer is not None:
+            tb_fields = {
+                "gen/loss_total": record.train_loss_total,
+                "gen/loss_policy": record.train_loss_policy,
+                "gen/loss_value": record.train_loss_value,
+                "gen/grad_norm": record.train_grad_norm,
+                "gen/gate_winrate": record.gate_winrate,
+                "gen/heuristic_winrate": record.heuristic_winrate,
+                "gen/random_winrate": record.random_winrate,
+                "perf/self_play_seconds": record.self_play_seconds,
+                "perf/train_seconds": record.train_seconds,
+                "data/buffer_size": record.buffer_size,
+                "data/shard_count": record.shard_count,
+                "data/plies_per_game_avg": record.plies_per_game_avg,
+            }
+            for tag, v in tb_fields.items():
+                if v is not None:
+                    writer.add_scalar(tag, float(v), new_gen)
+            writer.add_scalar("gen/promoted", 1.0 if promoted else 0.0, new_gen)
+            writer.flush()
 
         # Retention.
         _retain_checkpoints(run_dir, asdict(cfg.retention), new_gen)
