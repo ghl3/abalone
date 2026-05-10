@@ -6,15 +6,22 @@
 //! Plays N games (alternating colors), writes a JSON summary to
 //! `--out-json`. The training loop's gating and heuristic-anchor
 //! evaluations both invoke this binary with different player configs.
+//! Games are independent and run in parallel across `--threads` workers
+//! (default: cores-1). For model-vs-model gates the two ONNX sessions
+//! are shared via `Arc<Mutex<Session>>` — concurrent `.evaluate()` calls
+//! serialize on the mutex, but with two players we have two sessions so
+//! contention is bounded.
 //!
 //! Run:
 //!   eval-match --player-a model:checkpoints/gen_002.onnx \
 //!              --player-b model:checkpoints/best.onnx \
-//!              --games 21 --simulations 200 \
+//!              --games 21 --simulations 200 --threads 8 \
 //!              --out-json runs/foo/eval/gen_002_gate.json
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use abalone_game::{Game, GameState, Move, Side};
@@ -63,6 +70,7 @@ struct Args {
     c_puct: f32,
     out_json: PathBuf,
     seed: u64,
+    threads: usize,
 }
 
 impl Args {
@@ -78,6 +86,7 @@ impl Args {
             c_puct: 1.4,
             out_json: PathBuf::from("/tmp/eval-match.json"),
             seed: 0,
+            threads: num_cpus_or(8),
         };
         while let Some(k) = args.next() {
             let mut nxt = || args.next().expect("missing value");
@@ -89,6 +98,7 @@ impl Args {
                 "--c-puct" => a.c_puct = nxt().parse().unwrap(),
                 "--out-json" => a.out_json = PathBuf::from(nxt()),
                 "--seed" => a.seed = nxt().parse().unwrap(),
+                "--threads" => a.threads = nxt().parse().unwrap(),
                 _ => panic!("unknown arg: {}", k),
             }
         }
@@ -98,6 +108,13 @@ impl Args {
     }
 }
 
+fn num_cpus_or(default: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(default)
+}
+
+#[derive(Clone)]
 enum Player {
     Model(Arc<OrtEvaluator>),
     Heuristic,
@@ -158,46 +175,73 @@ fn main() {
         c_puct: args.c_puct,
     };
 
-    let mut wins_a = 0u32;
-    let mut wins_b = 0u32;
-    let mut draws = 0u32;
+    // Atomic counters: workers race to claim the next game id and bump
+    // the per-result tally on completion. Using `Relaxed` is fine — we
+    // only read the counters after `thread::scope` has joined.
+    let next_game = Arc::new(AtomicU32::new(0));
+    let wins_a = Arc::new(AtomicU32::new(0));
+    let wins_b = Arc::new(AtomicU32::new(0));
+    let draws = Arc::new(AtomicU32::new(0));
+    let games = args.games;
+    let seed = args.seed;
     let t = Instant::now();
 
-    for i in 0..args.games {
-        let a_is_black = i % 2 == 0;
-        let mut rng_a = SmallRng::seed_from_u64(args.seed.wrapping_add((i as u64) * 2));
-        let mut rng_b = SmallRng::seed_from_u64(args.seed.wrapping_add((i as u64) * 2 + 1));
-
-        let mut g = Game::new_standard();
-        while !g.is_terminal() {
-            let mv = if (g.turn == Side::Black) == a_is_black {
-                player_a.pick_move(&g, &cfg, &mut rng_a)
-            } else {
-                player_b.pick_move(&g, &cfg, &mut rng_b)
-            };
-            g.apply(mv);
-        }
-
-        match g.state() {
-            GameState::Wins(s) => {
-                let a_won = (s == Side::Black) == a_is_black;
-                if a_won {
-                    wins_a += 1;
-                } else {
-                    wins_b += 1;
+    thread::scope(|s| {
+        for _tid in 0..args.threads {
+            let player_a = player_a.clone();
+            let player_b = player_b.clone();
+            let cfg = cfg.clone();
+            let next_game = Arc::clone(&next_game);
+            let wins_a = Arc::clone(&wins_a);
+            let wins_b = Arc::clone(&wins_b);
+            let draws = Arc::clone(&draws);
+            s.spawn(move || loop {
+                let i = next_game.fetch_add(1, Ordering::Relaxed);
+                if i >= games {
+                    break;
                 }
-            }
-            GameState::Draw => draws += 1,
-            GameState::InProgress => unreachable!(),
-        }
+                let a_is_black = i % 2 == 0;
+                let mut rng_a = SmallRng::seed_from_u64(seed.wrapping_add((i as u64) * 2));
+                let mut rng_b = SmallRng::seed_from_u64(seed.wrapping_add((i as u64) * 2 + 1));
 
-        eprintln!(
-            "  game {}: a_is_black={}, final={:?}",
-            i,
-            a_is_black,
-            g.state()
-        );
-    }
+                let mut g = Game::new_standard();
+                while !g.is_terminal() {
+                    let mv = if (g.turn == Side::Black) == a_is_black {
+                        player_a.pick_move(&g, &cfg, &mut rng_a)
+                    } else {
+                        player_b.pick_move(&g, &cfg, &mut rng_b)
+                    };
+                    g.apply(mv);
+                }
+
+                match g.state() {
+                    GameState::Wins(side) => {
+                        let a_won = (side == Side::Black) == a_is_black;
+                        if a_won {
+                            wins_a.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            wins_b.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    GameState::Draw => {
+                        draws.fetch_add(1, Ordering::Relaxed);
+                    }
+                    GameState::InProgress => unreachable!(),
+                }
+
+                eprintln!(
+                    "  game {}: a_is_black={}, final={:?}",
+                    i,
+                    a_is_black,
+                    g.state()
+                );
+            });
+        }
+    });
+
+    let wins_a = wins_a.load(Ordering::Relaxed);
+    let wins_b = wins_b.load(Ordering::Relaxed);
+    let draws = draws.load(Ordering::Relaxed);
 
     let result = MatchResult {
         player_a: args.a.label(),

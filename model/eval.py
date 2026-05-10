@@ -110,8 +110,10 @@ def run_eval_match(
     c_puct: float,
     out_json: Path,
     seed: int = 0,
+    threads: int | None = None,
 ) -> MatchResult:
-    """Spawn `eval-match` and parse its JSON result."""
+    """Spawn `eval-match` and parse its JSON result. `threads=None` lets
+    the binary default to (cores - 1)."""
     cmd = [
         str(_bin("eval-match")),
         "--player-a", _format_player(player_a),
@@ -122,5 +124,7 @@ def run_eval_match(
         "--out-json", str(out_json),
         "--seed", str(seed),
     ]
+    if threads is not None:
+        cmd += ["--threads", str(threads)]
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
     return MatchResult.from_json(Path(out_json))
