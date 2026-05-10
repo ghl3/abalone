@@ -111,9 +111,12 @@ def run_eval_match(
     out_json: Path,
     seed: int = 0,
     threads: int | None = None,
+    stdout=None,
+    stderr=None,
 ) -> MatchResult:
     """Spawn `eval-match` and parse its JSON result. `threads=None` lets
-    the binary default to (cores - 1)."""
+    the binary default to (cores - 1). `stdout`/`stderr` let the caller
+    redirect the noisy per-game subprocess chatter to a file."""
     cmd = [
         str(_bin("eval-match")),
         "--player-a", _format_player(player_a),
@@ -126,5 +129,5 @@ def run_eval_match(
     ]
     if threads is not None:
         cmd += ["--threads", str(threads)]
-    subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+    subprocess.run(cmd, cwd=REPO_ROOT, check=True, stdout=stdout, stderr=stderr)
     return MatchResult.from_json(Path(out_json))

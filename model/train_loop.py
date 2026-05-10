@@ -45,6 +45,111 @@ from model.train_step import StepMetrics, train_step, value_target_blend_weight
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# How often (wall-clock seconds) to emit an in-gen progress line during
+# the long self-play / training phase. Each gen produces ~ self_play_secs
+# / PROGRESS_INTERVAL_S lines.
+PROGRESS_INTERVAL_S = 30.0
+
+
+# ---------- structured logging helpers --------------------------------------
+
+
+def _log(msg: str, *, gen: int | None = None, total_gens: int | None = None) -> None:
+    """Print one timestamped status line, flushed immediately so
+    `tail -f` sees it without buffering. Optional `[gen N/M]` prefix
+    keeps multi-gen output easy to grep."""
+    ts = time.strftime("%H:%M:%S")
+    prefix = f"[{ts}] "
+    if gen is not None and total_gens is not None:
+        prefix += f"[gen {gen:>2}/{total_gens}] "
+    print(f"{prefix}{msg}", flush=True)
+
+
+def _banner(run_id: str, device: torch.device, pid: int) -> None:
+    line = "═" * 71
+    print(line, flush=True)
+    print(f" Abalone training run: {run_id}", flush=True)
+    started = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(
+        f" Started:  {started}  ·  device: {device}  ·  pid: {pid}",
+        flush=True,
+    )
+    print(line, flush=True)
+    print(flush=True)
+
+
+def _section() -> None:
+    print("─" * 71, flush=True)
+
+
+def _dump_config(cfg: RunConfig, worker_threads_resolved: str) -> None:
+    """Print the resolved config as a structured block, so the run log
+    is self-describing — readers don't have to cross-reference config.yaml."""
+    sp = cfg.self_play
+    tr = cfg.train
+    ev = cfg.eval
+    print("[config]", flush=True)
+    print(f"  gens:                  {cfg.gens}", flush=True)
+    print(f"  seed:                  {cfg.seed}", flush=True)
+    print(f"  runs_root:             {cfg.runs_root}", flush=True)
+    print("  self_play:", flush=True)
+    print(f"    games_per_gen:       {sp.games_per_gen}", flush=True)
+    print(f"    simulations_per_move:{sp.simulations_per_move}", flush=True)
+    print(f"    c_puct:              {sp.c_puct}", flush=True)
+    print(f"    temperature_plies:   {sp.temperature_plies}", flush=True)
+    print(f"    temperature:         {sp.temperature}", flush=True)
+    print(f"    dirichlet_alpha:     {sp.dirichlet_alpha}", flush=True)
+    print(f"    dirichlet_eps:       {sp.dirichlet_eps}", flush=True)
+    print(f"    shard_games_per_file:{sp.shard_games_per_file}", flush=True)
+    print(f"    worker_threads:      {worker_threads_resolved}", flush=True)
+    print("  train:", flush=True)
+    print(f"    steps_per_gen:       {tr.steps_per_gen}", flush=True)
+    print(f"    batch_size:          {tr.batch_size}", flush=True)
+    print(f"    learning_rate:       {tr.learning_rate}", flush=True)
+    print(f"    weight_decay:        {tr.weight_decay}", flush=True)
+    print(f"    value_loss_weight:   {tr.value_loss_weight}", flush=True)
+    print(
+        f"    value_target_blend:  {tr.value_target_blend_start} → "
+        f"{tr.value_target_blend_end} by gen {tr.value_target_blend_done_by_gen}",
+        flush=True,
+    )
+    print(f"    replay_buffer_gens:  {tr.replay_buffer_gens}", flush=True)
+    print(f"    replay_buffer_min:   {tr.replay_buffer_min_size}", flush=True)
+    print(f"    symmetry_augment:    {str(tr.symmetry_augment).lower()}", flush=True)
+    print("  eval:", flush=True)
+    print(
+        f"    gate:        every {ev.gate_every_gens} gen,   "
+        f"{ev.gate_games} games × {ev.gate_simulations} sims, threshold {ev.gate_threshold}",
+        flush=True,
+    )
+    print(
+        f"    heuristic:   every {ev.heuristic_every_gens} gens,  "
+        f"{ev.heuristic_games} games × {ev.heuristic_simulations} sims",
+        flush=True,
+    )
+    print(
+        f"    random:      every {ev.random_every_gens} gens,  "
+        f"{ev.random_games} games × {ev.random_simulations} sims",
+        flush=True,
+    )
+    print(flush=True)
+
+
+def _fmt_secs(s: float) -> str:
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s/60:.1f}m"
+    return f"{s/3600:.2f}h"
+
+
+def _count_complete_shards(gen_dir: Path) -> int:
+    """Number of fully-written shard files in `gen_dir`. Atomic-rename
+    means we only count `.parquet` (not `.parquet.tmp`)."""
+    if not gen_dir.exists():
+        return 0
+    return sum(1 for _ in gen_dir.glob("*.parquet"))
+
 
 def _device() -> torch.device:
     if torch.backends.mps.is_available():
@@ -166,16 +271,21 @@ def _train_phase(
     rng: np.random.Generator,
     device: torch.device,
     writer: SummaryWriter | None = None,
-) -> tuple[int, StepMetrics | None]:
+    phase_start_time: float | None = None,
+) -> tuple[int, StepMetrics | None, float]:
     """Train while self-play runs (if `sp_proc` is alive). Continue
     training after self-play exits until we've done `steps_per_gen` SGD
-    steps total. Returns (steps_done, mean_metrics).
+    steps total.
 
-    `mean_metrics` is the running mean over all SGD steps in this gen
-    (loss_total/policy/value, grad_norm), or None if we never trained.
+    Returns (steps_done, mean_metrics, self_play_seconds). `mean_metrics`
+    is the running mean over all SGD steps; `self_play_seconds` is the
+    wall-clock the self-play subprocess actually took (so we can log it
+    distinctly from the trailing training-only tail).
 
     If `writer` is provided, per-step scalars are written under tags
-    `train/step_*` with global step `(new_gen - 1) * steps_per_gen + i`."""
+    `train/step_*` with global step `(new_gen - 1) * steps_per_gen + i`.
+    Periodic progress lines are emitted at `PROGRESS_INTERVAL_S`
+    cadence."""
 
     z_w = value_target_blend_weight(
         new_gen,
@@ -190,7 +300,19 @@ def _train_phase(
     sum_loss_policy = 0.0
     sum_loss_value = 0.0
     sum_grad_norm = 0.0
+    # For per-status-line running means (reset after each progress emit).
+    win_loss_total = 0.0
+    win_grad_norm = 0.0
+    win_steps = 0
     seen_files: set[Path] = set()
+
+    target_games = cfg.self_play.games_per_gen
+    target_steps = cfg.train.steps_per_gen
+    games_per_shard = cfg.self_play.shard_games_per_file
+    phase_start = phase_start_time if phase_start_time is not None else time.time()
+    last_progress_log = phase_start
+    sp_seconds: float | None = None  # set when sp_proc finishes
+    sp_done_announced = False
 
     def ingest_new() -> int:
         ingested = 0
@@ -201,15 +323,72 @@ def _train_phase(
                 buffer.ingest_shard(p, gen=new_gen)
                 seen_files.add(p)
                 ingested += 1
-            except Exception as e:
-                # Partial files mid-write may fail to read; skip and try again next poll.
-                print(f"  (skipping {p.name}: {e})", file=sys.stderr)
+            except Exception:
+                # Partial files mid-write may fail to read. Atomic-rename
+                # on the Rust side makes this rare, but we still tolerate
+                # it. Suppress the noise — we'll retry next poll.
+                pass
         return ingested
+
+    def emit_progress() -> None:
+        nonlocal win_loss_total, win_grad_norm, win_steps
+        sp_alive = sp_proc is not None and sp_proc.poll() is None
+        if sp_alive:
+            games_done = _count_complete_shards(shards_dir) * games_per_shard
+            sp_str = f"self-play {games_done:>4}/{target_games} ({100*games_done/max(target_games,1):4.1f}%)"
+        else:
+            sp_str = "self-play done            "
+        if win_steps > 0:
+            loss_str = f"loss={win_loss_total/win_steps:.4f}  grad={win_grad_norm/win_steps:.2f}"
+        elif steps_done == 0:
+            loss_str = "(waiting for buffer)"
+        else:
+            loss_str = "(no new steps)"
+        _log(
+            f"  progress  ·  {sp_str}  ·  train {steps_done:>4}/{target_steps}  {loss_str}",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
+        win_loss_total = 0.0
+        win_grad_norm = 0.0
+        win_steps = 0
 
     poll_interval = max(0.05, cfg.train.poll_interval_ms / 1000.0)
 
-    while steps_done < cfg.train.steps_per_gen:
+    while steps_done < target_steps:
         ingest_new()
+
+        # Self-play just exited? Emit the one-line summary then continue
+        # the training-only tail.
+        if (
+            not sp_done_announced
+            and sp_proc is not None
+            and sp_proc.poll() is not None
+        ):
+            sp_seconds = time.time() - phase_start
+            sp_done_announced = True
+            # Don't bail on nonzero yet — we still want to drain any final
+            # shards. We'll raise after wait() below.
+            if sp_proc.returncode == 0:
+                gen_size = buffer.chunk_size(new_gen)
+                avg_plies = gen_size / target_games if target_games > 0 else 0.0
+                _log(
+                    f"self-play complete in {_fmt_secs(sp_seconds)}  ·  "
+                    f"{gen_size} positions  ·  avg {avg_plies:.0f} plies/game",
+                    gen=new_gen,
+                    total_gens=cfg.gens,
+                )
+                _log(
+                    f"phase: training  (drain to {target_steps} SGD steps, batch {cfg.train.batch_size})",
+                    gen=new_gen,
+                    total_gens=cfg.gens,
+                )
+
+        # Periodic progress line.
+        now = time.time()
+        if now - last_progress_log >= PROGRESS_INTERVAL_S:
+            emit_progress()
+            last_progress_log = now
 
         # Evict beyond replay window.
         threshold = new_gen - cfg.train.replay_buffer_gens + 1
@@ -228,7 +407,7 @@ def _train_phase(
                 continue
 
         # One small training chunk per poll.
-        for _ in range(min(8, cfg.train.steps_per_gen - steps_done)):
+        for _ in range(min(8, target_steps - steps_done)):
             batch = buffer.sample(cfg.train.batch_size, rng)
             m = train_step(
                 model,
@@ -242,6 +421,9 @@ def _train_phase(
             sum_loss_policy += m.loss_policy
             sum_loss_value += m.loss_value
             sum_grad_norm += m.grad_norm
+            win_loss_total += m.loss_total
+            win_grad_norm += m.grad_norm
+            win_steps += 1
             steps_done += 1
             if writer is not None:
                 gs = step_offset + steps_done
@@ -249,7 +431,7 @@ def _train_phase(
                 writer.add_scalar("train/step_loss_policy", m.loss_policy, gs)
                 writer.add_scalar("train/step_loss_value", m.loss_value, gs)
                 writer.add_scalar("train/step_grad_norm", m.grad_norm, gs)
-            if steps_done >= cfg.train.steps_per_gen:
+            if steps_done >= target_steps:
                 break
 
         # Yield to self-play subprocess if it's still running.
@@ -262,19 +444,85 @@ def _train_phase(
         if sp_proc.returncode != 0:
             raise RuntimeError(
                 f"selfplay-batch exited with non-zero status {sp_proc.returncode}; "
-                f"see subprocess stderr above for cause."
+                f"see runs/<id>/logs/gen_NNN_selfplay.log for details."
             )
+        # Drain remaining shards BEFORE measuring gen_size: trainer may
+        # have exited steps loop before all shards arrived on disk.
         ingest_new()
+        if not sp_done_announced:
+            sp_seconds = time.time() - phase_start
+            gen_size = buffer.chunk_size(new_gen)
+            avg_plies = gen_size / target_games if target_games > 0 else 0.0
+            _log(
+                f"self-play complete in {_fmt_secs(sp_seconds)}  ·  "
+                f"{gen_size} positions  ·  avg {avg_plies:.0f} plies/game",
+                gen=new_gen,
+                total_gens=cfg.gens,
+            )
 
     if steps_done == 0:
-        return 0, None
+        return 0, None, sp_seconds or 0.0
     mean_metrics = StepMetrics(
         loss_total=sum_loss_total / steps_done,
         loss_policy=sum_loss_policy / steps_done,
         loss_value=sum_loss_value / steps_done,
         grad_norm=sum_grad_norm / steps_done,
     )
-    return steps_done, mean_metrics
+    return steps_done, mean_metrics, sp_seconds or (time.time() - phase_start)
+
+
+def _run_one_eval(
+    *,
+    kind: str,
+    player_a_label: str,
+    player_b_label: str,
+    player_a,
+    player_b,
+    games: int,
+    simulations: int,
+    c_puct: float,
+    out_json: Path,
+    log_path: Path,
+    seed: int,
+    new_gen: int,
+    total_gens: int,
+    promoted_marker: bool = False,
+    threshold: float | None = None,
+) -> float:
+    """Spawn one eval match, redirect its noisy stdout to `log_path`,
+    log a one-line pre/post status. Returns `winrate_a`."""
+    _log(
+        f"phase: eval-{kind}  ({player_a_label} vs {player_b_label}, "
+        f"{games} games × {simulations} sims)",
+        gen=new_gen,
+        total_gens=total_gens,
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    t = time.time()
+    with open(log_path, "w") as logf:
+        result = run_eval_match(
+            player_a=player_a,
+            player_b=player_b,
+            games=games,
+            simulations=simulations,
+            c_puct=c_puct,
+            out_json=out_json,
+            seed=seed,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+        )
+    elapsed = time.time() - t
+    marker = ""
+    if promoted_marker and threshold is not None and result.winrate_a >= threshold:
+        marker = "  ✓ PROMOTED"
+    _log(
+        f"  {kind:<9}  won {result.wins_a:>2}-{result.wins_b:<2} "
+        f"({result.draws} draws)  winrate {result.winrate_a:.3f}{marker}  "
+        f"({_fmt_secs(elapsed)})",
+        gen=new_gen,
+        total_gens=total_gens,
+    )
+    return result.winrate_a
 
 
 def _maybe_eval(
@@ -287,54 +535,71 @@ def _maybe_eval(
 ) -> tuple[float | None, float | None, float | None]:
     """Run gating + (optionally) heuristic + (optionally) random matches.
     Returns (gate_winrate, heuristic_winrate, random_winrate). Any may
-    be None if not run this gen."""
+    be None if not run this gen. Logs each match individually so a tail
+    of the run log shows the eval phase clearly."""
     eval_dir = run_dir / "eval"
     eval_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     gate_winrate = None
     if new_gen % cfg.eval.gate_every_gens == 0:
-        out = eval_dir / f"gen_{new_gen:03d}_gate.json"
-        result = run_eval_match(
+        gate_winrate = _run_one_eval(
+            kind="gate",
+            player_a_label=f"gen_{new_gen:03d}",
+            player_b_label="best",
             player_a=new_onnx,
             player_b=best_onnx,
             games=cfg.eval.gate_games,
             simulations=cfg.eval.gate_simulations,
             c_puct=cfg.self_play.c_puct,
-            out_json=out,
+            out_json=eval_dir / f"gen_{new_gen:03d}_gate.json",
+            log_path=logs_dir / f"gen_{new_gen:03d}_gate.log",
             seed=new_gen,
+            new_gen=new_gen,
+            total_gens=cfg.gens,
+            promoted_marker=True,
+            threshold=cfg.eval.gate_threshold,
         )
-        gate_winrate = result.winrate_a
 
     heuristic_winrate = None
     if (
         cfg.eval.heuristic_every_gens > 0
         and new_gen % cfg.eval.heuristic_every_gens == 0
     ):
-        out = eval_dir / f"gen_{new_gen:03d}_heuristic.json"
-        result = run_eval_match(
+        heuristic_winrate = _run_one_eval(
+            kind="heuristic",
+            player_a_label=f"gen_{new_gen:03d}",
+            player_b_label="heuristic",
             player_a=new_onnx,
             player_b="heuristic",
             games=cfg.eval.heuristic_games,
             simulations=cfg.eval.heuristic_simulations,
             c_puct=cfg.self_play.c_puct,
-            out_json=out,
+            out_json=eval_dir / f"gen_{new_gen:03d}_heuristic.json",
+            log_path=logs_dir / f"gen_{new_gen:03d}_heuristic.log",
             seed=new_gen + 100_000,
+            new_gen=new_gen,
+            total_gens=cfg.gens,
         )
-        heuristic_winrate = result.winrate_a
 
     random_winrate = None
     if cfg.eval.random_every_gens > 0 and new_gen % cfg.eval.random_every_gens == 0:
-        out = eval_dir / f"gen_{new_gen:03d}_random.json"
-        result = run_eval_match(
+        random_winrate = _run_one_eval(
+            kind="random",
+            player_a_label=f"gen_{new_gen:03d}",
+            player_b_label="random",
             player_a=new_onnx,
             player_b="random",
             games=cfg.eval.random_games,
             simulations=cfg.eval.random_simulations,
             c_puct=cfg.self_play.c_puct,
-            out_json=out,
+            out_json=eval_dir / f"gen_{new_gen:03d}_random.json",
+            log_path=logs_dir / f"gen_{new_gen:03d}_random.log",
             seed=new_gen + 200_000,
+            new_gen=new_gen,
+            total_gens=cfg.gens,
         )
-        random_winrate = result.winrate_a
 
     return gate_winrate, heuristic_winrate, random_winrate
 
@@ -385,13 +650,10 @@ def _start_tensorboard(runs_root: Path, port: int) -> subprocess.Popen | None:
         runs_root.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "w")
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-        print(
-            f"[train_loop] tensorboard: http://localhost:{port}/  "
-            f"(logs: {log_path})"
-        )
+        _log(f"tensorboard: http://localhost:{port}/  (server log: {log_path})")
         return proc
     except (FileNotFoundError, OSError) as e:
-        print(f"[train_loop] failed to start tensorboard: {e}", file=sys.stderr)
+        _log(f"failed to start tensorboard: {e}")
         return None
 
 
@@ -443,12 +705,13 @@ def main(argv: list[str] | None = None) -> int:
         "--no-resume", action="store_true", help="start fresh even if state exists"
     )
     parser.add_argument(
-        "--tb-port", type=int, default=6006,
-        help="port for the auto-spawned tensorboard server (default 6006)",
+        "--tensorboard", action="store_true",
+        help="spawn a tensorboard server at --tb-port. Event files are "
+        "always written to runs/<id>/tb/ regardless of this flag.",
     )
     parser.add_argument(
-        "--no-tensorboard", action="store_true",
-        help="don't spawn the tensorboard server (still writes events)",
+        "--tb-port", type=int, default=6006,
+        help="port for the tensorboard server when --tensorboard is set (default 6006)",
     )
     args = parser.parse_args(argv)
 
@@ -463,9 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     cfg.run_id = run_id
     run_dir = _resolve_run_dir(cfg, run_id)
-    print(f"[train_loop] run_id = {run_id}")
-    print(f"[train_loop] run_dir = {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     # Freeze the resolved config.
     cfg.to_yaml(run_dir / "config.yaml")
@@ -477,7 +739,21 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(cfg.seed)
 
     device = _device()
-    print(f"[train_loop] device = {device}")
+
+    # Banner + structured config dump so the log is self-describing.
+    _banner(run_id, device, os.getpid())
+    threads_resolved = (
+        f"{cfg.self_play.worker_threads}"
+        if cfg.self_play.worker_threads is not None
+        else "null (auto: cores-1)"
+    )
+    _dump_config(cfg, threads_resolved)
+    _log(f"run_dir: {run_dir}")
+    if prev_state is not None:
+        _log(
+            f"resuming from gen {prev_state.current_gen} "
+            f"(phase={prev_state.current_phase})"
+        )
 
     # Bootstrap or resume model.
     ckpt_dir = run_dir / "checkpoints"
@@ -541,8 +817,13 @@ def main(argv: list[str] | None = None) -> int:
     # comparison works in the UI.
     runs_root = REPO_ROOT / cfg.runs_root
     writer = SummaryWriter(str(run_dir / "tb"))
-    if not args.no_tensorboard:
+    if args.tensorboard:
         tb_state[0] = _start_tensorboard(runs_root, port=args.tb_port)
+    else:
+        _log(
+            f"tensorboard: events at {run_dir / 'tb'}/  "
+            f"(pass --tensorboard to spawn the server here)"
+        )
 
     try:
         return _run_outer_loop(
@@ -587,17 +868,35 @@ def _run_outer_loop(
     writer: SummaryWriter,
 ) -> int:
     # Outer loop.
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
     while state.current_gen < cfg.gens:
         new_gen = state.current_gen + 1
-        print(f"\n[train_loop] === GEN {new_gen}/{cfg.gens} ===")
+        print(flush=True)
+        _section()
+        gen_t = time.time()
+        _log("starting", gen=new_gen, total_gens=cfg.gens)
 
         # ---- self-play phase ----
         state.current_phase = "self_play"
         state.save_atomic(run_dir / "state.json")
         shards_dir = run_dir / "shards" / f"gen_{new_gen:03d}"
         shards_dir.mkdir(parents=True, exist_ok=True)
+        threads_used = (
+            cfg.self_play.worker_threads
+            if cfg.self_play.worker_threads is not None
+            else max(os.cpu_count() - 1, 1) if os.cpu_count() else 8
+        )
+        _log(
+            f"phase: self-play  ({cfg.self_play.games_per_gen} games × "
+            f"{cfg.self_play.simulations_per_move} sims on {threads_used} threads)",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
         sp_t = time.time()
-        print("[train_loop] launching self-play subprocess")
+        sp_log_path = logs_dir / f"gen_{new_gen:03d}_selfplay.log"
+        sp_log_file = open(sp_log_path, "w")
         sp_proc = start_self_play(
             model_onnx=run_dir / state.current_onnx,
             out_dir=shards_dir,
@@ -611,8 +910,8 @@ def _run_outer_loop(
             shard_games=cfg.self_play.shard_games_per_file,
             threads=cfg.self_play.worker_threads,
             seed=(cfg.seed + new_gen) & 0xFFFF_FFFF,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
+            stdout=sp_log_file,
+            stderr=subprocess.STDOUT,
         )
         sp_state[0] = sp_proc
 
@@ -620,7 +919,7 @@ def _run_outer_loop(
         state.current_phase = "training"
         state.save_atomic(run_dir / "state.json")
         train_t = time.time()
-        _, last_metrics = _train_phase(
+        _, last_metrics, sp_seconds = _train_phase(
             model=model,
             optimizer=optimizer,
             buffer=buffer,
@@ -631,10 +930,18 @@ def _run_outer_loop(
             rng=rng,
             device=device,
             writer=writer,
+            phase_start_time=sp_t,
         )
         sp_state[0] = None
+        sp_log_file.close()
         train_seconds = time.time() - train_t
-        sp_seconds = time.time() - sp_t
+        if last_metrics is not None:
+            _log(
+                f"training complete in {_fmt_secs(train_seconds)}  ·  "
+                f"mean loss={last_metrics.loss_total:.4f}  mean grad={last_metrics.grad_norm:.2f}",
+                gen=new_gen,
+                total_gens=cfg.gens,
+            )
 
         # ---- export ----
         state.current_phase = "export"
@@ -643,6 +950,12 @@ def _run_outer_loop(
         new_onnx = ckpt_dir / f"gen_{new_gen:03d}.onnx"
         _save_ckpt(model, optimizer, new_pt)
         export_onnx(model, new_onnx)
+        onnx_mb = new_onnx.stat().st_size / (1024 * 1024)
+        _log(
+            f"phase: export  →  checkpoints/gen_{new_gen:03d}.onnx ({onnx_mb:.1f} MB)",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
 
         # ---- gate + heuristic + random ----
         state.current_phase = "gate"
@@ -738,13 +1051,17 @@ def _run_outer_loop(
         state.current_phase = "complete"
         state.save_atomic(run_dir / "state.json")
 
+        gen_secs = time.time() - gen_t
         loss_str = f"{last_metrics.loss_total:.4f}" if last_metrics else "N/A"
-        print(
-            f"[train_loop] gen {new_gen} done. promoted={promoted}, gate={gate}, "
-            f"heuristic={heur}, random={rand}, loss={loss_str}"
+        promoted_str = "✓" if promoted else "✗"
+        _log(
+            f"complete in {_fmt_secs(gen_secs)}  ·  loss={loss_str}  ·  promoted {promoted_str}",
+            gen=new_gen,
+            total_gens=cfg.gens,
         )
 
-    print("[train_loop] all generations complete.")
+    _section()
+    _log("all generations complete.")
     return 0
 
 

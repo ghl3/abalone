@@ -37,8 +37,10 @@ extend-exclude = ["target", "web", "crates"]
 select = ["E", "F", "I", "B", "UP", "RUF"]
 ignore = [
     "E501", # line length handled by formatter
-    # Allow Unicode in docstrings/comments — `×` and en-dashes are
-    # intentional ("4×64 ResNet" reads better than "4x64").
+    # Allow Unicode in strings/docstrings/comments — `×` and en-dashes
+    # are intentional. The run log prints "200 games × 200 sims" which
+    # reads cleaner than "200 games x 200 sims".
+    "RUF001",
     "RUF002",
     "RUF003",
 ]
