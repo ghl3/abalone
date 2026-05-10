@@ -17,7 +17,7 @@ self_play:
   worker_threads: null  # null = (cores - 1)
 
 train:
-  steps_per_gen: 1000
+  steps_per_gen_min: 1000
   batch_size: 256
   learning_rate: 1.0e-3
   weight_decay: 1.0e-4

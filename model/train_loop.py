@@ -155,7 +155,13 @@ def _dump_config(cfg: RunConfig, worker_threads_resolved: str) -> None:
     print(f"    shard_games_per_file:{sp.shard_games_per_file}", flush=True)
     print(f"    worker_threads:      {worker_threads_resolved}", flush=True)
     print("  train:", flush=True)
-    print(f"    steps_per_gen:       {tr.steps_per_gen}", flush=True)
+    steps_max_str = (
+        str(tr.steps_per_gen_max) if tr.steps_per_gen_max is not None else "(none)"
+    )
+    print(
+        f"    steps_per_gen:       min={tr.steps_per_gen_min}, max={steps_max_str}",
+        flush=True,
+    )
     print(f"    batch_size:          {tr.batch_size}", flush=True)
     print(f"    learning_rate:       {tr.learning_rate}", flush=True)
     print(f"    weight_decay:        {tr.weight_decay}", flush=True)
@@ -374,19 +380,20 @@ def _train_phase(
     writer: SummaryWriter | None = None,
     phase_start_time: float | None = None,
 ) -> tuple[int, StepMetrics | None, float, float]:
-    """Train while self-play runs (if `sp_proc` is alive). Continue
-    training after self-play exits until we've done `steps_per_gen` SGD
-    steps total.
+    """Train while self-play runs (if `sp_proc` is alive). The exit
+    rule is dynamic:
 
-    Returns (steps_done, mean_metrics, self_play_seconds). `mean_metrics`
-    is the running mean over all SGD steps; `self_play_seconds` is the
-    wall-clock the self-play subprocess actually took (so we can log it
-    distinctly from the trailing training-only tail).
+      - Always do at least `train.steps_per_gen_min` SGD steps.
+      - If `steps_per_gen_max` is set and self-play is *still running*
+        when we hit the min, keep training (consuming otherwise-idle
+        wall-clock) up to `steps_per_gen_max` total, then stop.
+      - If self-play exits first and we're past the min, stop.
 
-    If `writer` is provided, per-step scalars are written under tags
-    `train/step_*` with global step `(new_gen - 1) * steps_per_gen + i`.
-    Periodic progress lines are emitted at `PROGRESS_INTERVAL_S`
-    cadence."""
+    Returns (steps_done, mean_metrics, self_play_seconds,
+    active_train_seconds). `mean_metrics` is the running mean over all
+    SGD steps. If `writer` is provided, per-step scalars go to the
+    `train/step_*` TB tags. Periodic progress lines fire at
+    `PROGRESS_INTERVAL_S` cadence."""
 
     z_w = value_target_blend_weight(
         new_gen,
@@ -394,7 +401,15 @@ def _train_phase(
         cfg.train.value_target_blend_end,
         cfg.train.value_target_blend_done_by_gen,
     )
-    step_offset = (new_gen - 1) * cfg.train.steps_per_gen
+
+    min_steps = cfg.train.steps_per_gen_min
+    # If max is unset, behave like the old fixed-step mode.
+    max_steps = cfg.train.steps_per_gen_max or min_steps
+    if max_steps < min_steps:
+        max_steps = min_steps
+    # TB global step uses the min as the per-gen budget so plots align
+    # across gens even when actual step counts vary.
+    step_offset = (new_gen - 1) * min_steps
 
     steps_done = 0
     sum_loss_total = 0.0
@@ -408,7 +423,6 @@ def _train_phase(
     seen_files: set[Path] = set()
 
     target_games = cfg.self_play.games_per_gen
-    target_steps = cfg.train.steps_per_gen
     games_per_shard = max(cfg.self_play.shard_games_per_file, 1)
     target_shards = (target_games + games_per_shard - 1) // games_per_shard
     phase_start = phase_start_time if phase_start_time is not None else time.time()
@@ -452,7 +466,13 @@ def _train_phase(
             )
         else:
             sp_str = f"self-play {games_done:>4}/{target_games} (done)"
-        shard_str = f"shards {shards_done:>2}/{target_shards}"
+        shard_str = f"shards {shards_done:>3}/{target_shards}"
+        # Show steps_done against the upper budget. The `+` mark
+        # indicates we're already past the min and into the "extra
+        # training while self-play runs" tail.
+        train_str = f"train {steps_done:>4}/{max_steps}"
+        if min_steps < max_steps and steps_done > min_steps:
+            train_str += "+"
         if win_steps > 0:
             loss_str = f"loss={win_loss_total/win_steps:.4f}  grad={win_grad_norm/win_steps:.2f}"
         elif steps_done == 0:
@@ -461,7 +481,7 @@ def _train_phase(
             loss_str = "(no new steps this window)"
         _log(
             f"  progress  ·  {sp_str}  ·  {shard_str}  ·  "
-            f"train {steps_done:>4}/{target_steps}  {loss_str}",
+            f"{train_str}  {loss_str}",
             gen=new_gen,
             total_gens=cfg.gens,
         )
@@ -471,7 +491,7 @@ def _train_phase(
 
     poll_interval = max(0.05, cfg.train.poll_interval_ms / 1000.0)
 
-    while steps_done < target_steps:
+    while True:
         ingest_new()
 
         # Self-play just exited? Emit the one-line summary then continue
@@ -493,12 +513,14 @@ def _train_phase(
                     gen=new_gen,
                     total_gens=cfg.gens,
                 )
-                _log(
-                    f"phase: training  (drain to {target_steps} SGD steps, "
-                    f"batch {cfg.train.batch_size})",
-                    gen=new_gen,
-                    total_gens=cfg.gens,
-                )
+                # Only announce a training "drain" if we still owe steps.
+                if steps_done < min_steps:
+                    _log(
+                        f"phase: training  (drain to {min_steps} SGD steps, "
+                        f"batch {cfg.train.batch_size})",
+                        gen=new_gen,
+                        total_gens=cfg.gens,
+                    )
 
         # Periodic progress line.
         now = time.time()
@@ -511,8 +533,17 @@ def _train_phase(
         if threshold > 0:
             buffer.evict_below(threshold)
 
+        # Stop conditions:
+        #  - Always stop at the hard cap.
+        #  - Once we've done the min, stop as soon as self-play is done.
+        sp_alive_now = sp_proc is not None and sp_proc.poll() is None
+        if steps_done >= max_steps:
+            break
+        if steps_done >= min_steps and not sp_alive_now:
+            break
+
         if buffer.total_size() < cfg.train.replay_buffer_min_size:
-            if sp_proc is None or sp_proc.poll() is not None:
+            if not sp_alive_now:
                 # Self-play done and we still don't have enough data.
                 # Sample what we have and proceed; if buffer is empty, bail.
                 if buffer.total_size() == 0:
@@ -523,7 +554,7 @@ def _train_phase(
                 continue
 
         # One small training chunk per poll.
-        for _ in range(min(8, target_steps - steps_done)):
+        for _ in range(min(8, max_steps - steps_done)):
             batch = buffer.sample(cfg.train.batch_size, rng)
             m = train_step(
                 model,
@@ -551,7 +582,7 @@ def _train_phase(
                 writer.add_scalar("train/step_loss_policy", m.loss_policy, gs)
                 writer.add_scalar("train/step_loss_value", m.loss_value, gs)
                 writer.add_scalar("train/step_grad_norm", m.grad_norm, gs)
-            if steps_done >= target_steps:
+            if steps_done >= max_steps:
                 break
 
         # Yield to self-play subprocess if it's still running.
@@ -1067,7 +1098,7 @@ def _run_outer_loop(
         state.current_phase = "training"
         state.save_atomic(run_dir / "state.json")
         train_t = time.time()
-        _, last_metrics, sp_seconds, active_train_secs = _train_phase(
+        steps_done, last_metrics, sp_seconds, active_train_secs = _train_phase(
             model=model,
             optimizer=optimizer,
             buffer=buffer,
@@ -1087,11 +1118,12 @@ def _run_outer_loop(
         if last_metrics is not None:
             # Use `active_train_secs` (first SGD step to last) for the
             # throughput metric — excludes the leading wait-for-buffer
-            # stretch so the rate is comparable across gens.
-            cfg_steps = cfg.train.steps_per_gen
-            rate = cfg_steps / active_train_secs if active_train_secs > 0 else 0.0
+            # stretch so the rate is comparable across gens. `steps_done`
+            # may exceed `steps_per_gen_min` if we used idle wall-clock
+            # to keep training while self-play kept running.
+            rate = steps_done / active_train_secs if active_train_secs > 0 else 0.0
             _log(
-                f"training complete: {cfg_steps} steps in "
+                f"training complete: {steps_done} steps in "
                 f"{_fmt_secs(active_train_secs)} ({rate:.1f} steps/s)  ·  "
                 f"mean loss={last_metrics.loss_total:.4f}  "
                 f"mean grad={last_metrics.grad_norm:.2f}",

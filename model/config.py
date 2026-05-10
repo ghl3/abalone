@@ -36,7 +36,16 @@ class SelfPlayConfig:
 
 @dataclass
 class TrainConfig:
-    steps_per_gen: int = 1000
+    # Minimum SGD steps per generation. Training always runs at least
+    # this many steps before letting the gen complete (even if
+    # self-play finishes earlier).
+    steps_per_gen_min: int = 1000
+    # Maximum SGD steps per generation. If self-play is still running
+    # when we hit the min, training keeps consuming otherwise-idle
+    # wall-clock until either self-play exits or this cap is reached.
+    # Prevents runaway overfitting on a fixed buffer. If None, behaves
+    # exactly like the old fixed-step mode (stops at the min).
+    steps_per_gen_max: int | None = None
     batch_size: int = 256
     learning_rate: float = 1.0e-3
     weight_decay: float = 1.0e-4

@@ -1,7 +1,7 @@
-# Medium training run, sized for ~3-4 hours on a 10-core M-series Mac.
+# Medium training run, sized for ~2-3 hours on a 10-core M-series Mac.
 # Goal: confirm the pipeline trains stably and produces a model that
 # beats random by a wide margin and starts to compete with the heuristic.
-# 12 gens with full self-play sims and parallel eval.
+# 12 gens with halved sims/move, dynamic training, and per-game shards.
 seed: 0
 gens: 12
 runs_root: runs
@@ -9,8 +9,14 @@ web_export_path: web/public/models/best.onnx
 
 self_play:
   games_per_gen: 200
-  shard_games_per_file: 8
-  simulations_per_move: 200
+  # One game per parquet file. Trade-off: more small files (200 per gen
+  # × 12 gens = ~2400) and slightly worse compression per file, but
+  # training sees fresh data within ~3 min instead of waiting ~25 min
+  # for the first 8-game shard to atomic-rename.
+  shard_games_per_file: 1
+  # Halved from 200 → 100 for ~2× self-play speedup. Still meaningfully
+  # better policy targets than the raw network priors.
+  simulations_per_move: 100
   c_puct: 1.4
   temperature_plies: 50
   temperature: 1.0
@@ -19,13 +25,17 @@ self_play:
   worker_threads: null  # null = (cores - 1)
 
 train:
-  steps_per_gen: 1000
+  # Always runs at least this many steps before the gen can complete.
+  steps_per_gen_min: 1000
+  # Cap when self-play is still running after min-steps. The extra
+  # steps consume otherwise-idle wall-clock during gen 1; ~5× the min
+  # is safe, higher risks oversampling a fixed buffer.
+  steps_per_gen_max: 5000
   batch_size: 256
   learning_rate: 1.0e-3
   weight_decay: 1.0e-4
   value_loss_weight: 0.5
   # Ramp from "trust MCTS Q a lot" early to "trust terminal z fully" late.
-  # done_by_gen lowered from 20 → 10 to fit the shorter run.
   value_target_blend_start: 0.5
   value_target_blend_end: 1.0
   value_target_blend_done_by_gen: 10
@@ -35,21 +45,17 @@ train:
   poll_interval_ms: 250
 
 eval:
-  # Gate every gen so promotion happens as early as possible.
+  # Match self-play sim count for apples-to-apples gating.
   gate_every_gens: 1
   gate_games: 21
-  gate_simulations: 200
+  gate_simulations: 100
   gate_threshold: 0.55
-  # Heuristic eval every 2 gens — frequent enough to chart the curve
-  # within a 12-gen run.
   heuristic_every_gens: 2
   heuristic_games: 21
-  heuristic_simulations: 200
-  # Random eval every 3 gens — cheap, gives a "this had better not regress"
-  # baseline.
+  heuristic_simulations: 100
   random_every_gens: 3
   random_games: 11
-  random_simulations: 200
+  random_simulations: 100
 
 retention:
   keep_last_checkpoints: 5

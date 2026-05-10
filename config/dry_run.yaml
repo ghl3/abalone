@@ -17,7 +17,7 @@ self_play:
   worker_threads: 2
 
 train:
-  steps_per_gen: 10
+  steps_per_gen_min: 10
   batch_size: 32
   learning_rate: 1.0e-3
   weight_decay: 1.0e-4
