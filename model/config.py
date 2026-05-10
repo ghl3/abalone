@@ -85,6 +85,12 @@ class RunConfig:
     gens: int = 50
     runs_root: str = "runs"
     web_export_path: str = "web/public/models/best.onnx"
+    # Infra knob: route Rust ORT inference through Apple's CoreML
+    # execution provider (Neural Engine / GPU) instead of CPU. On our
+    # 7M-param model with parallel workers, CPU is faster; enable only
+    # if you've scaled up the model and benchmarked the difference.
+    # Excluded from `config_hash` so flipping this on resume is allowed.
+    use_coreml: bool = False
     self_play: SelfPlayConfig = field(default_factory=SelfPlayConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
@@ -112,6 +118,7 @@ class RunConfig:
         d = asdict(self)
         d.pop("run_id", None)
         d.pop("gens", None)
+        d.pop("use_coreml", None)
         # Stable serialization: yaml with sorted keys, default flow.
         canonical = yaml.safe_dump(d, sort_keys=True, default_flow_style=False)
         return hashlib.sha256(canonical.encode()).hexdigest()

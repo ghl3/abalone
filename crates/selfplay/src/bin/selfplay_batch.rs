@@ -91,7 +91,10 @@ fn main() {
     eprintln!("selfplay-batch: {:?}", args);
     std::fs::create_dir_all(&args.out_dir).expect("create out-dir");
 
-    let evaluator = OrtEvaluator::from_onnx(&args.model).expect("load onnx model");
+    // Per-thread sessions: each worker loads its own ONNX. ORT 2.x's
+    // Session::run takes &mut self, and a shared Mutex<Session> would
+    // bottleneck all inference through one thread. ~30 MB × threads of
+    // extra memory is cheap compared to the throughput we recover.
     let cfg = SelfPlayConfig {
         simulations: args.simulations,
         c_puct: args.c_puct,
@@ -108,11 +111,24 @@ fn main() {
 
     thread::scope(|s| {
         for tid in 0..args.threads {
-            let evaluator = evaluator.clone();
+            let model_path = args.model.clone();
             let cfg = cfg.clone();
             let out_dir = args.out_dir.clone();
             let next_game = Arc::clone(&next_game);
-            s.spawn(move || run_worker(tid, evaluator, cfg, out_dir, games, shard_games, next_game, args.seed));
+            s.spawn(move || {
+                let mut evaluator =
+                    OrtEvaluator::from_onnx(&model_path).expect("load onnx model");
+                run_worker(
+                    tid,
+                    &mut evaluator,
+                    cfg,
+                    out_dir,
+                    games,
+                    shard_games,
+                    next_game,
+                    args.seed,
+                );
+            });
         }
     });
 
@@ -126,7 +142,7 @@ fn main() {
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     tid: usize,
-    evaluator: Arc<OrtEvaluator>,
+    evaluator: &mut OrtEvaluator,
     cfg: SelfPlayConfig,
     out_dir: PathBuf,
     games: u32,

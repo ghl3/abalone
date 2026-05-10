@@ -33,7 +33,14 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from model.abalone_net import BOARD_H, BOARD_W, INPUT_CHANNELS, AbaloneNet
+from model.abalone_net import (
+    BOARD_H,
+    BOARD_W,
+    CHANNELS,
+    INPUT_CHANNELS,
+    NUM_RES_BLOCKS,
+    AbaloneNet,
+)
 from model.config import RunConfig
 from model.encoder import VALID_CELL_MASK
 from model.eval import run_eval_match, start_self_play
@@ -65,15 +72,56 @@ def _log(msg: str, *, gen: int | None = None, total_gens: int | None = None) -> 
     print(f"{prefix}{msg}", flush=True)
 
 
-def _banner(run_id: str, device: torch.device, pid: int) -> None:
-    line = "═" * 71
-    print(line, flush=True)
-    print(f" Abalone training run: {run_id}", flush=True)
+def _git_short_sha() -> str:
+    """Best-effort git commit SHA prefix; 'detached' if outside a repo."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out or "detached"
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return "detached"
+
+
+def _banner(
+    run_id: str,
+    device: torch.device,
+    pid: int,
+    model: AbaloneNet,
+    worker_threads: int,
+) -> None:
+    """Print a self-describing run header. The marbles in the title are
+    the two players in Abalone — black ●, white ○. Layout is fixed-width
+    so it lines up in any monospace font."""
+    line = "═" * 73
+    title = "  ●○●○●   Abalone — AlphaZero training pipeline   ●○●○●"
     started = time.strftime("%Y-%m-%d %H:%M:%S")
+    n_params = model.num_parameters() / 1e6
+    arch = f"AbaloneNet ({NUM_RES_BLOCKS}×{CHANNELS}, {n_params:.1f}M params)"
+    torch_v = torch.__version__
+
+    print(line, flush=True)
+    print(title, flush=True)
+    print(line, flush=True)
+    print(flush=True)
+    print(f"  Run:       {run_id}", flush=True)
+    print(f"  Started:   {started}", flush=True)
     print(
-        f" Started:  {started}  ·  device: {device}  ·  pid: {pid}",
+        f"  Device:    {device!s:<13}  Workers:  {worker_threads} threads",
         flush=True,
     )
+    print(
+        f"  PID:       {pid!s:<13}  Commit:   {_git_short_sha()}",
+        flush=True,
+    )
+    print(
+        f"  Torch:     {torch_v:<13}  Model:    {arch}",
+        flush=True,
+    )
+    print(flush=True)
     print(line, flush=True)
     print(flush=True)
 
@@ -92,6 +140,10 @@ def _dump_config(cfg: RunConfig, worker_threads_resolved: str) -> None:
     print(f"  gens:                  {cfg.gens}", flush=True)
     print(f"  seed:                  {cfg.seed}", flush=True)
     print(f"  runs_root:             {cfg.runs_root}", flush=True)
+    print(
+        f"  inference backend:     {'CoreML (ANE/GPU)' if cfg.use_coreml else 'ORT CPU'}",
+        flush=True,
+    )
     print("  self_play:", flush=True)
     print(f"    games_per_gen:       {sp.games_per_gen}", flush=True)
     print(f"    simulations_per_move:{sp.simulations_per_move}", flush=True)
@@ -740,20 +792,12 @@ def main(argv: list[str] | None = None) -> int:
 
     device = _device()
 
-    # Banner + structured config dump so the log is self-describing.
-    _banner(run_id, device, os.getpid())
-    threads_resolved = (
-        f"{cfg.self_play.worker_threads}"
-        if cfg.self_play.worker_threads is not None
-        else "null (auto: cores-1)"
-    )
-    _dump_config(cfg, threads_resolved)
-    _log(f"run_dir: {run_dir}")
-    if prev_state is not None:
-        _log(
-            f"resuming from gen {prev_state.current_gen} "
-            f"(phase={prev_state.current_phase})"
-        )
+    # Plumb the CoreML toggle to Rust subprocesses via env var. Children
+    # inherit our environment so this is all that's needed.
+    if cfg.use_coreml:
+        os.environ["ABALONE_USE_COREML"] = "1"
+    else:
+        os.environ.pop("ABALONE_USE_COREML", None)
 
     # Bootstrap or resume model.
     ckpt_dir = run_dir / "checkpoints"
@@ -764,6 +808,26 @@ def main(argv: list[str] | None = None) -> int:
         lr=cfg.train.learning_rate,
         weight_decay=cfg.train.weight_decay,
     )
+
+    # Banner + structured config dump so the log is self-describing.
+    workers_n = (
+        cfg.self_play.worker_threads
+        if cfg.self_play.worker_threads is not None
+        else max((os.cpu_count() or 8) - 1, 1)
+    )
+    _banner(run_id, device, os.getpid(), model, workers_n)
+    threads_resolved = (
+        f"{cfg.self_play.worker_threads}"
+        if cfg.self_play.worker_threads is not None
+        else f"null (auto: {workers_n})"
+    )
+    _dump_config(cfg, threads_resolved)
+    _log(f"run_dir: {run_dir}")
+    if prev_state is not None:
+        _log(
+            f"resuming from gen {prev_state.current_gen} "
+            f"(phase={prev_state.current_phase})"
+        )
 
     if prev_state is None:
         # Fresh: bootstrap gen_000 (random weights) and start at gen 1.

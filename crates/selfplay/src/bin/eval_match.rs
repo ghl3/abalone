@@ -32,6 +32,11 @@ use rand::Rng;
 use rand::SeedableRng;
 use serde::Serialize;
 
+// Per-thread Player: each worker holds its own `OrtEvaluator` so all
+// inference runs in parallel (vs. one shared `Arc<Mutex<Session>>`
+// that would serialize). Cost is one ONNX load per thread; throughput
+// gain is ~num-threads×.
+
 #[derive(Clone, Debug)]
 enum PlayerSpec {
     Model(PathBuf),
@@ -114,9 +119,8 @@ fn num_cpus_or(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[derive(Clone)]
 enum Player {
-    Model(Arc<OrtEvaluator>),
+    Model(OrtEvaluator),
     Heuristic,
     Random,
 }
@@ -132,7 +136,7 @@ impl Player {
         }
     }
 
-    fn pick_move(&self, g: &Game, cfg: &SearchConfig, rng: &mut SmallRng) -> Move {
+    fn pick_move(&mut self, g: &Game, cfg: &SearchConfig, rng: &mut SmallRng) -> Move {
         match self {
             Player::Model(eval) => {
                 let res = search(g, cfg, rng, |state, _| -> LeafEval {
@@ -168,8 +172,6 @@ fn main() {
     let args = Args::parse();
     eprintln!("eval-match: {:?}", args);
 
-    let player_a = Player::from_spec(&args.a);
-    let player_b = Player::from_spec(&args.b);
     let cfg = SearchConfig {
         simulations: args.simulations,
         c_puct: args.c_puct,
@@ -188,53 +190,60 @@ fn main() {
 
     thread::scope(|s| {
         for _tid in 0..args.threads {
-            let player_a = player_a.clone();
-            let player_b = player_b.clone();
+            // Each thread constructs its own Player(s), which for Model
+            // means loading a fresh ort Session. This eliminates the
+            // global inference Mutex.
+            let a_spec = args.a.clone();
+            let b_spec = args.b.clone();
             let cfg = cfg.clone();
             let next_game = Arc::clone(&next_game);
             let wins_a = Arc::clone(&wins_a);
             let wins_b = Arc::clone(&wins_b);
             let draws = Arc::clone(&draws);
-            s.spawn(move || loop {
-                let i = next_game.fetch_add(1, Ordering::Relaxed);
-                if i >= games {
-                    break;
-                }
-                let a_is_black = i % 2 == 0;
-                let mut rng_a = SmallRng::seed_from_u64(seed.wrapping_add((i as u64) * 2));
-                let mut rng_b = SmallRng::seed_from_u64(seed.wrapping_add((i as u64) * 2 + 1));
+            s.spawn(move || {
+                let mut player_a = Player::from_spec(&a_spec);
+                let mut player_b = Player::from_spec(&b_spec);
+                loop {
+                    let i = next_game.fetch_add(1, Ordering::Relaxed);
+                    if i >= games {
+                        break;
+                    }
+                    let a_is_black = i % 2 == 0;
+                    let mut rng_a = SmallRng::seed_from_u64(seed.wrapping_add((i as u64) * 2));
+                    let mut rng_b = SmallRng::seed_from_u64(seed.wrapping_add((i as u64) * 2 + 1));
 
-                let mut g = Game::new_standard();
-                while !g.is_terminal() {
-                    let mv = if (g.turn == Side::Black) == a_is_black {
-                        player_a.pick_move(&g, &cfg, &mut rng_a)
-                    } else {
-                        player_b.pick_move(&g, &cfg, &mut rng_b)
-                    };
-                    g.apply(mv);
-                }
-
-                match g.state() {
-                    GameState::Wins(side) => {
-                        let a_won = (side == Side::Black) == a_is_black;
-                        if a_won {
-                            wins_a.fetch_add(1, Ordering::Relaxed);
+                    let mut g = Game::new_standard();
+                    while !g.is_terminal() {
+                        let mv = if (g.turn == Side::Black) == a_is_black {
+                            player_a.pick_move(&g, &cfg, &mut rng_a)
                         } else {
-                            wins_b.fetch_add(1, Ordering::Relaxed);
-                        }
+                            player_b.pick_move(&g, &cfg, &mut rng_b)
+                        };
+                        g.apply(mv);
                     }
-                    GameState::Draw => {
-                        draws.fetch_add(1, Ordering::Relaxed);
-                    }
-                    GameState::InProgress => unreachable!(),
-                }
 
-                eprintln!(
-                    "  game {}: a_is_black={}, final={:?}",
-                    i,
-                    a_is_black,
-                    g.state()
-                );
+                    match g.state() {
+                        GameState::Wins(side) => {
+                            let a_won = (side == Side::Black) == a_is_black;
+                            if a_won {
+                                wins_a.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                wins_b.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        GameState::Draw => {
+                            draws.fetch_add(1, Ordering::Relaxed);
+                        }
+                        GameState::InProgress => unreachable!(),
+                    }
+
+                    eprintln!(
+                        "  game {}: a_is_black={}, final={:?}",
+                        i,
+                        a_is_black,
+                        g.state()
+                    );
+                }
             });
         }
     });
