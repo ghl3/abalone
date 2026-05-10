@@ -171,17 +171,17 @@ def _dump_config(cfg: RunConfig, worker_threads_resolved: str) -> None:
     print("  eval:", flush=True)
     print(
         f"    gate:        every {ev.gate_every_gens} gen,   "
-        f"{ev.gate_games} games × {ev.gate_simulations} sims, threshold {ev.gate_threshold}",
+        f"{ev.gate_games} games, {ev.gate_simulations} sims/move, threshold {ev.gate_threshold}",
         flush=True,
     )
     print(
         f"    heuristic:   every {ev.heuristic_every_gens} gens,  "
-        f"{ev.heuristic_games} games × {ev.heuristic_simulations} sims",
+        f"{ev.heuristic_games} games, {ev.heuristic_simulations} sims/move",
         flush=True,
     )
     print(
         f"    random:      every {ev.random_every_gens} gens,  "
-        f"{ev.random_games} games × {ev.random_simulations} sims",
+        f"{ev.random_games} games, {ev.random_simulations} sims/move",
         flush=True,
     )
     print(flush=True)
@@ -201,6 +201,54 @@ def _count_complete_shards(gen_dir: Path) -> int:
     if not gen_dir.exists():
         return 0
     return sum(1 for _ in gen_dir.glob("*.parquet"))
+
+
+def _count_completed_games(selfplay_log_path: Path) -> tuple[int, float]:
+    """Parse the self-play subprocess log file for completed-game
+    records. Each finished game produces one line of the form
+        `  [tN] game M: P plies, final=Wins(Black)|Wins(White)|Draw`
+    written by a single `eprintln!` in `selfplay_batch.rs`. The
+    "] game M: P plies, final=" substring is the contract.
+
+    Called from `emit_progress` at the main progress cadence (~30s) —
+    NOT a hot loop. We re-read the whole file each call; even at 200
+    games × ~50 bytes/line = ~10 KB it's nothing. Defensive parsing
+    skips lines that don't match instead of erroring, so panics or
+    other unrelated output don't break the count.
+
+    Returns `(games_done, avg_plies_per_game)`."""
+    if not selfplay_log_path.exists():
+        return 0, 0.0
+    games = 0
+    total_plies = 0
+    try:
+        with selfplay_log_path.open() as f:
+            for line in f:
+                # Two stable anchor substrings. The plies value lives
+                # between "] game M: " and " plies, final=".
+                gm = line.find("] game ")
+                if gm == -1:
+                    continue
+                pf = line.find(" plies, final=", gm)
+                if pf == -1:
+                    continue
+                # The integer ends at pf and starts after a colon-space.
+                end = pf
+                start = end
+                while start > 0 and line[start - 1].isdigit():
+                    start -= 1
+                if start >= end:
+                    continue
+                try:
+                    plies = int(line[start:end])
+                except ValueError:
+                    continue
+                games += 1
+                total_plies += plies
+    except OSError:
+        return 0, 0.0
+    avg = total_plies / games if games > 0 else 0.0
+    return games, avg
 
 
 def _device() -> torch.device:
@@ -317,6 +365,7 @@ def _train_phase(
     optimizer: torch.optim.Optimizer,
     buffer: ReplayBuffer,
     sp_proc: subprocess.Popen | None,
+    selfplay_log_path: Path,
     shards_dir: Path,
     new_gen: int,
     cfg: RunConfig,
@@ -324,7 +373,7 @@ def _train_phase(
     device: torch.device,
     writer: SummaryWriter | None = None,
     phase_start_time: float | None = None,
-) -> tuple[int, StepMetrics | None, float]:
+) -> tuple[int, StepMetrics | None, float, float]:
     """Train while self-play runs (if `sp_proc` is alive). Continue
     training after self-play exits until we've done `steps_per_gen` SGD
     steps total.
@@ -360,11 +409,14 @@ def _train_phase(
 
     target_games = cfg.self_play.games_per_gen
     target_steps = cfg.train.steps_per_gen
-    games_per_shard = cfg.self_play.shard_games_per_file
+    games_per_shard = max(cfg.self_play.shard_games_per_file, 1)
+    target_shards = (target_games + games_per_shard - 1) // games_per_shard
     phase_start = phase_start_time if phase_start_time is not None else time.time()
     last_progress_log = phase_start
     sp_seconds: float | None = None  # set when sp_proc finishes
     sp_done_announced = False
+    first_step_time: float | None = None
+    last_step_time: float | None = None
 
     def ingest_new() -> int:
         ingested = 0
@@ -385,19 +437,31 @@ def _train_phase(
     def emit_progress() -> None:
         nonlocal win_loss_total, win_grad_norm, win_steps
         sp_alive = sp_proc is not None and sp_proc.poll() is None
+        # Two distinct signals:
+        #  - games_done: parsed from the selfplay log; smooth per-game.
+        #    Tells you self-play is alive and making moves.
+        #  - shards_done: count of `.parquet` files (atomic-renamed);
+        #    lumpy (rotates every shard_games_per_file games per thread)
+        #    but this is what training can actually ingest.
+        games_done, _ = _count_completed_games(selfplay_log_path)
+        shards_done = _count_complete_shards(shards_dir)
         if sp_alive:
-            games_done = _count_complete_shards(shards_dir) * games_per_shard
-            sp_str = f"self-play {games_done:>4}/{target_games} ({100*games_done/max(target_games,1):4.1f}%)"
+            sp_str = (
+                f"self-play {games_done:>4}/{target_games} "
+                f"({100*games_done/max(target_games,1):4.1f}%)"
+            )
         else:
-            sp_str = "self-play done            "
+            sp_str = f"self-play {games_done:>4}/{target_games} (done)"
+        shard_str = f"shards {shards_done:>2}/{target_shards}"
         if win_steps > 0:
             loss_str = f"loss={win_loss_total/win_steps:.4f}  grad={win_grad_norm/win_steps:.2f}"
         elif steps_done == 0:
             loss_str = "(waiting for buffer)"
         else:
-            loss_str = "(no new steps)"
+            loss_str = "(no new steps this window)"
         _log(
-            f"  progress  ·  {sp_str}  ·  train {steps_done:>4}/{target_steps}  {loss_str}",
+            f"  progress  ·  {sp_str}  ·  {shard_str}  ·  "
+            f"train {steps_done:>4}/{target_steps}  {loss_str}",
             gen=new_gen,
             total_gens=cfg.gens,
         )
@@ -422,16 +486,16 @@ def _train_phase(
             # Don't bail on nonzero yet — we still want to drain any final
             # shards. We'll raise after wait() below.
             if sp_proc.returncode == 0:
-                gen_size = buffer.chunk_size(new_gen)
-                avg_plies = gen_size / target_games if target_games > 0 else 0.0
+                games_done, avg_plies = _count_completed_games(selfplay_log_path)
                 _log(
                     f"self-play complete in {_fmt_secs(sp_seconds)}  ·  "
-                    f"{gen_size} positions  ·  avg {avg_plies:.0f} plies/game",
+                    f"{games_done} games  ·  avg {avg_plies:.0f} plies/game",
                     gen=new_gen,
                     total_gens=cfg.gens,
                 )
                 _log(
-                    f"phase: training  (drain to {target_steps} SGD steps, batch {cfg.train.batch_size})",
+                    f"phase: training  (drain to {target_steps} SGD steps, "
+                    f"batch {cfg.train.batch_size})",
                     gen=new_gen,
                     total_gens=cfg.gens,
                 )
@@ -477,6 +541,10 @@ def _train_phase(
             win_grad_norm += m.grad_norm
             win_steps += 1
             steps_done += 1
+            now_step = time.time()
+            if first_step_time is None:
+                first_step_time = now_step
+            last_step_time = now_step
             if writer is not None:
                 gs = step_offset + steps_done
                 writer.add_scalar("train/step_loss_total", m.loss_total, gs)
@@ -498,29 +566,41 @@ def _train_phase(
                 f"selfplay-batch exited with non-zero status {sp_proc.returncode}; "
                 f"see runs/<id>/logs/gen_NNN_selfplay.log for details."
             )
-        # Drain remaining shards BEFORE measuring gen_size: trainer may
-        # have exited steps loop before all shards arrived on disk.
+        # Drain remaining shards: trainer may have exited the steps loop
+        # before all shards arrived on disk.
         ingest_new()
         if not sp_done_announced:
             sp_seconds = time.time() - phase_start
-            gen_size = buffer.chunk_size(new_gen)
-            avg_plies = gen_size / target_games if target_games > 0 else 0.0
+            games_done, avg_plies = _count_completed_games(selfplay_log_path)
             _log(
                 f"self-play complete in {_fmt_secs(sp_seconds)}  ·  "
-                f"{gen_size} positions  ·  avg {avg_plies:.0f} plies/game",
+                f"{games_done} games  ·  avg {avg_plies:.0f} plies/game",
                 gen=new_gen,
                 total_gens=cfg.gens,
             )
 
     if steps_done == 0:
-        return 0, None, sp_seconds or 0.0
+        return 0, None, sp_seconds or 0.0, 0.0
     mean_metrics = StepMetrics(
         loss_total=sum_loss_total / steps_done,
         loss_policy=sum_loss_policy / steps_done,
         loss_value=sum_loss_value / steps_done,
         grad_norm=sum_grad_norm / steps_done,
     )
-    return steps_done, mean_metrics, sp_seconds or (time.time() - phase_start)
+    # `active_train_seconds` is the wall-clock from the first SGD step to
+    # the last — excludes the leading "waiting on buffer" stretch so the
+    # steps/sec rate reflects real training throughput.
+    active_train = (
+        (last_step_time - first_step_time)
+        if first_step_time is not None and last_step_time is not None
+        else 0.0
+    )
+    return (
+        steps_done,
+        mean_metrics,
+        sp_seconds or (time.time() - phase_start),
+        active_train,
+    )
 
 
 def _run_one_eval(
@@ -545,7 +625,7 @@ def _run_one_eval(
     log a one-line pre/post status. Returns `winrate_a`."""
     _log(
         f"phase: eval-{kind}  ({player_a_label} vs {player_b_label}, "
-        f"{games} games × {simulations} sims)",
+        f"{games} games, {simulations} sims/move)",
         gen=new_gen,
         total_gens=total_gens,
     )
@@ -953,14 +1033,18 @@ def _run_outer_loop(
             else max(os.cpu_count() - 1, 1) if os.cpu_count() else 8
         )
         _log(
-            f"phase: self-play  ({cfg.self_play.games_per_gen} games × "
-            f"{cfg.self_play.simulations_per_move} sims on {threads_used} threads)",
+            f"phase: self-play  ({cfg.self_play.games_per_gen} games, "
+            f"{cfg.self_play.simulations_per_move} sims/move, "
+            f"{threads_used} threads)",
             gen=new_gen,
             total_gens=cfg.gens,
         )
         sp_t = time.time()
         sp_log_path = logs_dir / f"gen_{new_gen:03d}_selfplay.log"
         sp_log_file = open(sp_log_path, "w")
+        # Both stdout and stderr go to the per-gen log file. The Python
+        # driver re-reads this file at progress-tick cadence to count
+        # completed games (`_count_completed_games`).
         sp_proc = start_self_play(
             model_onnx=run_dir / state.current_onnx,
             out_dir=shards_dir,
@@ -983,11 +1067,12 @@ def _run_outer_loop(
         state.current_phase = "training"
         state.save_atomic(run_dir / "state.json")
         train_t = time.time()
-        _, last_metrics, sp_seconds = _train_phase(
+        _, last_metrics, sp_seconds, active_train_secs = _train_phase(
             model=model,
             optimizer=optimizer,
             buffer=buffer,
             sp_proc=sp_proc,
+            selfplay_log_path=sp_log_path,
             shards_dir=shards_dir,
             new_gen=new_gen,
             cfg=cfg,
@@ -1000,9 +1085,16 @@ def _run_outer_loop(
         sp_log_file.close()
         train_seconds = time.time() - train_t
         if last_metrics is not None:
+            # Use `active_train_secs` (first SGD step to last) for the
+            # throughput metric — excludes the leading wait-for-buffer
+            # stretch so the rate is comparable across gens.
+            cfg_steps = cfg.train.steps_per_gen
+            rate = cfg_steps / active_train_secs if active_train_secs > 0 else 0.0
             _log(
-                f"training complete in {_fmt_secs(train_seconds)}  ·  "
-                f"mean loss={last_metrics.loss_total:.4f}  mean grad={last_metrics.grad_norm:.2f}",
+                f"training complete: {cfg_steps} steps in "
+                f"{_fmt_secs(active_train_secs)} ({rate:.1f} steps/s)  ·  "
+                f"mean loss={last_metrics.loss_total:.4f}  "
+                f"mean grad={last_metrics.grad_norm:.2f}",
                 gen=new_gen,
                 total_gens=cfg.gens,
             )

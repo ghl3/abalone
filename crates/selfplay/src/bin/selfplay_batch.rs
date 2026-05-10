@@ -8,7 +8,21 @@
 //!                  --shard-games 8 --threads 4
 //!
 //! Each thread plays games independently and rotates shard files every
-//! `shard-games` completed games. Threads share one ort Session via Arc.
+//! `shard-games` completed games. Each worker owns its own ort Session
+//! (no shared mutex) so all inference runs in parallel.
+//!
+//! # Output
+//!
+//! Everything goes to stderr via `eprintln!`:
+//!   - one start banner line
+//!   - one line per completed game:
+//!         `  [tN] game M: P plies, final=Wins(Black)|Wins(White)|Draw`
+//!   - one end summary line
+//!
+//! The Python driver redirects this stream to `runs/<id>/logs/
+//! gen_NNN_selfplay.log` and polls the file every progress tick to
+//! count completed games. The format above is the contract — keep the
+//! `] game M: P plies, final=` substring stable.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -185,6 +199,9 @@ fn run_worker(
 
         let plies = outcome.trajectory.len();
         let final_state = outcome.final_state.state();
+        // This line is the contract with the Python driver. It parses
+        // "] game M: P plies, final=..." substrings out of the log file
+        // to count completed games. Keep the format stable.
         eprintln!(
             "  [t{}] game {}: {} plies, final={:?}",
             tid, game_id, plies, final_state
