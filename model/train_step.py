@@ -85,6 +85,12 @@ def train_step(
     value_loss = F.mse_loss(value_pred, value_target)
 
     total = policy_loss + value_loss_weight * value_loss
+    if not torch.isfinite(total):
+        raise RuntimeError(
+            f"non-finite training loss: total={total.item()}, "
+            f"policy={policy_loss.item()}, value={value_loss.item()}. "
+            f"Training aborted to avoid corrupting the model."
+        )
     total.backward()
 
     if grad_clip is not None:

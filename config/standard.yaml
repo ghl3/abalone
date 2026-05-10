@@ -41,6 +41,7 @@ eval:
   heuristic_simulations: 200
   random_every_gens: 10
   random_games: 11
+  random_simulations: 200
 
 retention:
   keep_last_checkpoints: 5

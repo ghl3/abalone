@@ -32,8 +32,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from model.abalone_net import AbaloneNet
+from model.abalone_net import BOARD_H, BOARD_W, INPUT_CHANNELS, AbaloneNet
 from model.config import RunConfig
+from model.encoder import VALID_CELL_MASK
 from model.eval import run_eval_match, start_self_play
 from model.export_onnx import export as export_onnx
 from model.replay_buffer import ReplayBuffer, find_shards_for_gen
@@ -102,6 +103,41 @@ def _retain_checkpoints(run_dir: Path, retention: dict, current_gen: int) -> Non
                 f.unlink()
 
 
+def _warmup_bn(model: AbaloneNet, device: torch.device, batches: int = 8) -> None:
+    """Populate BN running stats so the bootstrap ONNX produces sane
+    activations. PyTorch's default init leaves running_mean=0, running_var=1
+    — fine in many cases, but BN's normalization then differs from what
+    `model.train()` would have computed, so the first self-play game runs
+    with a model whose forward differs from any actual training-mode pass.
+
+    We synthesize small batches resembling real positions (random marbles
+    on valid cells, a few constant feature planes) and forward in train()
+    mode so the running stats track these activations."""
+    was_training = model.training
+    model.train()
+    mask = torch.from_numpy(VALID_CELL_MASK).to(device)  # (9, 9)
+    with torch.no_grad():
+        for _ in range(batches):
+            x = torch.zeros(32, INPUT_CHANNELS, BOARD_H, BOARD_W, device=device)
+            # Plane 5 is the valid-cell mask, always 1 on the 61 valid cells.
+            x[:, 5] = mask
+            # Planes 0/1: random marbles confined to valid cells.
+            own = (torch.rand(32, BOARD_H, BOARD_W, device=device) < 0.2).float() * mask
+            opp = (torch.rand(32, BOARD_H, BOARD_W, device=device) < 0.2).float() * mask
+            x[:, 0] = own
+            x[:, 1] = opp
+            # Planes 2/3: capture counts as small constants per sample.
+            caps_a = torch.rand(32, 1, 1, device=device) * (3.0 / 6.0)
+            caps_b = torch.rand(32, 1, 1, device=device) * (3.0 / 6.0)
+            x[:, 2] = caps_a.expand(32, BOARD_H, BOARD_W) * mask
+            x[:, 3] = caps_b.expand(32, BOARD_H, BOARD_W) * mask
+            # Plane 4: ply / 400, sampled uniformly from [0, 1].
+            x[:, 4] = (torch.rand(32, 1, 1, device=device).expand(32, BOARD_H, BOARD_W) * mask)
+            model(x)
+    if not was_training:
+        model.eval()
+
+
 def _retain_shards(run_dir: Path, retention: dict, current_gen: int) -> None:
     """Drop shard directories below the retention threshold."""
     shards_root = run_dir / "shards"
@@ -131,7 +167,10 @@ def _train_phase(
 ) -> tuple[int, StepMetrics | None]:
     """Train while self-play runs (if `sp_proc` is alive). Continue
     training after self-play exits until we've done `steps_per_gen` SGD
-    steps total. Returns (steps_done, last_metrics)."""
+    steps total. Returns (steps_done, mean_metrics).
+
+    `mean_metrics` is the running mean over all SGD steps in this gen
+    (loss_total/policy/value, grad_norm), or None if we never trained."""
 
     z_w = value_target_blend_weight(
         new_gen,
@@ -141,7 +180,10 @@ def _train_phase(
     )
 
     steps_done = 0
-    last_metrics: StepMetrics | None = None
+    sum_loss_total = 0.0
+    sum_loss_policy = 0.0
+    sum_loss_value = 0.0
+    sum_grad_norm = 0.0
     seen_files: set[Path] = set()
 
     def ingest_new() -> int:
@@ -182,7 +224,7 @@ def _train_phase(
         # One small training chunk per poll.
         for _ in range(min(8, cfg.train.steps_per_gen - steps_done)):
             batch = buffer.sample(cfg.train.batch_size, rng)
-            last_metrics = train_step(
+            m = train_step(
                 model,
                 optimizer,
                 batch,
@@ -190,6 +232,10 @@ def _train_phase(
                 value_loss_weight=cfg.train.value_loss_weight,
                 z_weight=z_w,
             )
+            sum_loss_total += m.loss_total
+            sum_loss_policy += m.loss_policy
+            sum_loss_value += m.loss_value
+            sum_grad_norm += m.grad_norm
             steps_done += 1
             if steps_done >= cfg.train.steps_per_gen:
                 break
@@ -201,8 +247,22 @@ def _train_phase(
     # Drain: pick up any final shards self-play wrote after we exited the loop.
     if sp_proc is not None:
         sp_proc.wait()
+        if sp_proc.returncode != 0:
+            raise RuntimeError(
+                f"selfplay-batch exited with non-zero status {sp_proc.returncode}; "
+                f"see subprocess stderr above for cause."
+            )
         ingest_new()
-    return steps_done, last_metrics
+
+    if steps_done == 0:
+        return 0, None
+    mean_metrics = StepMetrics(
+        loss_total=sum_loss_total / steps_done,
+        loss_policy=sum_loss_policy / steps_done,
+        loss_value=sum_loss_value / steps_done,
+        grad_norm=sum_grad_norm / steps_done,
+    )
+    return steps_done, mean_metrics
 
 
 def _maybe_eval(
@@ -257,7 +317,7 @@ def _maybe_eval(
             player_a=new_onnx,
             player_b="random",
             games=cfg.eval.random_games,
-            simulations=cfg.eval.gate_simulations,
+            simulations=cfg.eval.random_simulations,
             c_puct=cfg.self_play.c_puct,
             out_json=out,
             seed=new_gen + 200_000,
@@ -375,36 +435,39 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if prev_state is None:
-        # Fresh: bootstrap gen_000 and start at gen 1.
+        # Fresh: bootstrap gen_000 (random weights) and start at gen 1.
+        # Warm BN running stats before export so the bootstrap ONNX
+        # behaves like the in-memory train()-mode forward pass.
+        _warmup_bn(model, device)
         _save_ckpt(model, optimizer, ckpt_dir / "gen_000.pt")
         export_onnx(model, ckpt_dir / "gen_000.onnx")
         _link_or_copy(ckpt_dir / "gen_000.onnx", ckpt_dir / "best.onnx")
         state = RunState.fresh(run_id=run_id, config_hash=cfg.hash())
         state.current_onnx = "checkpoints/gen_000.onnx"
         state.best_onnx = "checkpoints/gen_000.onnx"
-        state.current_gen = 0  # gen 0 = the bootstrap; first real gen is 1
+        state.current_gen = 0  # 0 fully-completed gens
+        state.current_phase = "complete"  # no gen in progress
         state.save_atomic(run_dir / "state.json")
     else:
-        # Resume: load the highest fully-completed checkpoint.
+        # Resume. `current_gen` is the number of fully-completed gens, so
+        # the checkpoint to load is always `gen_<current_gen>.pt`.
         state = prev_state
-        # The last fully-completed gen is `current_gen` if `current_phase
-        # == complete`, else `current_gen - 1`.
-        last_complete = (
-            state.current_gen
-            if state.current_phase == "complete"
-            else state.current_gen - 1
-        )
-        last_ckpt = ckpt_dir / f"gen_{max(last_complete, 0):03d}.pt"
-        if last_ckpt.exists():
-            _load_ckpt(last_ckpt, model, optimizer)
-        # If we crashed mid-self_play of gen N+1, the partial shard dir is stale; nuke it.
-        if state.current_phase == "self_play" and state.current_gen > 0:
-            partial = run_dir / "shards" / f"gen_{state.current_gen:03d}"
+        last_ckpt = ckpt_dir / f"gen_{state.current_gen:03d}.pt"
+        if not last_ckpt.exists():
+            raise FileNotFoundError(
+                f"resume requires checkpoint {last_ckpt} but it doesn't exist. "
+                f"Retention may have purged it, or the run directory is corrupt. "
+                f"Use --no-resume to start a fresh run."
+            )
+        _load_ckpt(last_ckpt, model, optimizer)
+        # If we crashed mid-gen (phase != "complete"), the partial shard
+        # dir for the in-progress gen is stale; nuke it and we'll redo
+        # the whole gen from self_play.
+        if state.current_phase != "complete":
+            in_progress_gen = state.current_gen + 1
+            partial = run_dir / "shards" / f"gen_{in_progress_gen:03d}"
             if partial.exists():
                 shutil.rmtree(partial, ignore_errors=True)
-        # Reset phase to start the gen over from self-play.
-        if state.current_phase != "complete":
-            state.current_phase = "self_play"
 
     # Replay buffer: pre-load existing shards within the window.
     buffer = ReplayBuffer(augment=cfg.train.symmetry_augment)
@@ -499,6 +562,16 @@ def main(argv: list[str] | None = None) -> int:
                 shutil.copyfile(new_onnx, web_dst)
 
         state.current_onnx = f"checkpoints/gen_{new_gen:03d}.onnx"
+
+        # Per-gen diagnostics: shard count, total positions, avg game length.
+        gen_shards = find_shards_for_gen(run_dir / "shards", new_gen)
+        shard_count = len(gen_shards)
+        gen_positions = buffer.chunk_size(new_gen)
+        games_per_gen = cfg.self_play.games_per_gen
+        plies_per_game_avg = (
+            float(gen_positions) / games_per_gen if games_per_gen > 0 else None
+        )
+
         state.append_history(
             GenRecord(
                 gen=new_gen,
@@ -506,11 +579,15 @@ def main(argv: list[str] | None = None) -> int:
                 train_loss_total=last_metrics.loss_total if last_metrics else None,
                 train_loss_policy=last_metrics.loss_policy if last_metrics else None,
                 train_loss_value=last_metrics.loss_value if last_metrics else None,
+                train_grad_norm=last_metrics.grad_norm if last_metrics else None,
                 gate_winrate=gate,
                 heuristic_winrate=heur,
                 random_winrate=rand,
                 self_play_seconds=sp_seconds,
                 train_seconds=train_seconds,
+                buffer_size=buffer.total_size(),
+                shard_count=shard_count,
+                plies_per_game_avg=plies_per_game_avg,
             )
         )
 
@@ -523,16 +600,16 @@ def main(argv: list[str] | None = None) -> int:
         _retain_checkpoints(run_dir, asdict(cfg.retention), new_gen)
         _retain_shards(run_dir, asdict(cfg.retention), new_gen)
 
-        # Mark gen complete and roll to next.
+        # Mark gen complete: advance `current_gen` and set phase to
+        # "complete" (= no gen in progress). One atomic save.
+        state.current_gen = new_gen
         state.current_phase = "complete"
         state.save_atomic(run_dir / "state.json")
-        state.begin_next_gen()
-        state.save_atomic(run_dir / "state.json")
 
+        loss_str = f"{last_metrics.loss_total:.4f}" if last_metrics else "N/A"
         print(
             f"[train_loop] gen {new_gen} done. promoted={promoted}, gate={gate}, "
-            f"heuristic={heur}, random={rand}, "
-            f"loss={last_metrics.loss_total if last_metrics else None:.4f}"
+            f"heuristic={heur}, random={rand}, loss={loss_str}"
         )
 
     print("[train_loop] all generations complete.")

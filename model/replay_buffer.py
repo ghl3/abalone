@@ -170,6 +170,11 @@ class ReplayBuffer:
     def total_size(self) -> int:
         return sum(c.size for c in self._chunks.values())
 
+    def chunk_size(self, gen: int) -> int:
+        """Number of positions buffered for `gen`, or 0 if not ingested."""
+        chunk = self._chunks.get(gen)
+        return chunk.size if chunk else 0
+
     def generations(self) -> list[int]:
         return sorted(self._chunks.keys())
 

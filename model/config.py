@@ -64,6 +64,7 @@ class EvalConfig:
     heuristic_simulations: int = 200
     random_every_gens: int = 10
     random_games: int = 11
+    random_simulations: int = 200
 
 
 @dataclass
@@ -105,10 +106,12 @@ class RunConfig:
         """Stable SHA-256 hex of the resolved config. Used by the
         resume-time validation to detect drift since last run.
 
-        Excludes `run_id` (which is auto-generated and not a config
-        choice) so renaming a resumed run doesn't trip the check."""
+        Excludes `run_id` (auto-generated, not a config choice) and `gens`
+        (the outer loop bound — bumping it on resume should be allowed so
+        you can extend a finished run)."""
         d = asdict(self)
         d.pop("run_id", None)
+        d.pop("gens", None)
         # Stable serialization: yaml with sorted keys, default flow.
         canonical = yaml.safe_dump(d, sort_keys=True, default_flow_style=False)
         return hashlib.sha256(canonical.encode()).hexdigest()
