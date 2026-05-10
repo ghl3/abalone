@@ -589,16 +589,26 @@ def _train_phase(
         if sp_proc is not None and sp_proc.poll() is None:
             time.sleep(0)  # cooperative
 
-    # Drain: pick up any final shards self-play wrote after we exited the loop.
+    # If we exited training (either by hitting the cap or finishing
+    # the min after sp completed) while self-play is still running, we
+    # need to wait for it — BUT keep emitting progress lines so the log
+    # tail doesn't go silent. Previously we just called sp_proc.wait()
+    # here, which blocked silently for the rest of self-play.
     if sp_proc is not None:
-        sp_proc.wait()
+        while sp_proc.poll() is None:
+            ingest_new()  # data ingested now seeds next gen's buffer
+            now = time.time()
+            if now - last_progress_log >= PROGRESS_INTERVAL_S:
+                emit_progress()
+                last_progress_log = now
+            time.sleep(poll_interval)
         if sp_proc.returncode != 0:
             raise RuntimeError(
                 f"selfplay-batch exited with non-zero status {sp_proc.returncode}; "
                 f"see runs/<id>/logs/gen_NNN_selfplay.log for details."
             )
-        # Drain remaining shards: trainer may have exited the steps loop
-        # before all shards arrived on disk.
+        # Drain final shards: trainer may have exited steps loop before
+        # the last shard rotated to disk.
         ingest_new()
         if not sp_done_announced:
             sp_seconds = time.time() - phase_start
