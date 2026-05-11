@@ -65,15 +65,21 @@ def start_self_play(
     shard_games: int,
     threads: int | None,
     seed: int,
+    evaluator: str = "model",
     stdout=None,
     stderr=None,
 ) -> subprocess.Popen:
     """Spawn `selfplay-batch` as a non-blocking child process. Returns
     the `Popen` so the caller can poll/wait while doing other work
-    (the training loop streams shard files as they appear)."""
+    (the training loop streams shard files as they appear).
+
+    `evaluator` selects the leaf-eval mode for MCTS:
+      - "model" (default): ONNX-driven NN. `model_onnx` is required.
+      - "heuristic": hand-coded eval. `model_onnx` is ignored.
+    """
     cmd = [
         str(_bin("selfplay-batch")),
-        "--model", str(model_onnx),
+        "--evaluator", evaluator,
         "--out-dir", str(out_dir),
         "--games", str(games),
         "--simulations", str(simulations),
@@ -85,6 +91,10 @@ def start_self_play(
         "--shard-games", str(shard_games),
         "--seed", str(seed),
     ]
+    # `--model` is irrelevant for non-model evaluators, but harmless.
+    # Pass it whenever we have a path so resume / debug stays simple.
+    if model_onnx is not None and evaluator == "model":
+        cmd += ["--model", str(model_onnx)]
     if threads is not None:
         cmd += ["--threads", str(threads)]
     return subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=stdout, stderr=stderr)

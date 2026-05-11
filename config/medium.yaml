@@ -23,6 +23,13 @@ self_play:
   dirichlet_alpha: 0.3
   dirichlet_eps: 0.25
   worker_threads: null  # null = (cores - 1)
+  # Cold-start fix: with a random-init NN, MCTS produces ~uniform visit
+  # distributions, every game runs to max plies (draw), and the value
+  # head sees only z=0 — training stalls. Use the hand-coded heuristic
+  # for self-play in the first 2 gens so the value head gets real
+  # winners/losers. After that the trained model takes over.
+  evaluator_schedule:
+    2: heuristic
 
 train:
   # Always runs at least this many steps before the gen can complete.

@@ -57,6 +57,35 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # / PROGRESS_INTERVAL_S lines.
 PROGRESS_INTERVAL_S = 30.0
 
+# Evaluator names recognized in `SelfPlayConfig.evaluator_schedule`.
+# Kept in sync with the Rust `Evaluator` enum in `selfplay_batch.rs`.
+VALID_EVALUATORS = {"model", "heuristic"}
+DEFAULT_EVALUATOR = "model"
+
+
+def _select_evaluator(new_gen: int, schedule: dict) -> str:
+    """Pick the leaf evaluator for `new_gen` from the schedule (a
+    `{until_gen: evaluator_name}` dict). Keys are processed in
+    ascending order; the first key >= `new_gen` wins. Falls back to
+    "model" if nothing matches. Validates names so a typo surfaces
+    here, not deep in a Rust subprocess panic."""
+    for until_gen in sorted((schedule or {}).keys()):
+        try:
+            until = int(until_gen)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"evaluator_schedule keys must be int (until_gen); got {until_gen!r}"
+            ) from e
+        name = str(schedule[until_gen])
+        if name not in VALID_EVALUATORS:
+            raise ValueError(
+                f"unknown evaluator {name!r} in schedule; "
+                f"valid: {sorted(VALID_EVALUATORS)}"
+            )
+        if new_gen <= until:
+            return name
+    return DEFAULT_EVALUATOR
+
 
 # ---------- structured logging helpers --------------------------------------
 
@@ -154,6 +183,14 @@ def _dump_config(cfg: RunConfig, worker_threads_resolved: str) -> None:
     print(f"    dirichlet_eps:       {sp.dirichlet_eps}", flush=True)
     print(f"    shard_games_per_file:{sp.shard_games_per_file}", flush=True)
     print(f"    worker_threads:      {worker_threads_resolved}", flush=True)
+    if sp.evaluator_schedule:
+        rules = ", ".join(
+            f"gen<={k}→{sp.evaluator_schedule[k]}"
+            for k in sorted(sp.evaluator_schedule.keys())
+        )
+        print(f"    evaluator_schedule:  {rules}, then model", flush=True)
+    else:
+        print("    evaluator_schedule:  (always model)", flush=True)
     print("  train:", flush=True)
     steps_max_str = (
         str(tr.steps_per_gen_max) if tr.steps_per_gen_max is not None else "(none)"
@@ -1073,10 +1110,13 @@ def _run_outer_loop(
             if cfg.self_play.worker_threads is not None
             else max(os.cpu_count() - 1, 1) if os.cpu_count() else 8
         )
+        evaluator_name = _select_evaluator(
+            new_gen, cfg.self_play.evaluator_schedule
+        )
         _log(
             f"phase: self-play  ({cfg.self_play.games_per_gen} games, "
             f"{cfg.self_play.simulations_per_move} sims/move, "
-            f"{threads_used} threads)",
+            f"{threads_used} threads, evaluator={evaluator_name})",
             gen=new_gen,
             total_gens=cfg.gens,
         )
@@ -1099,6 +1139,7 @@ def _run_outer_loop(
             shard_games=cfg.self_play.shard_games_per_file,
             threads=cfg.self_play.worker_threads,
             seed=(cfg.seed + new_gen) & 0xFFFF_FFFF,
+            evaluator=evaluator_name,
             stdout=sp_log_file,
             stderr=subprocess.STDOUT,
         )

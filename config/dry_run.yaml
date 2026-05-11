@@ -15,6 +15,9 @@ self_play:
   dirichlet_alpha: 0.3
   dirichlet_eps: 0.25
   worker_threads: 2
+  # Smoke-test both code paths: gen 1 = heuristic, gen 2 = model.
+  evaluator_schedule:
+    1: heuristic
 
 train:
   steps_per_gen_min: 10

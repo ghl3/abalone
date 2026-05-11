@@ -32,6 +32,23 @@ class SelfPlayConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
     worker_threads: int | None = None  # null = (cores - 1)
+    # Per-gen schedule for which leaf evaluator MCTS uses during
+    # self-play. Keyed by `until_gen` (inclusive), valued with an
+    # evaluator name. Entries are processed in ascending key order; the
+    # first whose key is >= the current gen wins. Any gen not matched
+    # falls back to the trained model ("model"). Empty = always model.
+    #
+    # YAML example (gens 1-2 use heuristic, gens 3+ use the trained model):
+    #     evaluator_schedule:
+    #       2: heuristic
+    #
+    # Valid evaluator names: "model" (trained NN, the default) and
+    # "heuristic" (hand-coded positional eval). The heuristic option is
+    # mainly useful for cold-start warmup — a random-init NN produces
+    # uniform visit distributions and all-draws games at max plies, so
+    # the value head never sees real winners/losers. The heuristic
+    # actually pushes marbles and produces meaningful trajectories.
+    evaluator_schedule: dict = field(default_factory=dict)
 
 
 @dataclass

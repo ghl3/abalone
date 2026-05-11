@@ -1,15 +1,21 @@
-//! ONNX-driven self-play. Plays N games using the supplied model and
-//! writes parquet shards to an output directory.
+//! Self-play game generation. Plays N games using a configurable leaf
+//! evaluator and writes parquet shards to an output directory.
 //!
 //! Run:
-//!   selfplay-batch --model checkpoints/gen_001.onnx \
+//!   selfplay-batch --evaluator model --model checkpoints/gen_001.onnx \
 //!                  --out-dir runs/foo/shards/gen_002/ \
 //!                  --games 200 --simulations 200 \
 //!                  --shard-games 8 --threads 4
 //!
-//! Each thread plays games independently and rotates shard files every
-//! `shard-games` completed games. Each worker owns its own ort Session
-//! (no shared mutex) so all inference runs in parallel.
+//! Available evaluators (selected via `--evaluator`):
+//!   - `model`     — ONNX-driven NN leaf eval. Requires `--model PATH`.
+//!                   Each thread owns its own ort Session (no shared
+//!                   mutex) so inference runs in parallel.
+//!   - `heuristic` — Hand-coded positional eval. Stateless; no model
+//!                   needed. Used during cold-start warmup, because a
+//!                   random-init NN produces uniform visit distributions
+//!                   and all-draws games (max-plies) that starve the
+//!                   value head of signal.
 //!
 //! # Output
 //!
@@ -30,6 +36,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+use abalone_game::Game;
 use abalone_mcts::LeafEval;
 use abalone_selfplay::{
     ort_eval::OrtEvaluator, play_game, shard::ShardWriter, SelfPlayConfig,
@@ -37,9 +44,33 @@ use abalone_selfplay::{
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
+/// Named leaf evaluator. Selected via `--evaluator NAME` on the CLI;
+/// surfaces in train-loop config + per-gen logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Evaluator {
+    Model,
+    Heuristic,
+}
+
+impl Evaluator {
+    fn parse(s: &str) -> Self {
+        match s {
+            "model" => Evaluator::Model,
+            "heuristic" => Evaluator::Heuristic,
+            other => panic!(
+                "unknown --evaluator '{}' (expected 'model' or 'heuristic')",
+                other
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Args {
-    model: PathBuf,
+    evaluator: Evaluator,
+    /// ONNX model for NN-driven leaf eval. Required when `--evaluator
+    /// model`; unused (but harmless if passed) when `--evaluator heuristic`.
+    model: Option<PathBuf>,
     out_dir: PathBuf,
     games: u32,
     simulations: u32,
@@ -57,7 +88,8 @@ impl Args {
     fn parse() -> Self {
         let mut args = std::env::args().skip(1);
         let mut a = Args {
-            model: PathBuf::new(),
+            evaluator: Evaluator::Model,
+            model: None,
             out_dir: PathBuf::new(),
             games: 200,
             simulations: 200,
@@ -73,7 +105,8 @@ impl Args {
         while let Some(k) = args.next() {
             let mut nxt = || args.next().expect("missing value");
             match k.as_str() {
-                "--model" => a.model = PathBuf::from(nxt()),
+                "--evaluator" => a.evaluator = Evaluator::parse(&nxt()),
+                "--model" => a.model = Some(PathBuf::from(nxt())),
                 "--out-dir" => a.out_dir = PathBuf::from(nxt()),
                 "--games" => a.games = nxt().parse().unwrap(),
                 "--simulations" => a.simulations = nxt().parse().unwrap(),
@@ -88,7 +121,12 @@ impl Args {
                 _ => panic!("unknown arg: {}", k),
             }
         }
-        assert!(!a.model.as_os_str().is_empty(), "--model required");
+        if a.evaluator == Evaluator::Model {
+            assert!(
+                a.model.is_some(),
+                "--model required for --evaluator model (or use --evaluator heuristic)"
+            );
+        }
         assert!(!a.out_dir.as_os_str().is_empty(), "--out-dir required");
         a
     }
@@ -126,22 +164,46 @@ fn main() {
     thread::scope(|s| {
         for tid in 0..args.threads {
             let model_path = args.model.clone();
+            let evaluator_kind = args.evaluator;
             let cfg = cfg.clone();
             let out_dir = args.out_dir.clone();
             let next_game = Arc::clone(&next_game);
-            s.spawn(move || {
-                let mut evaluator =
-                    OrtEvaluator::from_onnx(&model_path).expect("load onnx model");
-                run_worker(
-                    tid,
-                    &mut evaluator,
-                    cfg,
-                    out_dir,
-                    games,
-                    shard_games,
-                    next_game,
-                    args.seed,
-                );
+            s.spawn(move || match evaluator_kind {
+                Evaluator::Heuristic => {
+                    // Stateless leaf eval — no model loaded.
+                    let mut eval_fn = |g: &Game, rng: &mut SmallRng| -> LeafEval {
+                        abalone_mcts::heuristic(g, rng)
+                    };
+                    run_worker(
+                        tid,
+                        cfg,
+                        out_dir,
+                        games,
+                        shard_games,
+                        next_game,
+                        args.seed,
+                        &mut eval_fn,
+                    );
+                }
+                Evaluator::Model => {
+                    let mut evaluator = OrtEvaluator::from_onnx(
+                        &model_path.expect("--model required for --evaluator model"),
+                    )
+                    .expect("load onnx model");
+                    let mut eval_fn = |g: &Game, _rng: &mut SmallRng| -> LeafEval {
+                        evaluator.evaluate(g).expect("ort evaluate")
+                    };
+                    run_worker(
+                        tid,
+                        cfg,
+                        out_dir,
+                        games,
+                        shard_games,
+                        next_game,
+                        args.seed,
+                        &mut eval_fn,
+                    );
+                }
             });
         }
     });
@@ -154,16 +216,19 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_worker(
+fn run_worker<E>(
     tid: usize,
-    evaluator: &mut OrtEvaluator,
     cfg: SelfPlayConfig,
     out_dir: PathBuf,
     games: u32,
     shard_games: u32,
     next_game: Arc<AtomicU32>,
     seed: u64,
-) {
+    eval_fn: &mut E,
+)
+where
+    E: FnMut(&Game, &mut SmallRng) -> LeafEval,
+{
     let mut shard_idx = 0u32;
     let mut writer: Option<ShardWriter> = None;
     let mut games_in_shard = 0u32;
@@ -175,9 +240,9 @@ fn run_worker(
         }
         let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(game_id as u64));
 
-        let outcome = play_game(&cfg, &mut rng, |g, _rng| -> LeafEval {
-            evaluator.evaluate(g).expect("ort evaluate")
-        });
+        // Re-borrow `eval_fn` as `&mut E` (which itself implements FnMut)
+        // so play_game can take it by-value generic-style each iteration.
+        let outcome = play_game(&cfg, &mut rng, &mut *eval_fn);
 
         // Lazily create a shard writer; rotate every `shard_games`.
         if writer.is_none() {
