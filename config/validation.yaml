@@ -1,0 +1,121 @@
+# Validation run — "is the training signal back?"
+#
+# This is the gate the previous run lacked (roadmap Phase 2, acceptance
+# criteria). Six generations, ~60 games each at 400 full simulations, about an
+# hour. It is not a training run: it exists to answer one question fast and
+# cheaply, and to be stopped on if the answer is no.
+#
+# Pass requires all four, read off the per-generation summary line and
+# metrics.jsonl:
+#
+#   1. mean_plies              < 180
+#   2. decisive_rate           > 0.40
+#   3. policy_target_entropy   < policy_uniform_entropy − 0.3
+#                              (equivalently policy_entropy_ratio well under 1)
+#   4. val_value_ce falling, and train_loss_value > 0.05 and moving
+#
+# If any fail, stop and diagnose. Do not scale up.
+seed: 0
+gens: 6
+runs_root: runs
+web_export_path: web/public/models/best.onnx
+# 6×96, ~1.1M params. Capacity is not what is being tested here.
+net_preset: small
+# 0.9 pos/s on CPU vs 29.5 pos/s on CoreML at batch 32. The batched search
+# plus fixed-width padding inverted the old CPU-wins benchmark; without this
+# the run is a day, not an hour.
+use_coreml: true
+
+self_play:
+  games_per_gen: 60
+  # One game per file: training sees fresh data within a minute or two
+  # instead of waiting for an 8-game shard to rotate.
+  shard_games_per_file: 1
+  worker_threads: null   # null = (cores - 1)
+  # 400 full sims ≈ 7× the branching factor. Below ~10× the visit histogram is
+  # noise and the policy target carries nothing (MODEL.md §2.1); 400 is the
+  # cheapest number that clears the bar the roadmap set.
+  sims_fast: 100
+  sims_full: 400
+  full_search_rate: 0.25
+  c_puct: 1.4
+  batch_size: 32
+  virtual_loss: 1.0
+  fpu_reduction: 0.25
+  dirichlet_alpha: 0.2
+  dirichlet_eps: 0.25
+  temperature_plies: 30
+  temperature: 1.0
+  opening: belgian
+  # The curriculum, at full strength: 70% of games start near the capture
+  # threshold, so terminals are inside the search horizon from generation one.
+  handicap_rate: 0.7
+  handicap_max: 5
+  random_opening_plies: 2
+  max_plies: 200
+  no_progress_plies: 0
+  capture_gamma: 0.98
+
+train:
+  steps_per_gen_min: 400
+  steps_per_gen_max: 1500
+  batch_size: 256
+  learning_rate: 1.0e-3
+  # Six generations is too short for a decay to pay; kept explicit so the
+  # difference from the longer configs is visible rather than implied.
+  lr_schedule: {}
+  weight_decay: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  grad_clip: 1.0
+  loss_weights:
+    value: 1.0
+    score: 0.15
+    capture_map: 0.15
+  ema:
+    enabled: true
+    decay: 0.999
+    warmup_steps: 100
+  replay_buffer_gens: 6
+  replay_buffer_min_size: 2000
+  symmetry_augment: true
+  poll_interval_ms: 250
+
+validation:
+  enabled: true
+  holdout_gen: 1
+  every_gens: 1
+  positions: 4096
+  batch_size: 512
+  seed: 20260727
+  entropy_ratio_warn: 0.95
+
+anchor_ladder:
+  # Twice in six generations. Enough to see a direction; a ladder is not what
+  # this run is for.
+  every_gens: 3
+  run_on_final_gen: true
+  games: 12
+  simulations: 400
+  opponents: [random, heuristic@100, heuristic@800]
+  frozen_gens: [1]
+  batch_size: 32
+  c_puct: 1.4
+  opening: belgian
+  random_opening_plies: 2
+  temperature_plies: 10
+  temperature: 1.0
+  max_plies: 200
+  no_progress_plies: 0
+  threads: null
+
+export:
+  games_per_gen: 20
+  web_export: true
+
+retention:
+  keep_last_checkpoints: 6
+  keep_last_onnx: 10
+  keep_last_shard_gens: 10
+  keep_last_game_gens: 10

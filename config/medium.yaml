@@ -1,71 +1,108 @@
-# Medium training run, sized for ~2-3 hours on a 10-core M-series Mac.
-# Goal: confirm the pipeline trains stably and produces a model that
-# beats random by a wide margin and starts to compete with the heuristic.
-# 12 gens with halved sims/move, dynamic training, and per-game shards.
+# Medium run — the first configuration meant to actually learn something.
+#
+# Twelve generations at full search depth. Run this only after
+# config/validation.yaml has passed its four acceptance criteria; scaling up a
+# run whose training signal is empty just buys more empty data.
+#
+# Success looks like: decisive rate > 40%, mean plies < 180, policy target
+# entropy well below ln(branching), value CE falling on the holdout, and a
+# ladder Elo curve that goes up.
 seed: 0
 gens: 12
 runs_root: runs
 web_export_path: web/public/models/best.onnx
+# 10×128, ~3.0M params.
+net_preset: base
+use_coreml: true
 
 self_play:
   games_per_gen: 200
-  # One game per parquet file. Trade-off: more small files (200 per gen
-  # × 12 gens = ~2400) and slightly worse compression per file, but
-  # training sees fresh data within ~3 min instead of waiting ~25 min
-  # for the first 8-game shard to atomic-rename.
-  shard_games_per_file: 1
-  # Halved from 200 → 100 for ~2× self-play speedup. Still meaningfully
-  # better policy targets than the raw network priors.
-  simulations_per_move: 100
+  shard_games_per_file: 2
+  worker_threads: null   # null = (cores - 1)
+  # Playout cap randomisation (MODEL.md §7.2): most moves run the fast budget,
+  # a quarter run the full one, and only those produce policy targets. Roughly
+  # 2–3× more games per unit compute at equal target quality.
+  sims_fast: 200
+  sims_full: 800
+  full_search_rate: 0.25
   c_puct: 1.4
-  temperature_plies: 50
-  temperature: 1.0
-  dirichlet_alpha: 0.3
+  batch_size: 32
+  virtual_loss: 1.0
+  fpu_reduction: 0.25
+  dirichlet_alpha: 0.2
   dirichlet_eps: 0.25
-  worker_threads: null  # null = (cores - 1)
-  # Cold-start fix: with a random-init NN, MCTS produces ~uniform visit
-  # distributions, every game runs to max plies (draw), and the value
-  # head sees only z=0 — training stalls. Use the hand-coded heuristic
-  # for self-play in the first 2 gens so the value head gets real
-  # winners/losers. After that the trained model takes over.
-  evaluator_schedule:
-    2: heuristic
+  temperature_plies: 30
+  temperature: 1.0
+  opening: belgian
+  handicap_rate: 0.7
+  handicap_max: 5
+  random_opening_plies: 2
+  max_plies: 200
+  no_progress_plies: 0
+  capture_gamma: 0.98
 
 train:
-  # Always runs at least this many steps before the gen can complete.
   steps_per_gen_min: 1000
-  # Cap when self-play is still running after min-steps. The extra
-  # steps consume otherwise-idle wall-clock during gen 1; ~5× the min
-  # is safe, higher risks oversampling a fixed buffer.
-  steps_per_gen_max: 5000
+  # Self-play is CPU-bound and training is GPU-bound, so the extra steps run on
+  # wall-clock that would otherwise be idle. The cap stops a fixed buffer being
+  # oversampled into overfitting.
+  steps_per_gen_max: 4000
   batch_size: 256
   learning_rate: 1.0e-3
+  # Step decay keyed to generation milestones (MODEL.md §8).
+  lr_schedule:
+    8: 3.0e-4
   weight_decay: 1.0e-4
-  value_loss_weight: 0.5
-  # Ramp from "trust MCTS Q a lot" early to "trust terminal z fully" late.
-  value_target_blend_start: 0.5
-  value_target_blend_end: 1.0
-  value_target_blend_done_by_gen: 10
-  replay_buffer_gens: 12
-  replay_buffer_min_size: 1000
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  grad_clip: 1.0
+  loss_weights:
+    value: 1.0
+    score: 0.15
+    capture_map: 0.15
+  ema:
+    enabled: true
+    decay: 0.999
+    warmup_steps: 200
+  replay_buffer_gens: 8
+  replay_buffer_min_size: 5000
   symmetry_augment: true
   poll_interval_ms: 250
 
-eval:
-  # Match self-play sim count for apples-to-apples gating.
-  gate_every_gens: 1
-  gate_games: 21
-  gate_simulations: 100
-  gate_threshold: 0.55
-  heuristic_every_gens: 2
-  heuristic_games: 21
-  heuristic_simulations: 100
-  random_every_gens: 3
-  random_games: 11
-  random_simulations: 100
+validation:
+  enabled: true
+  holdout_gen: 1
+  every_gens: 1
+  positions: 8192
+  batch_size: 512
+  seed: 20260727
+  entropy_ratio_warn: 0.95
+
+anchor_ladder:
+  every_gens: 3
+  run_on_final_gen: true
+  games: 24
+  simulations: 400
+  # `heuristic@800` at equal simulation count is the milestone (MODEL.md §8.2).
+  opponents: [random, heuristic@100, heuristic@800]
+  frozen_gens: [1, 6]
+  batch_size: 32
+  c_puct: 1.4
+  opening: belgian
+  random_opening_plies: 2
+  temperature_plies: 10
+  temperature: 1.0
+  max_plies: 200
+  no_progress_plies: 0
+  threads: null
+
+export:
+  games_per_gen: 30
+  web_export: true
 
 retention:
   keep_last_checkpoints: 5
-  keep_last_onnx: 25
-  keep_last_shard_gens: 25
-  web_export_on_promotion: true
+  keep_last_onnx: 15
+  keep_last_shard_gens: 12
+  keep_last_game_gens: 12
