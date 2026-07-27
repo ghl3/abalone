@@ -71,9 +71,15 @@ OVERFIT_WARN = 0.35
 def find_run(runs_root: Path, run: str) -> Path:
     """Resolve `--run`: a run id, a path, or `latest`.
 
-    `latest` is by `metrics.jsonl` mtime, not by name — run ids are
+    `latest` is by `state.json` mtime, not by name — run ids are
     `<adjective>-<noun>-<date>-<time>` and sorting them alphabetically returns
     whichever adjective happens to sort last.
+
+    It is deliberately `state.json` and not `metrics.jsonl`: `metrics.jsonl` is
+    only appended when a generation *completes*, so a run still inside its first
+    generation has none — which made `latest` skip past the live run and report
+    on a finished one, exactly when this tool is most wanted. `state.json` is
+    written at run start and at every phase transition, so it exists throughout.
     """
     if run not in ("latest", ""):
         for candidate in (Path(run), runs_root / run):
@@ -82,10 +88,27 @@ def find_run(runs_root: Path, run: str) -> Path:
         raise FileNotFoundError(f"no run directory for {run!r} (looked in {runs_root})")
     if not runs_root.is_dir():
         raise FileNotFoundError(f"no runs directory at {runs_root}")
-    candidates = [p for p in runs_root.glob("*") if (p / "metrics.jsonl").exists()]
+    def freshness(p: Path) -> float:
+        # Newest of whichever markers exist. state.json alone is a run that has
+        # not finished a generation yet; metrics.jsonl alone is a partial or
+        # copied directory. Both should be reachable.
+        times = [
+            (p / name).stat().st_mtime
+            for name in ("state.json", "metrics.jsonl")
+            if (p / name).exists()
+        ]
+        return max(times) if times else float("-inf")
+
+    candidates = [
+        p
+        for p in runs_root.glob("*")
+        if p.is_dir() and ((p / "state.json").exists() or (p / "metrics.jsonl").exists())
+    ]
     if not candidates:
-        raise FileNotFoundError(f"no run in {runs_root} has a metrics.jsonl")
-    return max(candidates, key=lambda p: (p / "metrics.jsonl").stat().st_mtime)
+        raise FileNotFoundError(
+            f"no run in {runs_root} has a state.json or metrics.jsonl"
+        )
+    return max(candidates, key=freshness)
 
 
 def read_metrics(run_dir: Path) -> list[dict[str, Any]]:

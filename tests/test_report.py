@@ -408,3 +408,31 @@ def test_epochs_column_reads_the_buffer_metric() -> None:
     assert Row.from_metrics({"gen": 1, "buffer/epochs_this_gen": 1.6}).epochs == 1.6
     assert Row.from_metrics({"gen": 1, "train/epochs_over_buffer": 20.2}).epochs == 20.2
     assert math.isnan(float("nan"))  # sanity: nan is nan
+
+
+def test_latest_finds_a_run_that_has_not_finished_a_generation(tmp_path):
+    """A live run inside its first generation has a `state.json` but no
+    `metrics.jsonl` — that file is only appended when a generation completes.
+
+    Resolving `latest` by `metrics.jsonl` alone therefore skipped straight past
+    the running job and reported on a finished one, which is precisely when this
+    tool is most wanted. Regression test for that.
+    """
+    import os
+
+    from model.report import find_run
+
+    finished = tmp_path / "finished-run-20260101-0000"
+    (finished / "logs").mkdir(parents=True)
+    (finished / "metrics.jsonl").write_text('{"gen": 1}\n')
+    (finished / "state.json").write_text('{"current_gen": 1}')
+
+    live = tmp_path / "live-run-20260101-0100"
+    (live / "logs").mkdir(parents=True)
+    (live / "state.json").write_text('{"current_gen": 0}')  # no metrics.jsonl yet
+
+    os.utime(finished / "metrics.jsonl", (1_700_000_000, 1_700_000_000))
+    os.utime(finished / "state.json", (1_700_000_000, 1_700_000_000))
+    os.utime(live / "state.json", (1_800_000_000, 1_800_000_000))
+
+    assert find_run(tmp_path, "latest") == live
