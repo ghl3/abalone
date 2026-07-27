@@ -221,6 +221,27 @@ activations cannot bleed through the 20 dead slots.
    gather -> 2562 logits
 ```
 
+### 6.0 A note on "value" vs "score"
+
+Two heads model outcome-ish quantities and the names are easy to confuse. They
+are distinct and both are kept:
+
+| Head | Quantity | Range | Role |
+| --- | --- | --- | --- |
+| `value` | **Who wins** — the game-theoretic outcome | `softmax` over (win, draw, loss) | The RL value function. This is what MCTS backs up; `E[value] = P(win) − P(loss)`. |
+| `score` | **By how much** — final capture differential | `softmax` over `d ∈ [−6, +6]` | Auxiliary target. Denser gradient than a 3-way outcome, and the natural number to show a human. |
+
+Put another way: `value` is *score* in the reinforcement-learning sense (expected
+return), while `score` is *score* in the Abalone sense (the marble count the rules
+track). Only `value` participates in search. `score` exists because the difference
+between winning 6–0 and 6–5 is real information that a 3-way outcome discards,
+and because "expected +1.4 marbles" is far more legible in the review UI than
+"+0.31".
+
+These names are load-bearing: they appear in the ONNX output signature
+([ARCHITECTURE §5.3](ARCHITECTURE.md#53-onnx-signature)), the shard schema, and
+the loss terms in §6.6.
+
 ### 6.1 Trunk
 
 `N` blocks × `C` channels, pre-activation residual blocks, stride 1 throughout.

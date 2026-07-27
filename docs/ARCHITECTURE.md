@@ -282,16 +282,41 @@ One row per trajectory position. Columns hold the position POV-relative, the
 outcome labels, and the full search result:
 
 ```
-game_id, seed                     identify and reproduce the source game
-own_bb_lo/hi, opp_bb_lo/hi        side-to-move relative bitboards
-black_losses, white_losses        marbles each side has LOST
-turn, ply
-move_played                       flat move index applied next
-z                                 outcome from this POV
-score_diff                        final capture differential from this POV
-q                                 MCTS root value from this POV
-child_move_idxs[], child_visits[] the search result — the policy target
+game_id          u32        source game within (run, generation)
+seed             u64        RNG seed — the game is reproducible from this
+opening          u8         0 = Standard, 1 = BelgianDaisy
+handicap_black   u8         marbles Black conceded at curriculum seeding
+handicap_white   u8         marbles White conceded at curriculum seeding
+
+own_bb_lo/hi     u64        side-to-move relative bitboards
+opp_bb_lo/hi     u64
+black_losses     u8         marbles BLACK has lost
+white_losses     u8         marbles WHITE has lost
+turn             u8         0 = Black, 1 = White
+ply              u16
+max_plies        u16        this game's cap — the ply plane's denominator
+
+move_played      u16        flat move index applied next
+is_full_search   bool       true iff this position ran the FULL simulation
+                            count; only these carry a policy target (§7.2)
+
+z                i8         outcome from this POV: +1 win, 0 draw, −1 loss
+score_diff       i8         final capture differential from this POV, [−6, 6]
+q                f32        MCTS root value from this POV (diagnostics / UI)
+
+child_move_idxs  list<u16>  the search result — the policy target
+child_visits     list<u32>  parallel to child_move_idxs
+
+cap_map_idx      list<u16>  sparse capture map: channel*81 + cell, 0..162
+cap_map_val      list<f32>  parallel discounted weights, clamped to [0, 1]
 ```
+
+**Capture-map target.** For a position at ply `t` with side-to-move `S`, every
+future capture at ply `t' ≥ t` that removed a marble of side `X` from cell `c`
+contributes `γ^(t'−t)` (γ ≈ 0.98) to channel `0` if `X == S` else channel `1`, at
+cell `c`. Cells are absolute board indices — only the *channel* is POV-relative,
+matching the own/opp convention of the input planes. Weights are clamped to
+`[0, 1]` and only non-zero entries are stored.
 
 Column names state whose *losses* they are. The previous naming
 (`pushed_off_black`) meant "pushed off **by** black" and read naturally as the
@@ -300,7 +325,35 @@ opposite; that ambiguity is what produced the plane-swap bug.
 `game_id` and `seed` make shards self-describing: games can be reconstructed and
 replayed without inferring boundaries from `ply` resets.
 
-### 5.5 Enforcement
+### 5.5 Training batch
+
+The contract between `replay_buffer.py` and `train_step.py`:
+
+```
+planes        (B, 14, 9, 9) float32
+policy        (B, 2562)     float32   normalised over legal moves; zeros if no target
+legal_mask    (B, 2562)     float32   1.0 on legal moves
+policy_weight (B,)          float32   1.0 if is_full_search else 0.0
+value         (B,)          int64     class index: 0 = win, 1 = draw, 2 = loss
+score         (B,)          int64     class index: score_diff + 6, in [0, 12]
+capture_map   (B, 2, 9, 9)  float32   targets in [0, 1]
+q             (B,)          float32   carried for diagnostics, not a loss term
+```
+
+**The value head trains on the game outcome alone — there is no z/q blend.** The
+blend existed to work around an all-draws data distribution; the curriculum in
+[MODEL.md §4](MODEL.md#4-curriculum-capture-handicap-seeding) removed that
+problem (measured decisive rate 82.5%, mean |d| 2.06), so the blend would now be
+complexity in service of a solved problem. `q` stays in the shard for diagnostics
+and the review UI. If value learning proves noisy at low game counts, the
+principled fix is to have MCTS back up a 3-way distribution rather than a scalar
+— not to reintroduce a soft-label hack.
+
+`policy_weight` implements playout cap randomisation: positions searched at the
+fast simulation count still supply value, score and capture-map targets, but must
+not contribute to the policy loss.
+
+### 5.6 Enforcement
 
 **Interim — golden-file conformance test.** `dump-golden` emits ~200
 `(position, planes, legal move indices, encoded planes)` fixtures as JSON; a
@@ -449,30 +502,53 @@ train_loop.py  (parent)
 
 ---
 
-## 10. Deltas from the current implementation
+## 10. Implementation status
 
-What this document describes that the code does not yet do:
+### 10.1 Landed (2026-07-27)
+
+The training pipeline has been rebuilt against this document.
+
+| Area | Was | Now | Ref |
+| --- | --- | --- | --- |
+| Termination | 400-ply → draw | 200-ply → adjudicate by capture differential | [MODEL §3](MODEL.md#3-game-termination-and-the-outcome-signal) |
+| Cold start | heuristic evaluator, gens 1–2 | capture-handicap seeding, no heuristic anywhere | [MODEL §4](MODEL.md#4-curriculum-capture-handicap-seeding) |
+| Opening | standard, fixed | configurable + randomised plies | [MODEL §4](MODEL.md#4-curriculum-capture-handicap-seeding) |
+| Search batching | 1 leaf per NN call | pull-based coroutine, 16–64 with virtual loss | [MODEL §7.1](MODEL.md#71-batched-evaluation-is-the-enabling-change) |
+| Simulations | 100 (1.6× branching) | 200 fast / 800 full + playout cap randomisation | [MODEL §7](MODEL.md#7-search) |
+| Policy head | dense, 3,321,282 params | conv `(42,9,9)` gather, 48,426 | [MODEL §6.2](MODEL.md#62-policy-head--convolutional-not-dense) |
+| Value head | tanh scalar | 3-way win/draw/loss | [MODEL §6.3](MODEL.md#63-value-head--3-way-not-tanh) |
+| Auxiliary heads | none | score (13-way) + capture-map `(2,9,9)` | [MODEL §6.4](MODEL.md#64-score-head--auxiliary-from-the-trajectory) |
+| Trunk | 4 × 64 (~300 k) | 10 × 128 (2,954,240 = 97.4% of the model) | [MODEL §6.1](MODEL.md#61-trunk) |
+| Model selection | per-gen gate, 21 games | anchor ladder → Elo | [MODEL §8.1](MODEL.md#81-measurement--the-part-that-was-missing) |
+| Held-out eval | none | `validate.py` every generation | [MODEL §8.1](MODEL.md#81-measurement--the-part-that-was-missing) |
+| Encoder sharing | duplicated, untested across languages | 832-fixture golden conformance test | §5.6 |
+| Replay buffer | per-example loop, 4,536 B/position | vectorised, 32 B/position bitboards | §3 |
+| Game export | none | `export_game.py` → reviewable JSON | §7.4 |
+
+### 10.2 Remaining
 
 | Area | Current | Target | Ref |
 | --- | --- | --- | --- |
-| Termination | 400-ply → draw | 200-ply → adjudicate by score | [MODEL §3](MODEL.md#3-game-termination-and-the-outcome-signal) |
-| Cold start | heuristic evaluator for gens 1–2 | capture-handicap seeding | [MODEL §4](MODEL.md#4-curriculum-capture-handicap-seeding) |
-| Opening | standard, fixed | Belgian Daisy + randomised plies | [MODEL §4](MODEL.md#4-curriculum-capture-handicap-seeding) |
-| Search batching | 1 leaf per NN call | 16–64 with virtual loss | [MODEL §7.1](MODEL.md#71-batched-evaluation-is-the-enabling-change) |
-| Simulations | 100 (1.6× branching) | 800–1600 + playout cap randomisation | [MODEL §7](MODEL.md#7-search) |
-| Policy head | dense, 3.3 M params | conv `(42,9,9)` gather, ~48 k | [MODEL §6.2](MODEL.md#62-policy-head--convolutional-not-dense) |
-| Value head | tanh scalar | 3-way win/draw/loss | [MODEL §6.3](MODEL.md#63-value-head--3-way-not-tanh) |
-| Auxiliary heads | none | score + capture-map | [MODEL §6.4](MODEL.md#64-score-head--auxiliary-from-the-trajectory) |
-| Trunk | 4 × 64 | 10 × 128 (+ optional SE) | [MODEL §6.1](MODEL.md#61-trunk) |
-| Model selection | per-gen gate, 21 games | none; anchor ladder → Elo | [MODEL §8.1](MODEL.md#81-measurement--the-part-that-was-missing) |
-| Held-out eval | none | validation set every generation | [MODEL §8.1](MODEL.md#81-measurement--the-part-that-was-missing) |
-| Encoder sharing | duplicated, untested across languages | conformance test → PyO3 | §5.5 |
-| Replay buffer | per-example Python loop, dense planes | vectorised, bitboard-backed, threaded | §3 |
+| Encoder sharing | conformance-tested duplication | single implementation via PyO3 | §5.6 |
 | Web engine | heuristic MCTS in WASM | trained network via `onnxruntime-web` | §7.3 |
+| WASM search | old single-leaf `search()` | pull-based coroutine (already exists in `abalone-mcts`) | §2.4 |
 | Web mode | play only | play + review | §7.2 |
+| Notation | engine-internal only | standard Abalone notation for display/parse | §7.4 |
+| Position sharing | none | permalinks encoding board + counters + ply | §7.4 |
+| Repo entry point | no root README | README pointing at `docs/` | — |
+| Stale artifacts | `runs/` holds 6-plane, 2-output checkpoints | purge; they cannot load under the current contract | §5.3 |
 
-Sequencing for these changes is in
-[2026-07-27-architecture-review.md §10](2026-07-27-architecture-review.md#10-roadmap).
+### 10.3 Known environment hazard
+
+Release builds link against cached `ort-sys` / `zstd-sys` build-script output. If
+the Xcode Command Line Tools are upgraded, that cache keeps pointing at the old
+clang runtime directory and `cargo build --release` fails with
+`ld: library 'clang_rt.osx' not found`. **Debug builds do not exhibit this**,
+which makes it easy to misdiagnose — and training runs release binaries. Fix:
+
+```sh
+cargo clean --release -p ort-sys -p zstd-sys
+```
 
 ---
 
