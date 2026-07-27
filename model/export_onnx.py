@@ -1,14 +1,26 @@
-"""Export a trained `AbaloneNet` to ONNX. The exported model:
+"""Export a trained `AbaloneNet` to ONNX.
 
-  - Sets the network to eval mode (BN runs in inference mode).
-  - Has a fixed batch dimension expanded to dynamic at export time so
-    inference can use any batch size.
-  - Uses input/output names that the `ort`-based Rust evaluator
-    expects: `planes` in, `(policy_logits, value)` out.
+Signature (ARCHITECTURE.md §5.3, MODEL.md §6):
 
-We deliberately do NOT fuse softmax into the policy head — keeping
-logits gives the Rust side flexibility (it can apply legal-mask
-clipping then softmax itself).
+```
+input   planes         (B, 14, 9, 9)  float32
+output  policy_logits  (B, 2562)      float32   unmasked, unnormalised
+        value          (B, 3)         float32   logits over (win, draw, loss)
+        score          (B, 13)        float32   logits over d ∈ [−6, +6]
+        capture_map    (B, 2, 9, 9)   float32   raw, pre-sigmoid
+```
+
+Batch is dynamic on every tensor. The export:
+
+  - Sets the network to eval mode (BN runs in inference mode), then restores
+    the caller's `training` flag and device.
+  - Deliberately does **not** fuse softmax, sigmoid or legal-masking into the
+    graph — keeping logits lets the Rust evaluator and `onnxruntime-web` apply
+    the legal mask before normalising.
+
+`value` and `score` are distinct heads and the names are load-bearing:
+`value` is *who wins* (the RL value function MCTS backs up), `score` is *by
+how much* (the final capture differential). See MODEL.md §6.0.
 """
 
 from __future__ import annotations
@@ -22,12 +34,23 @@ from model.abalone_net import (
     BOARD_H,
     BOARD_W,
     INPUT_CHANNELS,
+    PRESETS,
     AbaloneNet,
+    build,
 )
 
 INPUT_NAME = "planes"
 OUTPUT_POLICY_NAME = "policy_logits"
 OUTPUT_VALUE_NAME = "value"
+OUTPUT_SCORE_NAME = "score"
+OUTPUT_CAPTURE_MAP_NAME = "capture_map"
+
+OUTPUT_NAMES = [
+    OUTPUT_POLICY_NAME,
+    OUTPUT_VALUE_NAME,
+    OUTPUT_SCORE_NAME,
+    OUTPUT_CAPTURE_MAP_NAME,
+]
 
 
 def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
@@ -53,20 +76,16 @@ def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
         # `dynamo=False` selects the legacy exporter, which emits a
         # single self-contained .onnx (weights inlined). The newer
         # dynamo-based exporter writes weights to a sidecar `.data`
-        # file, which doesn't survive our temp + rename pattern. Our
-        # 4×64 model is ~28 MB — far under the 2 GB protobuf limit
+        # file, which doesn't survive our temp + rename pattern. The
+        # 10×128 model is ~12 MB — far under the 2 GB protobuf limit
         # where external-data becomes mandatory.
         torch.onnx.export(
             model,
             dummy,
             tmp_name,
             input_names=[INPUT_NAME],
-            output_names=[OUTPUT_POLICY_NAME, OUTPUT_VALUE_NAME],
-            dynamic_axes={
-                INPUT_NAME: {0: "batch"},
-                OUTPUT_POLICY_NAME: {0: "batch"},
-                OUTPUT_VALUE_NAME: {0: "batch"},
-            },
+            output_names=OUTPUT_NAMES,
+            dynamic_axes={name: {0: "batch"} for name in [INPUT_NAME, *OUTPUT_NAMES]},
             opset_version=opset,
             do_constant_folding=True,
             dynamo=False,
@@ -87,13 +106,22 @@ def export(model: AbaloneNet, out_path: Path | str, opset: int = 17) -> None:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True, help="path to a .pt file")
     parser.add_argument("--out", required=True, help="output .onnx path")
+    parser.add_argument(
+        "--preset",
+        default=None,
+        choices=sorted(PRESETS),
+        help="trunk preset; defaults to the one recorded in the checkpoint, else 'base'",
+    )
     args = parser.parse_args()
 
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    net = AbaloneNet()
+    # Checkpoints written by the training loop may record the trunk shape;
+    # the CLI flag wins if given, and `base` is the fallback.
+    preset = args.preset or state.get("preset", "base")
+    net = build(preset)
     net.load_state_dict(state["model"])
     export(net, args.out)
-    print(f"exported {args.out}")
+    print(f"exported {args.out} ({preset}, {net.num_parameters():,} params)")
