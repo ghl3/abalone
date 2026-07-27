@@ -2,6 +2,9 @@
 //!     cargo run --release -p abalone-mcts --bin mcts-bench
 //!
 //! Sections:
+//!   0. Batched evaluation: sims/sec at batch sizes 1/8/32/64 against an
+//!      evaluator with a fixed cost *per call* (the shape of real NN
+//!      inference), plus the pure search-side overhead.
 //!   1. Single-search timing on the standard opening (sims/sec) for both
 //!      random-rollout and heuristic evaluators.
 //!   2. heuristic-MCTS vs uniform-random match.
@@ -13,7 +16,8 @@ use std::time::Instant;
 use abalone_game::{Game, GameState, Move, Side};
 use abalone_mcts::eval::Weights;
 use abalone_mcts::{
-    eval, heuristic, random_rollout, search, LeafEval, SearchConfig, SearchResult,
+    eval, heuristic, random_rollout, search, search_batched, LeafEval, Search,
+    SearchConfig, SearchResult,
 };
 use rand::rngs::SmallRng;
 use rand::Rng;
@@ -24,13 +28,21 @@ fn pick_random<R: Rng + ?Sized>(g: &Game, rng: &mut R) -> Move {
     moves[rng.gen_range(0..moves.len())]
 }
 
-fn pick_mcts_random_rollout(g: &Game, cfg: &SearchConfig, rng: &mut SmallRng) -> Move {
+fn pick_mcts_random_rollout(
+    g: &Game,
+    cfg: &SearchConfig,
+    rng: &mut SmallRng,
+) -> Move {
     search(g, cfg, rng, random_rollout)
         .expect("non-terminal => some move")
         .best
 }
 
-fn pick_mcts_heuristic(g: &Game, cfg: &SearchConfig, rng: &mut SmallRng) -> Move {
+fn pick_mcts_heuristic(
+    g: &Game,
+    cfg: &SearchConfig,
+    rng: &mut SmallRng,
+) -> Move {
     search(g, cfg, rng, heuristic)
         .expect("non-terminal => some move")
         .best
@@ -136,6 +148,7 @@ where
     let cfg = SearchConfig {
         simulations: 800,
         c_puct: 1.4,
+        ..Default::default()
     };
     let mut rng = SmallRng::seed_from_u64(0);
     let t = Instant::now();
@@ -148,8 +161,128 @@ where
     );
 }
 
+/// Burn a fixed amount of wall time. Models the *per-call* cost of neural
+/// network inference (session dispatch, thread wake-up, buffer copies), which
+/// is what batching amortises — deliberately independent of how many
+/// positions the call carries.
+fn spin(micros: u64) {
+    let t = Instant::now();
+    let target = std::time::Duration::from_micros(micros);
+    while t.elapsed() < target {
+        std::hint::black_box(0u64);
+    }
+}
+
+/// Synthetic value/prior producer: cheap, deterministic, per-position.
+fn synthetic_eval(g: &Game) -> LeafEval {
+    let h = (g.board.marbles[0] ^ g.board.marbles[1]) as u64 ^ u64::from(g.ply);
+    let h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    LeafEval::from_value((h >> 40) as f32 / 16_777_216.0 * 2.0 - 1.0)
+}
+
+const BATCH_SIZES: [usize; 4] = [1, 8, 32, 64];
+const REPS: u32 = 5;
+
+/// sims/sec against batch size with a fixed per-CALL evaluator cost. This is
+/// the throughput curve `docs/MODEL.md` §7.1 is about: real inference is
+/// dominated by per-call overhead, so the win is roughly the reduction in
+/// call count until search-side cost takes over.
+fn bench_batching(sims: u32, per_call_us: u64) {
+    let g = Game::new_standard();
+    println!("\nbatched search (standard, sims={sims}, evaluator costs {per_call_us}µs per CALL, best of {REPS}):");
+    let mut baseline = 0.0f64;
+    for &bs in &BATCH_SIZES {
+        let cfg = SearchConfig {
+            simulations: sims,
+            batch_size: bs,
+            ..Default::default()
+        };
+        let mut best_dt = f64::INFINITY;
+        let mut calls = 0u32;
+        let mut positions = 0u64;
+        for rep in 0..REPS {
+            let (mut c, mut p) = (0u32, 0u64);
+            let t = Instant::now();
+            search_batched(&g, &cfg, 0, |batch| {
+                c += 1;
+                p += batch.len() as u64;
+                spin(per_call_us);
+                batch.iter().map(synthetic_eval).collect()
+            })
+            .unwrap();
+            best_dt = best_dt.min(t.elapsed().as_secs_f64());
+            if rep == 0 {
+                calls = c;
+                positions = p;
+            }
+        }
+        let sims_per_sec = f64::from(sims) / best_dt;
+        if bs == BATCH_SIZES[0] {
+            baseline = sims_per_sec;
+        }
+        println!(
+            "  batch={bs:>3}: {:>7.2}ms  {:>9.0} sims/sec  ({:>5.2}x)  \
+             {calls:>4} calls, {:.1} positions/call",
+            best_dt * 1e3,
+            sims_per_sec,
+            sims_per_sec / baseline,
+            positions as f64 / f64::from(calls),
+        );
+    }
+}
+
+/// Search-side cost only (evaluator does no work): the ceiling batching can
+/// approach, and a check that the arena itself is not the bottleneck. Also
+/// reports arena size and the number of positions actually evaluated, which
+/// is where large batches start to lose value: once `batch_size` approaches
+/// the number of distinct leaves available, descents collapse onto the same
+/// leaves and simulations get spent re-backing-up one evaluation.
+fn bench_search_overhead(sims: u32) {
+    let g = Game::new_standard();
+    println!("\nsearch overhead (standard, sims={sims}, zero-cost evaluator, best of {REPS}):");
+    for &bs in &BATCH_SIZES {
+        let cfg = SearchConfig {
+            simulations: sims,
+            batch_size: bs,
+            ..Default::default()
+        };
+        let mut best_dt = f64::INFINITY;
+        for _ in 0..REPS {
+            let t = Instant::now();
+            search_batched(&g, &cfg, 0, |batch| {
+                batch.iter().map(synthetic_eval).collect()
+            })
+            .unwrap();
+            best_dt = best_dt.min(t.elapsed().as_secs_f64());
+        }
+        // Same search, driven manually, for the arena statistics.
+        let mut s = Search::begin(&g, &cfg, 0);
+        let mut positions = 0u64;
+        loop {
+            let batch = s.next_batch();
+            if batch.is_empty() {
+                break;
+            }
+            positions += batch.len() as u64;
+            let evals: Vec<LeafEval> =
+                batch.iter().map(synthetic_eval).collect();
+            s.submit(&evals);
+        }
+        println!(
+            "  batch={bs:>3}: {:>7.2}ms  {:>9.0} sims/sec   {:>7} nodes, {positions} positions evaluated",
+            best_dt * 1e3,
+            f64::from(sims) / best_dt,
+            s.node_count(),
+        );
+    }
+}
+
 fn main() {
     println!("== abalone-mcts bench ==\n");
+
+    // 0) Batched evaluation: the throughput lever.
+    bench_batching(800, 200);
+    bench_search_overhead(2000);
 
     // 1) Single-search timing
     time_search("random-rollout", random_rollout);
@@ -158,6 +291,7 @@ fn main() {
     let cfg = SearchConfig {
         simulations: 200,
         c_puct: 1.4,
+        ..Default::default()
     };
 
     // 2) heuristic-MCTS vs random. Heuristic eval is fast enough (~0.5M
@@ -167,6 +301,7 @@ fn main() {
         let cfg_h = SearchConfig {
             simulations: 800,
             c_puct: 1.4,
+            ..Default::default()
         };
         let games = 30u32;
         println!(
@@ -207,7 +342,9 @@ fn main() {
             |seed| {
                 let cfg = cfg.clone();
                 let mut rng = SmallRng::seed_from_u64(seed);
-                Box::new(move |g: &Game| pick_mcts_random_rollout(g, &cfg, &mut rng))
+                Box::new(move |g: &Game| {
+                    pick_mcts_random_rollout(g, &cfg, &mut rng)
+                })
             },
         );
         stats.print("heuristic", "rollout");
@@ -251,6 +388,7 @@ fn main() {
         let cfg_tune = SearchConfig {
             simulations: 100,
             c_puct: 1.4,
+            ..Default::default()
         };
         let games_per_pair = 4u32;
         let n = candidates.len();

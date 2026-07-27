@@ -1,6 +1,14 @@
 //! Hand-crafted Abalone evaluator. Linear combination of three positional
 //! features, squashed by `tanh` into `[-1, 1]`.
 //!
+//! **RETIRED FROM THE TRAINING LOOP — DO NOT WIRE THIS BACK INTO SELF-PLAY.**
+//! Per `docs/MODEL.md`, the network learns from self-play outcomes alone; a
+//! hand-written evaluator as teacher or bootstrap would inject exactly the
+//! human strategy priors the project exists to avoid. It is kept for two
+//! purposes only: as a *fixed* benchmark opponent on the Elo ladder (a
+//! yardstick that never moves), and as a cheap deterministic test fixture for
+//! the search code. Neither use touches training data.
+//!
 //! From the side-to-move's perspective:
 //! 1. **Capture differential** — `(opp marbles we pushed off) - (own marbles
 //!    they pushed off)`. The win condition is 6 of either side, so this

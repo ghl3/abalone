@@ -228,6 +228,7 @@ impl WasmGame {
         let cfg = SearchConfig {
             simulations: simulations.max(1),
             c_puct: 1.4,
+            ..Default::default()
         };
         // Heuristic eval is deterministic given a position; rng is only
         // needed to satisfy the search signature.

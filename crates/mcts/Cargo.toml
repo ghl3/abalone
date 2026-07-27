@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 abalone-game = { path = "../game" }
 rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
 
 [[bin]]
 name = "mcts-bench"
