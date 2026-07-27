@@ -3,44 +3,86 @@
 Every metric the previous run logged was *training* loss on the replay buffer,
 so a total collapse of the training signal went unnoticed for three generations
 ([2026-07-27 review §7.2](../docs/2026-07-27-architecture-review.md)). This
-module is the cheap instrumentation that would have caught it in minutes:
-run a frozen set of positions from a withheld generation through the network
-every generation and look at the numbers.
+module is the cheap instrumentation that would have caught it in minutes.
 
-The single most important number here is **`policy_target_entropy`**. The failed
-run sat at a policy loss of 4.13 ≈ `ln(62)` ≈ `ln(branching factor)`, meaning the
-MCTS visit distributions carried *zero* information — search was returning
-roughly uniform over legal moves and there was nothing for the policy head to
-learn. `policy_uniform_entropy` (= `ln(mean_legal_moves)`) is reported right next
-to it so the comparison is direct, and `policy_entropy_ratio` is the two divided:
-**at 1.0 the data is worthless and no downstream metric means anything.**
+## Two holdouts, and only one of them is a gate
+
+`validate` is prefix-parameterised because it serves both (see
+`model/replay_buffer.py`):
+
+    val_rolling/   positions withheld from the NEWEST generation, never trained
+                   on. Same distribution the network is being trained on, so a
+                   rising CE here really is a generalisation failure. Gate on
+                   this one.
+    val_frozen/    a whole early generation, withheld for the life of the run.
+                   The self-play distribution moves by design, so CE here
+                   measures DRIFT from an obsolete distribution as much as
+                   anything about the model. Read it; never gate on it.
+
+That distinction is not cosmetic. Across generations 1→6 of the validation run,
+value CE on the frozen gen-1 holdout rose 1.557 → 2.047 while value *accuracy*
+on the same data also rose 0.639 → 0.677. Overfitting and distribution shift
+were indistinguishable, because there was only one holdout and it was the wrong
+one. `value_brier` (below) exists to break the other half of that ambiguity.
+
+## `data_*` is a property of the DATASET, not of the model
+
+Keys under `data_` describe the held-out positions themselves. On the **frozen**
+holdout every one of them is **constant across generations by construction** —
+the data does not change, so neither can they. A `data_*` curve that is flat is
+working correctly; it is not a plateau, and it is not progress either way. Only
+`selfplay/policy_target_entropy` (`model/export_game.py`, measured on the
+current generation's fresh games) says anything about whether search is
+improving. Reading `val_frozen/data_policy_target_entropy` as a progress signal
+is the specific mistake this naming exists to prevent.
+
+## The numbers that carry the signal
+
+    policy_kl_visits_from_prior   KL(MCTS visits ‖ network prior) over legal
+                                  moves. How much search improves on the raw
+                                  network — the quantity the policy head is
+                                  literally trying to close. It should SHRINK.
+                                  Far better behaved than top-1 agreement,
+                                  which sits at 0.026–0.037 against a ~1/60
+                                  chance level and is nearly all noise.
+    policy_top5_agreement         top-1's less noisy sibling.
+    value_brier                   bounded in [0, 2] and not tail-dominated, so
+                                  it separates "generally miscalibrated" (Brier
+                                  and CE both rise) from "a few confident
+                                  errors" (CE rises, Brier barely moves).
+    value_ce, value_accuracy, value_ece, value_calibration
 
 Everything is computed under `torch.no_grad()` with the model in eval mode
 (BatchNorm running stats, not batch stats — validation batches are not
 statistically like training batches). The caller's train/eval mode is restored on
 the way out, including if a batch raises.
 
-Metrics returned by `validate` — a flat `dict` apart from `value_calibration`:
+Full key set, before the caller's prefix — a flat `dict` apart from
+`value_calibration`:
 
     loss_total, loss_policy, loss_value, loss_score, loss_capture_map
 
     policy_top1_agreement   argmax over legal moves == MCTS argmax
+    policy_top5_agreement   MCTS argmax within the model's top 5 legal moves
     policy_ce               weighted policy cross-entropy
-    policy_target_entropy   mean entropy of the MCTS visit distribution  ← the one
-    policy_uniform_entropy  ln(mean_legal_moves) — the pathological value
-    policy_entropy_ratio    target / uniform; 1.0 means search learned nothing
-    mean_legal_moves        branching factor over the same rows
+    policy_kl_visits_from_prior   ← the policy signal worth watching
     policy_rows             rows with policy_weight > 0
 
-    value_ce, value_accuracy, value_ece, value_calibration
+    value_ce, value_brier, value_accuracy, value_ece, value_calibration
 
     score_ce, score_mae (marbles), score_accuracy
 
-    capture_map_bce, capture_map_auc, capture_map_separation,
-    capture_map_positive_rate
+    capture_map_bce, capture_map_auc, capture_map_separation
 
-    positions, decisive_rate, draw_rate, mean_abs_score_diff,
-    mean_ply_fraction, mean_ply, policy_target_rate
+    positions
+
+    data_policy_target_entropy    mean entropy of the MCTS visit distribution
+    data_policy_uniform_entropy   ln(mean_legal_moves) — the pathological value
+    data_policy_entropy_ratio     target / uniform; 1.0 means search learned nothing
+    data_mean_legal_moves         branching factor over the same rows
+    data_policy_target_rate       fraction of rows carrying a policy target
+    data_decisive_rate, data_draw_rate, data_mean_abs_score_diff,
+    data_mean_ply_fraction, data_mean_ply, data_capture_map_positive_rate
 
 Undefined metrics are `nan` (e.g. `policy_top1_agreement` when no row carries a
 policy target), never a silently misleading 0.0.
@@ -68,6 +110,7 @@ from model.train_step import (
     NUM_VALID_CELLS,
     LossWeights,
     batch_to_tensors,
+    masked_log_softmax,
     masked_policy_logits,
     policy_cross_entropy_rows,
     valid_cell_mask,
@@ -83,6 +126,25 @@ DEFAULT_CAPTURE_THRESHOLD = 0.5
 #: Flat indices (into the 81-cell grid) of the 61 on-board cells.
 _VALID_FLAT = np.flatnonzero(VALID_CELL_MASK.reshape(-1) > 0)
 
+#: Namespace for the rolling holdout — positions withheld from the newest
+#: generation. Generalisation within the current distribution; gate on this.
+VAL_ROLLING_PREFIX = "val_rolling/"
+
+#: Namespace for the frozen holdout — a whole early generation. A drift
+#: indicator only. **Never gate on anything under this prefix.**
+VAL_FROZEN_PREFIX = "val_frozen/"
+
+#: Marks keys describing the held-out DATA rather than the model. Constant
+#: across generations on a frozen holdout, by construction.
+DATASET_KEY_PREFIX = "data_"
+
+#: Top-k used by `policy_top5_agreement`.
+TOP_K = 5
+
+#: The one returned value that is not a scalar. A generic logger (TensorBoard,
+#: a CSV writer) should skip it; it belongs in `metrics.jsonl`.
+NON_SCALAR_KEYS: frozenset[str] = frozenset({"value_calibration"})
+
 
 def validate(
     model: nn.Module,
@@ -93,15 +155,20 @@ def validate(
     calibration_bins: int = DEFAULT_CALIBRATION_BINS,
     capture_threshold: float = DEFAULT_CAPTURE_THRESHOLD,
     max_plies: int | None = None,
+    prefix: str = "",
 ) -> dict[str, object]:
     """Run `model` over `batches` and return the held-out metrics.
 
     `batches` is any iterable of `Batch` — a list, or a generator draining a
-    frozen validation shard. It is consumed exactly once.
+    holdout. It is consumed exactly once.
 
     `max_plies` is the game's ply cap. Plane 12 stores `ply / max_plies`, so the
     cap is the only way back to a human-legible mean ply; without it
-    `mean_ply` is `nan` and only `mean_ply_fraction` is reported.
+    `data_mean_ply` is `nan` and only `data_mean_ply_fraction` is reported.
+
+    `prefix` namespaces every returned key, so one function serves both
+    holdouts: pass `VAL_ROLLING_PREFIX` or `VAL_FROZEN_PREFIX`. The default of
+    `""` returns bare keys.
     """
     was_training = model.training
     model.eval()
@@ -115,12 +182,26 @@ def validate(
     finally:
         model.train(was_training)
 
-    return acc.finalise(
+    metrics = acc.finalise(
         weights=weights,
         calibration_bins=calibration_bins,
         capture_threshold=capture_threshold,
         max_plies=max_plies,
     )
+    return {f"{prefix}{k}": v for k, v in metrics.items()} if prefix else metrics
+
+
+def scalar_metrics(metrics: dict[str, object]) -> dict[str, float]:
+    """`metrics` reduced to the plain-number entries, for a generic logger.
+
+    Drops `value_calibration` (a curve) and anything else non-numeric,
+    whether or not a prefix has been applied.
+    """
+    return {
+        k: float(v)
+        for k, v in metrics.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
 
 
 # ----- accumulation ----------------------------------------------------------
@@ -156,12 +237,28 @@ class _Accumulator:
         masked = masked_policy_logits(policy_logits, t.legal_mask)
         self._push("policy_ce_rows", policy_cross_entropy_rows(policy_logits, t.policy, t.legal_mask))
         self._push("policy_weight", t.policy_weight)
-        self._push("agree", (masked.argmax(dim=1) == t.policy.argmax(dim=1)).float())
+        best = t.policy.argmax(dim=1)
+        self._push("agree", (masked.argmax(dim=1) == best).float())
+        # Top-k by rank rather than by `topk`: the number of legal moves the
+        # model scores strictly above the MCTS choice. `topk` over the full
+        # 2562-wide head would pad with illegal moves on a row with fewer than
+        # k legal ones and score it as agreement for free.
+        best_logit = masked.gather(1, best.unsqueeze(1))
+        rank = (masked > best_logit).sum(dim=1)
+        self._push("agree_topk", (rank < TOP_K).float())
         self._push("legal_count", t.legal_mask.sum(dim=1))
         # Entropy of the *target*: clamp inside the log only, so zero-probability
         # moves contribute 0·log(tiny) = 0 rather than 0·(−inf) = NaN.
         p = t.policy
-        self._push("target_entropy", -(p * torch.log(p.clamp_min(1e-12))).sum(dim=1))
+        log_p = torch.log(p.clamp_min(1e-12))
+        self._push("target_entropy", -(p * log_p).sum(dim=1))
+        # KL(visits ‖ prior) over legal moves = Σ π log(π / p). Computed
+        # directly rather than as `policy_ce − target_entropy` so a bug in the
+        # cross-entropy cannot cancel itself out here. Rows with no policy
+        # target come out as 0 (π is identically zero) and are dropped at
+        # reduction time, not counted as a perfect match.
+        log_q = masked_log_softmax(policy_logits, t.legal_mask)
+        self._push("policy_kl_rows", (p * (log_p - log_q)).sum(dim=1))
 
         # -- value -----------------------------------------------------------
         self._push("value_ce_rows", F.cross_entropy(value_logits, t.value, reduction="none"))
@@ -169,6 +266,12 @@ class _Accumulator:
         self._push("p_win", value_probs[:, VALUE_WIN])
         self._push("value_correct", (value_logits.argmax(dim=1) == t.value).float())
         self._push("value_target", t.value)
+        # Multiclass Brier: Σ_c (p_c − y_c)², in [0, 2]. Bounded and quadratic,
+        # where CE is unbounded and dominated by its tail — the pair is what
+        # tells "uniformly miscalibrated" apart from "a handful of confident
+        # errors".
+        onehot = F.one_hot(t.value, num_classes=value_probs.shape[1]).to(value_probs.dtype)
+        self._push("value_brier_rows", ((value_probs - onehot) ** 2).sum(dim=1))
 
         # -- score -----------------------------------------------------------
         self._push("score_ce_rows", F.cross_entropy(score_logits, t.score, reduction="none"))
@@ -230,11 +333,17 @@ class _Accumulator:
         )
         if sel.any():
             top1 = float(self._get("agree")[sel].mean())
+            topk = float(self._get("agree_topk")[sel].mean())
             target_entropy = float(self._get("target_entropy")[sel].mean())
             mean_legal = float(self._get("legal_count")[sel].mean())
+            # Only over rows that carry a full-search target: a fast-searched
+            # row's visit distribution is not the thing the prior is chasing.
+            policy_kl = float(self._get("policy_kl_rows")[sel].mean())
         else:
             top1 = nan
+            topk = nan
             target_entropy = nan
+            policy_kl = nan
             mean_legal = float(self._get("legal_count").mean())
         uniform_entropy = math.log(mean_legal) if mean_legal > 0 else nan
         entropy_ratio = (
@@ -245,6 +354,7 @@ class _Accumulator:
 
         # -- value ------------------------------------------------------------
         value_ce = float(self._get("value_ce_rows").mean())
+        value_brier = float(self._get("value_brier_rows").mean())
         value_accuracy = float(self._get("value_correct").mean())
         p_win = self._get("p_win")
         won = (self._get("value_target") == VALUE_WIN).astype(np.float64)
@@ -279,6 +389,7 @@ class _Accumulator:
         )
 
         return {
+            # -- model quality: these move when the network moves -------------
             # headline
             "loss_total": float(loss_total),
             "loss_policy": policy_ce,
@@ -287,14 +398,13 @@ class _Accumulator:
             "loss_capture_map": capture_bce,
             # policy
             "policy_top1_agreement": top1,
+            "policy_top5_agreement": topk,
             "policy_ce": policy_ce,
-            "policy_target_entropy": target_entropy,
-            "policy_uniform_entropy": uniform_entropy,
-            "policy_entropy_ratio": entropy_ratio,
-            "mean_legal_moves": mean_legal,
+            "policy_kl_visits_from_prior": policy_kl,
             "policy_rows": int(sel.sum()),
             # value
             "value_ce": value_ce,
+            "value_brier": value_brier,
             "value_accuracy": value_accuracy,
             "value_ece": ece,
             "value_calibration": calibration,
@@ -306,33 +416,84 @@ class _Accumulator:
             "capture_map_bce": capture_bce,
             "capture_map_auc": capture_auc,
             "capture_map_separation": capture_sep,
-            "capture_map_positive_rate": float(cap_label.mean()) if cap_label.size else nan,
-            # data health
             "positions": int(n),
-            "decisive_rate": 1.0 - draw_rate,
-            "draw_rate": draw_rate,
-            "mean_abs_score_diff": float(self._get("abs_score_diff").mean()),
-            "mean_ply_fraction": ply_fraction,
-            "mean_ply": ply_fraction * max_plies if max_plies else nan,
-            "policy_target_rate": float(sel.mean()),
+            # -- properties of the held-out DATA ------------------------------
+            # Constant across generations on a frozen holdout, by construction.
+            # Flat is correct here; flat is not a plateau and not progress.
+            "data_policy_target_entropy": target_entropy,
+            "data_policy_uniform_entropy": uniform_entropy,
+            "data_policy_entropy_ratio": entropy_ratio,
+            "data_policy_entropy_gap": (
+                uniform_entropy - target_entropy
+                if not (math.isnan(uniform_entropy) or math.isnan(target_entropy))
+                else nan
+            ),
+            "data_mean_legal_moves": mean_legal,
+            "data_policy_target_rate": float(sel.mean()),
+            "data_capture_map_positive_rate": (
+                float(cap_label.mean()) if cap_label.size else nan
+            ),
+            "data_decisive_rate": 1.0 - draw_rate,
+            "data_draw_rate": draw_rate,
+            "data_mean_abs_score_diff": float(self._get("abs_score_diff").mean()),
+            "data_mean_ply_fraction": ply_fraction,
+            "data_mean_ply": ply_fraction * max_plies if max_plies else nan,
         }
+
+
+#: Every scalar key `validate` returns, in the order `finalise` emits them.
+#: `_empty_metrics` is built from this so the two cannot drift apart.
+METRIC_KEYS: tuple[str, ...] = (
+    "loss_total",
+    "loss_policy",
+    "loss_value",
+    "loss_score",
+    "loss_capture_map",
+    "policy_top1_agreement",
+    "policy_top5_agreement",
+    "policy_ce",
+    "policy_kl_visits_from_prior",
+    "policy_rows",
+    "value_ce",
+    "value_brier",
+    "value_accuracy",
+    "value_ece",
+    "score_ce",
+    "score_mae",
+    "score_accuracy",
+    "capture_map_bce",
+    "capture_map_auc",
+    "capture_map_separation",
+    "positions",
+    "data_policy_target_entropy",
+    "data_policy_uniform_entropy",
+    "data_policy_entropy_ratio",
+    "data_policy_entropy_gap",
+    "data_mean_legal_moves",
+    "data_policy_target_rate",
+    "data_capture_map_positive_rate",
+    "data_decisive_rate",
+    "data_draw_rate",
+    "data_mean_abs_score_diff",
+    "data_mean_ply_fraction",
+    "data_mean_ply",
+)
+
+#: Keys that describe the held-out positions rather than the model. On a frozen
+#: holdout every one of these is constant for the life of the run.
+DATASET_METRIC_KEYS: frozenset[str] = frozenset(
+    k for k in METRIC_KEYS if k.startswith(DATASET_KEY_PREFIX)
+)
+
+#: Integer-valued keys — counts, not rates. `nan` would be a lie for these.
+_COUNT_KEYS: frozenset[str] = frozenset({"positions", "policy_rows"})
 
 
 def _empty_metrics(calibration_bins: int) -> dict[str, object]:
     """Every metric as `nan` for an empty validation set, with the same keys —
     a caller logging these should not have to branch on emptiness."""
     nan = float("nan")
-    keys = (
-        "loss_total loss_policy loss_value loss_score loss_capture_map "
-        "policy_top1_agreement policy_ce policy_target_entropy policy_uniform_entropy "
-        "policy_entropy_ratio mean_legal_moves value_ce value_accuracy value_ece "
-        "score_ce score_mae score_accuracy capture_map_bce capture_map_auc "
-        "capture_map_separation capture_map_positive_rate decisive_rate draw_rate "
-        "mean_abs_score_diff mean_ply_fraction mean_ply policy_target_rate"
-    ).split()
-    out: dict[str, object] = dict.fromkeys(keys, nan)
-    out["positions"] = 0
-    out["policy_rows"] = 0
+    out: dict[str, object] = {k: 0 if k in _COUNT_KEYS else nan for k in METRIC_KEYS}
     out["value_calibration"] = _empty_calibration(calibration_bins)
     return out
 
@@ -426,8 +587,16 @@ def _separation(scores: np.ndarray, labels: np.ndarray) -> float:
 
 
 __all__ = [
+    "DATASET_KEY_PREFIX",
+    "DATASET_METRIC_KEYS",
     "DEFAULT_CALIBRATION_BINS",
     "DEFAULT_CAPTURE_THRESHOLD",
+    "METRIC_KEYS",
+    "NON_SCALAR_KEYS",
     "NUM_VALID_CELLS",
+    "TOP_K",
+    "VAL_FROZEN_PREFIX",
+    "VAL_ROLLING_PREFIX",
+    "scalar_metrics",
     "validate",
 ]

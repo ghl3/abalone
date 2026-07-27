@@ -23,16 +23,33 @@ from pathlib import Path
 
 import pytest
 
-from model.eval import MatchResult, _format_player, _slug, mean_elo, model_spec
+from model.eval import (
+    KIND_FLOOR,
+    KIND_FROZEN,
+    KIND_TRAILING,
+    LadderOpponent,
+    MatchResult,
+    _format_player,
+    _slug,
+    clamped_fraction,
+    ladder_summary,
+    mean_elo,
+    model_spec,
+    opponent_label,
+)
 from model.state import GenRecord, RunState
 from model.train_loop import (
     LadderRung,
     _count_completed_games,
     _fmt_secs,
     entropy_ratio_alarm,
+    epoch_budget_steps,
+    epochs_alarm,
+    epochs_over_buffer,
     git_sha_drift,
     ladder_opponents,
-    opponent_label,
+    namespaced,
+    overfit_alarm,
     plan_resume,
     retention_victims,
     should_run_ladder,
@@ -154,37 +171,89 @@ def test_ladder_every_generation() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _ckpts(tmp_path: Path, *gens: int) -> None:
+    for g in gens:
+        (tmp_path / f"gen_{g:03d}.onnx").write_bytes(b"")
+
+
+def test_floor_anchors_get_fewer_games_than_checkpoint_rungs(tmp_path: Path) -> None:
+    """A floor rung answers "is anything catastrophically broken", which is a
+    binary question; a checkpoint rung answers "how much stronger am I", which
+    needs enough games for the interval to exclude zero."""
+    _ckpts(tmp_path, 1)
+    out = ladder_opponents(
+        ["random", "heuristic@100"], [1], [], gen=5, ckpt_dir=tmp_path,
+        games=40, floor_games=16,
+    )
+    assert [(o.spec, o.games, o.kind) for o in out] == [
+        ("random", 16, KIND_FLOOR),
+        ("heuristic@100", 16, KIND_FLOOR),
+        (model_spec(tmp_path / "gen_001.onnx"), 40, KIND_FROZEN),
+    ]
+
+
 def test_ladder_opponents_keeps_fixed_anchors(tmp_path: Path) -> None:
-    fixed = ["random", "heuristic@100", "heuristic@800"]
-    assert ladder_opponents(fixed, [], gen=5, ckpt_dir=tmp_path) == fixed
+    fixed = ["random", "heuristic@100"]
+    out = ladder_opponents(fixed, [], [], gen=5, ckpt_dir=tmp_path)
+    assert [o.spec for o in out] == fixed
+    assert all(o.kind == KIND_FLOOR for o in out)
 
 
 def test_ladder_opponents_adds_existing_frozen_checkpoints(tmp_path: Path) -> None:
-    (tmp_path / "gen_001.onnx").write_bytes(b"")
-    (tmp_path / "gen_010.onnx").write_bytes(b"")
-    out = ladder_opponents(["random"], [1, 10], gen=20, ckpt_dir=tmp_path)
-    assert out == ["random", model_spec(tmp_path / "gen_001.onnx"), model_spec(tmp_path / "gen_010.onnx")]
+    _ckpts(tmp_path, 1, 10)
+    out = ladder_opponents(["random"], [1, 10], [], gen=20, ckpt_dir=tmp_path)
+    assert [o.spec for o in out] == [
+        "random",
+        model_spec(tmp_path / "gen_001.onnx"),
+        model_spec(tmp_path / "gen_010.onnx"),
+    ]
+
+
+def test_trailing_rungs_are_relative_to_the_current_generation(tmp_path: Path) -> None:
+    """The rung that does not saturate: it moves with the network, so it still
+    has resolution once every fixed anchor is being swept."""
+    _ckpts(tmp_path, 1, 15, 18)
+    out = ladder_opponents([], [1], [5, 2], gen=20, ckpt_dir=tmp_path)
+    assert [(Path(o.spec).name, o.kind) for o in out] == [
+        ("gen_001.onnx", KIND_FROZEN),
+        ("gen_015.onnx", KIND_TRAILING),
+        ("gen_018.onnx", KIND_TRAILING),
+    ]
+
+
+def test_a_trailing_rung_that_lands_on_a_frozen_one_is_deduplicated(tmp_path: Path) -> None:
+    """`frozen_gens: [25]` with `trailing_gens: [5]` collide at generation 30.
+    Playing the same checkpoint twice costs a rung's worth of wall-clock and
+    measures it twice under two names."""
+    _ckpts(tmp_path, 25)
+    out = ladder_opponents([], [25], [5], gen=30, ckpt_dir=tmp_path)
+    assert [(Path(o.spec).name, o.kind) for o in out] == [("gen_025.onnx", KIND_FROZEN)]
 
 
 def test_ladder_opponents_skips_a_collected_checkpoint(tmp_path: Path) -> None:
     """Retention may have taken it. Dropping the rung beats crashing a ladder
     five hours into a run."""
-    assert ladder_opponents(["random"], [1], gen=20, ckpt_dir=tmp_path) == ["random"]
+    out = ladder_opponents(["random"], [1], [5], gen=20, ckpt_dir=tmp_path)
+    assert [o.spec for o in out] == ["random"]
 
 
 def test_a_generation_is_never_its_own_ladder_opponent(tmp_path: Path) -> None:
-    (tmp_path / "gen_005.onnx").write_bytes(b"")
-    assert ladder_opponents([], [5], gen=5, ckpt_dir=tmp_path) == []
-    assert ladder_opponents([], [5], gen=6, ckpt_dir=tmp_path) == [
-        model_spec(tmp_path / "gen_005.onnx")
-    ]
+    _ckpts(tmp_path, 5)
+    assert ladder_opponents([], [5], [], gen=5, ckpt_dir=tmp_path) == []
+    # `trailing_gens: [0]` is rejected by the config, but the resolver must not
+    # rely on that to avoid playing itself.
+    assert ladder_opponents([], [], [0], gen=5, ckpt_dir=tmp_path) == []
+    out = ladder_opponents([], [5], [], gen=6, ckpt_dir=tmp_path)
+    assert [o.spec for o in out] == [model_spec(tmp_path / "gen_005.onnx")]
 
 
 def test_ladder_opponents_deduplicates_and_orders(tmp_path: Path) -> None:
-    for g in (1, 3):
-        (tmp_path / f"gen_{g:03d}.onnx").write_bytes(b"")
-    out = ladder_opponents([], [3, 1, 3], gen=9, ckpt_dir=tmp_path)
-    assert out == [model_spec(tmp_path / "gen_001.onnx"), model_spec(tmp_path / "gen_003.onnx")]
+    _ckpts(tmp_path, 1, 3)
+    out = ladder_opponents([], [3, 1, 3], [], gen=9, ckpt_dir=tmp_path)
+    assert [o.spec for o in out] == [
+        model_spec(tmp_path / "gen_001.onnx"),
+        model_spec(tmp_path / "gen_003.onnx"),
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -496,37 +565,220 @@ def test_opponent_label_shortens_absolute_paths(spec: str, expected: str) -> Non
     assert opponent_label(spec) == expected
 
 
+def test_only_trailing_rungs_are_a_moving_reference() -> None:
+    """What `mean_elo` selects on. A floor anchor and a frozen checkpoint are
+    the same strength at generation 5 and at generation 45; `gen - k` is not."""
+    assert LadderOpponent("random", 16, KIND_FLOOR).is_fixed_reference
+    assert LadderOpponent("model:a/gen_001.onnx", 40, KIND_FROZEN).is_fixed_reference
+    assert not LadderOpponent("model:a/gen_015.onnx", 40, KIND_TRAILING).is_fixed_reference
+    assert LadderOpponent("model:/abs/x/gen_003.onnx", 40).label == "model:gen_003.onnx"
+
+
 # --------------------------------------------------------------------------- #
 # Elo aggregation                                                              #
 # --------------------------------------------------------------------------- #
 
 
-def _rung(opponent: str, elo: float) -> LadderRung:
-    return LadderRung(opponent=opponent, result=MatchResult.from_dict({"elo_a": elo}))
+def _rung(opponent: str, elo: float, kind: str = KIND_FLOOR, **extra) -> LadderRung:
+    return LadderRung(
+        opponent=opponent,
+        result=MatchResult.from_dict({"elo_a": elo, **extra}),
+        kind=kind,
+    )
 
 
-def test_mean_elo_averages_the_fixed_anchors() -> None:
-    rungs = [_rung("random", 400.0), _rung("heuristic@100", 100.0), _rung("heuristic@800", -100.0)]
+def test_mean_elo_averages_the_fixed_reference_rungs() -> None:
+    """Floor anchors and absolute frozen checkpoints: everything whose strength
+    is the same number at generation 5 and generation 45."""
+    rungs = [
+        _rung("random", 400.0),
+        _rung("heuristic@100", 100.0),
+        _rung("model:checkpoints/gen_001.onnx", -100.0, KIND_FROZEN),
+    ]
     assert mean_elo(rungs) == pytest.approx(400 / 3)
 
 
-def test_mean_elo_excludes_frozen_checkpoints() -> None:
-    """A frozen earlier checkpoint is a moving reference across generations;
-    averaging against it would make the tracked best-checkpoint number
-    meaningless."""
+def test_mean_elo_excludes_trailing_rungs() -> None:
+    """`gen - k` gets stronger every time the network does. Averaging it in
+    would flatten, by construction, the curve the ladder exists to draw."""
     fixed = [_rung("random", 400.0), _rung("heuristic@100", 200.0)]
-    with_frozen = [*fixed, _rung("model:checkpoints/gen_001.onnx", 0.0)]
-    assert mean_elo(with_frozen) == pytest.approx(mean_elo(fixed))
+    with_trailing = [*fixed, _rung("model:checkpoints/gen_015.onnx", 0.0, KIND_TRAILING)]
+    assert mean_elo(with_trailing) == pytest.approx(mean_elo(fixed))
 
 
 def test_mean_elo_is_nan_with_nothing_to_average() -> None:
     assert math.isnan(mean_elo([]))
-    assert math.isnan(mean_elo([_rung("model:a.onnx", 10.0)]))
+    assert math.isnan(mean_elo([_rung("model:a.onnx", 10.0, KIND_TRAILING)]))
 
 
 def test_mean_elo_skips_unmeasured_rungs() -> None:
     rungs = [_rung("random", 300.0), _rung("heuristic@100", float("nan"))]
     assert mean_elo(rungs) == pytest.approx(300.0)
+
+
+# --------------------------------------------------------------------------- #
+# Clamping — the failure that made "+545" look like a measurement              #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_swept_ladder_reports_that_it_measured_nothing() -> None:
+    """Generation 6 of the validation run, exactly: four rungs, four 12-0-0
+    sweeps, four identical sample-size bounds, and a mean reported as if it
+    were a strength."""
+    rungs = [
+        _rung("random", 544.7, KIND_FLOOR, elo_a_clamped=True),
+        _rung("heuristic@100", 544.7, KIND_FLOOR, elo_a_clamped=True),
+        _rung("model:gen_001.onnx", 544.7, KIND_FROZEN, elo_a_clamped=True),
+        _rung("model:gen_004.onnx", 544.7, KIND_TRAILING, elo_a_clamped=True),
+    ]
+    assert clamped_fraction(rungs) == pytest.approx(1.0)
+    summary = ladder_summary(rungs)
+    assert summary["ladder/all_clamped"] == 1.0
+    assert summary["ladder/clamped_fraction"] == pytest.approx(1.0)
+
+
+def test_a_ladder_with_resolution_is_not_flagged() -> None:
+    rungs = [
+        _rung("random", 544.7, KIND_FLOOR, elo_a_clamped=True),
+        _rung("model:gen_015.onnx", 120.0, KIND_TRAILING, elo_a_clamped=False),
+    ]
+    assert clamped_fraction(rungs) == pytest.approx(0.5)
+    assert ladder_summary(rungs)["ladder/all_clamped"] == 0.0
+
+
+def test_clamped_fraction_is_nan_with_nothing_measured() -> None:
+    """Not 0.0: "no rungs were clamped" and "no rungs were played" are
+    different facts and only one of them is reassuring."""
+    assert math.isnan(clamped_fraction([]))
+
+
+def test_ladder_summary_emits_every_rung_not_just_the_mean() -> None:
+    rungs = [
+        _rung("random", 400.0, KIND_FLOOR, elo_a_ci95_lo=300.0, elo_a_ci95_hi=500.0),
+        _rung("model:gen_010.onnx", 120.0, KIND_TRAILING),
+    ]
+    summary = ladder_summary(rungs)
+    for key in (
+        "ladder/elo/random",
+        "ladder/elo_ci95_lo/random",
+        "ladder/elo_ci95_hi/random",
+        "ladder/score/random",
+        "ladder/clamped/random",
+        "ladder/elo/gen_010",
+        "ladder/rungs",
+        "ladder/clamped_fraction",
+        "ladder/elo_mean",
+    ):
+        assert key in summary, key
+    assert summary["ladder/elo_ci95_lo/random"] == pytest.approx(300.0)
+
+
+def test_the_mean_elo_carries_its_own_interval() -> None:
+    """An Elo without an interval is an opinion. Independent matches, so the
+    standard errors add in quadrature."""
+    rungs = [
+        _rung("random", 400.0, KIND_FLOOR, elo_a_stderr=30.0),
+        _rung("heuristic@100", 200.0, KIND_FLOOR, elo_a_stderr=40.0),
+    ]
+    summary = ladder_summary(rungs)
+    se = math.sqrt(30.0**2 + 40.0**2) / 2
+    assert summary["ladder/elo_mean_stderr"] == pytest.approx(se)
+    assert summary["ladder/elo_mean_ci95_lo"] == pytest.approx(300.0 - 1.96 * se)
+    assert summary["ladder/elo_mean_ci95_hi"] == pytest.approx(300.0 + 1.96 * se)
+
+
+# --------------------------------------------------------------------------- #
+# Step budget in epochs — the "20 raw epochs in one generation" bug            #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_step_budget_tracks_the_buffer() -> None:
+    """The validation run's generation 3: a 1500-step cap over a 19k-position
+    buffer at batch 256 is 20.2 raw epochs, and nobody chose 20 — games had
+    shortened from 148 plies to 67 and the buffer shrank underneath a
+    constant."""
+    assert epochs_over_buffer(1500, 256, 19_000) == pytest.approx(20.2, abs=0.05)
+    # Expressed in epochs, the same buffer asks for ~110 steps.
+    assert epoch_budget_steps(19_000, 256, 1.5, 100, 1500) == 111
+
+
+def test_the_budget_is_clamped_at_both_ends() -> None:
+    assert epoch_budget_steps(1_000_000, 256, 1.5, 400, 4000) == 4000
+    assert epoch_budget_steps(1_000, 256, 1.5, 400, 4000) == 400
+
+
+def test_no_epoch_target_is_the_old_fixed_cap() -> None:
+    assert epoch_budget_steps(19_000, 256, None, 400, 1500) == 1500
+
+
+def test_an_empty_buffer_asks_for_the_minimum_not_a_division_by_zero() -> None:
+    assert epoch_budget_steps(0, 256, 1.5, 400, 4000) == 400
+    assert math.isnan(epochs_over_buffer(400, 256, 0))
+
+
+@pytest.mark.parametrize(
+    ("epochs", "expected"), [(20.2, True), (8.01, True), (8.0, False), (1.5, False)]
+)
+def test_epochs_alarm(epochs: float, expected: bool) -> None:
+    assert epochs_alarm(epochs, 8.0) is expected
+
+
+@pytest.mark.parametrize("value", [None, float("nan")])
+def test_an_unmeasured_epoch_count_is_not_an_alarm(value) -> None:
+    assert not epochs_alarm(value, 8.0)
+
+
+# --------------------------------------------------------------------------- #
+# Overfitting — the signal the frozen holdout could not give cleanly           #
+# --------------------------------------------------------------------------- #
+
+
+def test_rolling_loss_pulling_away_from_train_loss_is_an_alarm() -> None:
+    """Both are the same weighted total over the same distribution; one is on
+    data the network trained on and one is not. The gap is memorisation."""
+    assert overfit_alarm(4.9, 4.4, 0.35)
+
+
+def test_a_small_generalisation_gap_is_normal() -> None:
+    assert not overfit_alarm(4.5, 4.4, 0.35)
+
+
+def test_a_rolling_loss_below_the_train_loss_is_never_an_alarm() -> None:
+    """It happens: the training mean is over a whole generation of steps, the
+    holdout is scored once at the end with better weights."""
+    assert not overfit_alarm(4.0, 4.4, 0.35)
+
+
+@pytest.mark.parametrize(
+    ("rolling", "train"),
+    [(None, 4.4), (4.9, None), (float("nan"), 4.4), (4.9, float("nan"))],
+)
+def test_an_unmeasured_holdout_is_not_an_alarm(rolling, train) -> None:
+    assert not overfit_alarm(rolling, train, 0.35)
+
+
+# --------------------------------------------------------------------------- #
+# Generic metric namespacing                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_namespaced_prefixes_bare_keys() -> None:
+    assert namespaced("train", {"loss_total": 1.0}) == {"train/loss_total": 1.0}
+
+
+def test_namespaced_passes_through_keys_that_already_carry_one() -> None:
+    """The measurement layer emits its own prefixes. A consumer that blindly
+    re-prefixed would produce `val_frozen/val_frozen/loss_total` the day that
+    landed."""
+    assert namespaced("train", {"buffer/size": 3}) == {"buffer/size": 3}
+
+
+def test_namespacing_does_not_enumerate_metric_names() -> None:
+    """The property that matters: a key nobody has written code for still gets
+    logged. A whitelist is how a new diagnostic ends up existing only in the
+    source."""
+    out = namespaced("selfplay", {"a_metric_added_next_week": 7.0})
+    assert out == {"selfplay/a_metric_added_next_week": 7.0}
 
 
 # --------------------------------------------------------------------------- #

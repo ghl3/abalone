@@ -18,6 +18,7 @@ looks wrong. In particular:
 
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
@@ -42,7 +43,18 @@ from model.batch import (
 )
 from model.encoder import PLY_PLANE, VALID_CELL_MASK
 from model.train_step import batch_to_tensors, capture_map_loss
-from model.validate import _auc, validate
+from model.validate import (
+    DATASET_KEY_PREFIX,
+    DATASET_METRIC_KEYS,
+    METRIC_KEYS,
+    NON_SCALAR_KEYS,
+    TOP_K,
+    VAL_FROZEN_PREFIX,
+    VAL_ROLLING_PREFIX,
+    _auc,
+    scalar_metrics,
+    validate,
+)
 from tests.test_train_step import make_batch
 
 CPU = torch.device("cpu")
@@ -160,10 +172,10 @@ def test_uniform_target_entropy_is_log_n() -> None:
     batch.validate()
 
     out = validate(ScriptedNet(*zeros_like_outputs(size)), [batch], CPU)
-    assert out["policy_target_entropy"] == pytest.approx(math.log(n), abs=1e-5)
-    assert out["mean_legal_moves"] == pytest.approx(float(n))
-    assert out["policy_uniform_entropy"] == pytest.approx(math.log(n), abs=1e-9)
-    assert out["policy_entropy_ratio"] == pytest.approx(1.0, abs=1e-5)
+    assert out["data_policy_target_entropy"] == pytest.approx(math.log(n), abs=1e-5)
+    assert out["data_mean_legal_moves"] == pytest.approx(float(n))
+    assert out["data_policy_uniform_entropy"] == pytest.approx(math.log(n), abs=1e-9)
+    assert out["data_policy_entropy_ratio"] == pytest.approx(1.0, abs=1e-5)
     # A uniform model against a uniform target: CE == the target entropy.
     assert out["policy_ce"] == pytest.approx(math.log(n), abs=1e-5)
 
@@ -181,8 +193,8 @@ def test_peaked_target_entropy_is_far_below_log_n() -> None:
     batch.policy_weight[:] = 1.0
 
     out = validate(ScriptedNet(*zeros_like_outputs(2)), [batch], CPU)
-    assert out["policy_target_entropy"] == pytest.approx(math.log(2.0), abs=1e-5)
-    assert out["policy_entropy_ratio"] < 0.2
+    assert out["data_policy_target_entropy"] == pytest.approx(math.log(2.0), abs=1e-5)
+    assert out["data_policy_entropy_ratio"] < 0.2
 
 
 def test_policy_metrics_use_only_weighted_rows() -> None:
@@ -198,7 +210,7 @@ def test_policy_metrics_use_only_weighted_rows() -> None:
     out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
     assert out["policy_top1_agreement"] == 1.0
     assert out["policy_rows"] == 2
-    assert out["policy_target_rate"] == pytest.approx(0.5)
+    assert out["data_policy_target_rate"] == pytest.approx(0.5)
 
 
 def test_no_weighted_rows_gives_nan_not_zero() -> None:
@@ -207,6 +219,131 @@ def test_no_weighted_rows_gives_nan_not_zero() -> None:
     assert math.isnan(out["policy_top1_agreement"])
     assert math.isnan(out["policy_ce"])
     assert out["policy_rows"] == 0
+
+
+def test_top5_agreement_is_looser_than_top1() -> None:
+    """Top-1 against a ~1/60 chance level is nearly all noise. Top-5 must
+    credit a model that ranks the MCTS choice second."""
+    n = 20
+    size = 4
+    batch = blank_batch(size, seed=40)
+    rng = np.random.default_rng(11)
+    p, v, s, c = zeros_like_outputs(size)
+    for i in range(size):
+        idx = rng.choice(MOVE_SPACE, size=n, replace=False)
+        batch.legal_mask[i, idx] = 1.0
+        batch.policy[i, idx[0]] = 1.0  # MCTS picks idx[0]
+        # The model ranks idx[1] first and the MCTS choice second.
+        p[i, idx[1]] = 9.0
+        p[i, idx[0]] = 8.0
+    batch.policy_weight[:] = 1.0
+
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    assert out["policy_top1_agreement"] == 0.0
+    assert out["policy_top5_agreement"] == 1.0
+
+
+def test_top5_agreement_is_zero_when_the_choice_is_ranked_sixth() -> None:
+    n = 20
+    batch = blank_batch(1, seed=41)
+    p, v, s, c = zeros_like_outputs(1)
+    idx = np.random.default_rng(12).choice(MOVE_SPACE, size=n, replace=False)
+    batch.legal_mask[0, idx] = 1.0
+    batch.policy[0, idx[0]] = 1.0
+    # Five legal moves score strictly above the MCTS choice: rank 5, so out.
+    for k in range(1, TOP_K + 1):
+        p[0, idx[k]] = 10.0 + k
+    p[0, idx[0]] = 1.0
+    batch.policy_weight[:] = 1.0
+
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    assert out["policy_top5_agreement"] == 0.0
+
+
+def test_top5_agreement_is_not_inflated_by_illegal_moves() -> None:
+    """A row with three legal moves has only three candidates. `topk` over the
+    2562-wide head would pad the other two slots with illegal moves and hand
+    out agreement for free."""
+    batch = blank_batch(1, seed=42)
+    p, v, s, c = zeros_like_outputs(1)
+    idx = np.array([100, 200, 300])
+    batch.legal_mask[0, idx] = 1.0
+    batch.policy[0, idx[2]] = 1.0  # MCTS picks the model's *worst* legal move
+    p[0, idx[0]] = 3.0
+    p[0, idx[1]] = 2.0
+    p[0, idx[2]] = 1.0
+    batch.policy_weight[:] = 1.0
+
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    # Two legal moves beat it, so rank 2 < 5: still agreement, correctly.
+    assert out["policy_top5_agreement"] == 1.0
+    assert out["policy_top1_agreement"] == 0.0
+
+
+# ----- KL(visits || prior) ---------------------------------------------------
+
+
+def _kl_batch(size: int, n_legal: int, *, seed: int) -> tuple[Batch, np.ndarray]:
+    """A batch whose every legal move carries visits, plus the legal indices."""
+    batch = blank_batch(size, seed=seed)
+    idx = np.random.default_rng(seed).choice(MOVE_SPACE, size=n_legal, replace=False)
+    for i in range(size):
+        batch.legal_mask[i, idx] = 1.0
+        batch.policy[i, idx] = 1.0 / n_legal
+    batch.policy_weight[:] = 1.0
+    return batch, idx
+
+
+def test_kl_visits_from_prior_is_zero_when_the_prior_equals_the_visits() -> None:
+    """The quantity the policy head is trying to drive to zero. If it does not
+    read 0 on an exact match, every reading of it is wrong by an offset."""
+    batch, idx = _kl_batch(3, 25, seed=43)
+    p, v, s, c = zeros_like_outputs(3)
+    # Uniform logits over the legal moves reproduce the uniform target exactly.
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    assert out["policy_kl_visits_from_prior"] == pytest.approx(0.0, abs=1e-6)
+    # ...and the identity KL = CE − H holds.
+    assert out["policy_ce"] == pytest.approx(out["data_policy_target_entropy"], abs=1e-5)
+    assert idx.size == 25
+
+
+def test_kl_visits_from_prior_is_positive_and_hand_checkable() -> None:
+    """Peaked visits against a uniform prior: KL = ln(n) − H(visits)."""
+    n = 30
+    batch = blank_batch(1, seed=44)
+    idx = np.random.default_rng(14).choice(MOVE_SPACE, size=n, replace=False)
+    batch.legal_mask[0, idx] = 1.0
+    batch.policy[0, idx[:2]] = 0.5  # H = ln 2
+    batch.policy_weight[:] = 1.0
+
+    out = validate(ScriptedNet(*zeros_like_outputs(1)), [batch], CPU)
+    assert out["policy_kl_visits_from_prior"] == pytest.approx(
+        math.log(n) - math.log(2.0), abs=1e-5
+    )
+    assert out["policy_kl_visits_from_prior"] > 0.0
+
+
+def test_kl_visits_from_prior_uses_only_full_search_rows() -> None:
+    """A `policy_weight == 0` row's visit distribution is noise from the fast
+    search. Averaging its KL in would make the metric track the playout-cap
+    rate rather than the network."""
+    n = 16
+    batch = blank_batch(2, seed=45)
+    idx = np.random.default_rng(15).choice(MOVE_SPACE, size=n, replace=False)
+    for i in range(2):
+        batch.legal_mask[i, idx] = 1.0
+    batch.policy[0, idx] = 1.0 / n  # full search: matches a uniform prior
+    batch.policy[1, idx[0]] = 1.0  # fast search: maximally far from uniform
+    batch.policy_weight[:] = np.array([1.0, 0.0], dtype=np.float32)
+
+    out = validate(ScriptedNet(*zeros_like_outputs(2)), [batch], CPU)
+    assert out["policy_rows"] == 1
+    assert out["policy_kl_visits_from_prior"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_kl_visits_from_prior_is_nan_without_any_policy_target() -> None:
+    out = validate(ScriptedNet(*zeros_like_outputs(3)), [blank_batch(3, seed=46)], CPU)
+    assert math.isnan(out["policy_kl_visits_from_prior"])
 
 
 # ----- value -----------------------------------------------------------------
@@ -227,6 +364,43 @@ def test_value_ce_and_accuracy_are_hand_checkable() -> None:
     expected = (ce_confident_right + ce_confident_wrong + 2 * math.log(3.0)) / 4.0
     assert out["value_ce"] == pytest.approx(expected, abs=1e-5)
     assert out["value_accuracy"] == pytest.approx(0.5)
+
+
+def test_value_brier_is_hand_workable() -> None:
+    """Multiclass Brier: `Σ_c (p_c − y_c)²`.
+
+    Row 0 is a uniform head on a WIN: `(1/3−1)² + (1/3)² + (1/3)² = 2/3`.
+    Row 1 is confidently right: ≈ 0. Mean = 1/3.
+    """
+    batch = blank_batch(2, seed=47)
+    batch.value[:] = np.array([VALUE_WIN, VALUE_LOSS])
+    p, v, s, c = zeros_like_outputs(2)
+    v[1, VALUE_LOSS] = 40.0
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    assert out["value_brier"] == pytest.approx((2.0 / 3.0 + 0.0) / 2.0, abs=1e-5)
+
+
+def test_value_brier_is_bounded_where_cross_entropy_is_not() -> None:
+    """A confidently wrong row: Brier saturates at 2, CE runs away. That bound
+    is the whole point — it is why the pair separates 'generally
+    miscalibrated' from 'a few confident errors'."""
+    batch = blank_batch(1, seed=48)
+    batch.value[:] = VALUE_WIN
+    p, v, s, c = zeros_like_outputs(1)
+    v[0, VALUE_LOSS] = 60.0
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    assert out["value_brier"] == pytest.approx(2.0, abs=1e-6)
+    assert out["value_ce"] > 50.0
+
+
+def test_value_brier_is_zero_for_a_perfect_confident_model() -> None:
+    batch = blank_batch(3, seed=49)
+    batch.value[:] = np.array([VALUE_WIN, VALUE_DRAW, VALUE_LOSS])
+    p, v, s, c = zeros_like_outputs(3)
+    for i, cls in enumerate((VALUE_WIN, VALUE_DRAW, VALUE_LOSS)):
+        v[i, cls] = 60.0
+    out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
+    assert out["value_brier"] == pytest.approx(0.0, abs=1e-9)
 
 
 def _calibration_batch(p_win: np.ndarray, wins: np.ndarray) -> tuple[Batch, torch.Tensor]:
@@ -331,7 +505,7 @@ def test_capture_map_auc_is_one_for_perfect_separation() -> None:
     out = validate(ScriptedNet(p, v, s, c), [batch], CPU)
     assert out["capture_map_auc"] == pytest.approx(1.0)
     assert out["capture_map_separation"] > 0.9
-    assert out["capture_map_positive_rate"] > 0.0
+    assert out["data_capture_map_positive_rate"] > 0.0
 
 
 def test_capture_map_auc_is_one_half_for_constant_predictions() -> None:
@@ -402,16 +576,116 @@ def test_data_health_stats() -> None:
 
     out = validate(ScriptedNet(*zeros_like_outputs(4)), [batch], CPU, max_plies=200)
     assert out["positions"] == 4
-    assert out["draw_rate"] == pytest.approx(0.25)
-    assert out["decisive_rate"] == pytest.approx(0.75)
-    assert out["mean_abs_score_diff"] == pytest.approx((3 + 0 + 1 + 4) / 4)
-    assert out["mean_ply_fraction"] == pytest.approx(0.5)
-    assert out["mean_ply"] == pytest.approx(100.0)
+    assert out["data_draw_rate"] == pytest.approx(0.25)
+    assert out["data_decisive_rate"] == pytest.approx(0.75)
+    assert out["data_mean_abs_score_diff"] == pytest.approx((3 + 0 + 1 + 4) / 4)
+    assert out["data_mean_ply_fraction"] == pytest.approx(0.5)
+    assert out["data_mean_ply"] == pytest.approx(100.0)
 
 
 def test_mean_ply_is_nan_without_a_ply_cap() -> None:
     out = validate(ScriptedNet(*zeros_like_outputs(2)), [blank_batch(2)], CPU)
-    assert math.isnan(out["mean_ply"])
+    assert math.isnan(out["data_mean_ply"])
+
+
+# ----- namespacing, and the metric that is NOT a progress signal -------------
+
+
+def test_prefix_namespaces_every_key_and_changes_nothing_else() -> None:
+    batch = make_batch(size=3, seed=30)
+    net = ScriptedNet(*zeros_like_outputs(3))
+    bare = validate(net, [batch], CPU)
+    net.cursor = 0
+    rolling = validate(net, [batch], CPU, prefix=VAL_ROLLING_PREFIX)
+
+    assert set(rolling) == {f"{VAL_ROLLING_PREFIX}{k}" for k in bare}
+    assert all(k.startswith(VAL_ROLLING_PREFIX) for k in rolling)
+    for key, value in bare.items():
+        if key in NON_SCALAR_KEYS:
+            continue
+        got = rolling[f"{VAL_ROLLING_PREFIX}{key}"]
+        if isinstance(value, float) and math.isnan(value):
+            assert math.isnan(got), key
+        else:
+            assert got == value, key
+    assert VAL_FROZEN_PREFIX != VAL_ROLLING_PREFIX
+
+
+def test_frozen_holdout_entropy_is_a_dataset_property_not_a_progress_signal() -> None:
+    """**The trap this naming exists to prevent.**
+
+    On a frozen holdout the data never changes, so `data_policy_target_entropy`
+    cannot change either — no matter what the network learns. It is a property
+    of the held-out set, and a flat curve is it working correctly, not a
+    plateau. Read `selfplay/policy_target_entropy` for the training signal.
+
+    Enforced by scoring the *same* batch with two very different models: every
+    `data_*` key must come out bit-identical, and the model-quality keys must
+    not.
+    """
+    batch = make_batch(size=6, seed=31)
+    torch.manual_seed(0)
+    weak = ScriptedNet(*zeros_like_outputs(6))
+    strong = ScriptedNet(
+        torch.from_numpy(batch.policy).clone() * 12.0,
+        torch.randn(6, VALUE_CLASSES) * 4.0,
+        torch.randn(6, SCORE_CLASSES) * 4.0,
+        torch.randn(6, CAPTURE_MAP_CHANNELS, BOARD_H, BOARD_W),
+    )
+    a = validate(weak, [batch], CPU, prefix=VAL_FROZEN_PREFIX, max_plies=200)
+    b = validate(strong, [batch], CPU, prefix=VAL_FROZEN_PREFIX, max_plies=200)
+
+    dataset_keys = {f"{VAL_FROZEN_PREFIX}{k}" for k in DATASET_METRIC_KEYS}
+    assert dataset_keys, "the dataset-property namespace must not be empty"
+    assert f"{VAL_FROZEN_PREFIX}data_policy_target_entropy" in dataset_keys
+    for key in dataset_keys:
+        assert a[key] == b[key] or (math.isnan(a[key]) and math.isnan(b[key])), key
+
+    # ...and the model-quality metrics did move, so the test above is not
+    # passing because both models are identical.
+    assert a[f"{VAL_FROZEN_PREFIX}policy_top1_agreement"] != pytest.approx(
+        b[f"{VAL_FROZEN_PREFIX}policy_top1_agreement"]
+    )
+
+
+def test_every_dataset_property_carries_the_data_prefix() -> None:
+    """No metric that is a property of the held-out set may sit under a bare
+    name next to the model-quality metrics — that is exactly how
+    `val_policy_target_entropy` got read as progress twice."""
+    out = validate(ScriptedNet(*zeros_like_outputs(4)), [make_batch(size=4, seed=32)], CPU)
+    for key in ("policy_target_entropy", "policy_uniform_entropy", "policy_entropy_ratio",
+                "mean_legal_moves", "decisive_rate", "draw_rate", "mean_ply",
+                "mean_abs_score_diff", "policy_target_rate", "capture_map_positive_rate"):
+        assert key not in out, f"{key} must be namespaced under {DATASET_KEY_PREFIX}"
+        assert f"{DATASET_KEY_PREFIX}{key}" in out
+    assert DATASET_METRIC_KEYS == frozenset(
+        k for k in METRIC_KEYS if k.startswith(DATASET_KEY_PREFIX)
+    )
+    # The model-quality keys must NOT be under `data_`: the marker has to mean
+    # something.
+    for key in ("value_ce", "value_brier", "policy_kl_visits_from_prior", "loss_total"):
+        assert key in out
+        assert not key.startswith(DATASET_KEY_PREFIX)
+
+
+def test_scalar_metrics_drops_the_calibration_curve() -> None:
+    out = validate(ScriptedNet(*zeros_like_outputs(3)), [make_batch(size=3, seed=33)], CPU)
+    scalars = scalar_metrics(out)
+    assert set(out) - set(scalars) == NON_SCALAR_KEYS
+    assert all(isinstance(v, float) for v in scalars.values())
+
+
+def test_every_metric_is_json_serialisable() -> None:
+    """A numpy scalar anywhere in here is a `TypeError` at `metrics.jsonl`
+    write time, a generation after the mistake."""
+    out = validate(
+        ScriptedNet(*zeros_like_outputs(3)), [make_batch(size=3, seed=34)], CPU, max_plies=200
+    )
+    for key, value in out.items():
+        if key == "value_calibration":
+            continue
+        assert type(value) in (int, float), (key, type(value))
+    json.dumps(out)
 
 
 # ----- plumbing --------------------------------------------------------------
@@ -497,17 +771,7 @@ def test_real_network_produces_the_full_metric_set() -> None:
     batches = [make_batch(size=4, seed=17), make_batch(size=3, seed=18)]
     out = validate(model, batches, CPU, max_plies=200)
 
-    expected = {
-        "loss_total", "loss_policy", "loss_value", "loss_score", "loss_capture_map",
-        "policy_top1_agreement", "policy_ce", "policy_target_entropy",
-        "policy_uniform_entropy", "policy_entropy_ratio", "mean_legal_moves",
-        "policy_rows", "value_ce", "value_accuracy", "value_ece", "value_calibration",
-        "score_ce", "score_mae", "score_accuracy", "capture_map_bce", "capture_map_auc",
-        "capture_map_separation", "capture_map_positive_rate", "positions",
-        "decisive_rate", "draw_rate", "mean_abs_score_diff", "mean_ply_fraction",
-        "mean_ply", "policy_target_rate",
-    }
-    assert set(out) == expected
+    assert set(out) == set(METRIC_KEYS) | {"value_calibration"}
     assert out["positions"] == 7
     assert out["policy_rows"] == 7
     assert math.isfinite(out["loss_total"])

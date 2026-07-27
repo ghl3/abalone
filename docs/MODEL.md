@@ -200,16 +200,30 @@ self-play, applying from the next generation on):
 mode: off          rate unchanged
 mode: schedule     rate = most recent {gen: rate} entry with key <= gen
 mode: controller   unseeded_games < min_unseeded_games  → hold (too noisy)
-                   natural_termination_rate >= target   → rate = max(floor, rate − step)
+                   natural_termination_rate >= target   → rate = max(floor, rate − Δ)
                    otherwise                            → hold
+
+    where  Δ = step × clamp(natural_termination_rate / target, 1, max_step_multiple)
 ```
 
 Two invariants hold in every mode: the rate never increases, and it never lands
 below `floor`. A curriculum does not go backwards — if the network regresses,
 holding is right and re-teaching endgames it already knows is not — and a
 monotone rule cannot oscillate, which is what makes a controller this crude safe
-to leave running for 50 generations. At most one step per generation: each step
+to leave running for 50 generations. One *decision* per generation: each step
 changes the distribution the next measurement is taken from.
+
+**The step is proportional to how far above target the signal sits.** A fixed
+step ignores the magnitude of its own error signal, and the six-generation
+validation run showed what that costs: `natural_termination_rate` reached 1.00
+at generation 4 — *four times* the 0.25 target, completely saturated — and the
+controller still moved 0.05 a generation, going 0.70 → 0.50 over six
+generations with eight more needed to reach the floor. The whole run was spent
+retiring a crutch the network had visibly outgrown. At
+`max_step_multiple: 4.0` the same signal retires it in three generations. The
+clamp is what keeps this a ratchet rather than a controller with gain: the step
+never shrinks below the configured one, and never exceeds K of them, so one
+lucky generation cannot dump the entire curriculum.
 
 `floor: 0.10` is deliberately non-zero. Positions at 5–4 captures are
 strategically critical and essentially never reached by self-play from a fresh
@@ -223,7 +237,8 @@ self_play:
   handicap_anneal:
     mode: controller          # controller | schedule | off
     target_natural_termination: 0.25
-    step: 0.05
+    step: 0.05                # at a signal sitting exactly on target
+    max_step_multiple: 4.0    # step × clamp(signal/target, 1, K)
     floor: 0.10
     min_unseeded_games: 20
     schedule: {}              # {gen: rate}, used only when mode == schedule
@@ -236,12 +251,12 @@ resume, so a resumed run continues the curriculum instead of silently
 restarting it at 0.7. Nothing writes the annealed value back into the config —
 that would make every resume after the first step refuse on a hash mismatch.
 
-**Sample size, and why a short run never anneals.** `min_unseeded_games: 20` is
-what stops the controller acting on noise. `config/validation.yaml` is 6
-generations of 60 games: at rate 0.7 only ~18 games a generation are unseeded,
-so the controller holds every generation and logs *insufficient sample* as the
-reason. That is the intended behaviour — six generations of a small network have
-no business retiring the curriculum — not a failure to fire.
+**Sample size.** `min_unseeded_games: 20` is what stops the controller acting on
+noise: 19 unseeded games at 100% natural termination is one plausible run of
+luck, not evidence. It is checked *before* the target, so a small sample holds
+however good it looks. At 200 games a generation and rate 0.7 there are ~60
+unseeded games, comfortably clear; the 60-game predecessor to
+`config/validation.yaml` had ~18 and correctly held every generation.
 
 **What a run logs.** Every generation, one line naming the current rate, the
 unseeded game count, the natural termination rate, the target, and whether the
@@ -465,7 +480,7 @@ efficiency device — no domain knowledge, no bias.
   │   SGD (AdamW, LR schedule, EMA weights)
   │        ↓ export ONNX
   └────────┘
-        every 5 gens ─→ anchor ladder ─→ Elo
+        every 5 gens ─→ anchor ladder ─→ Elo per rung, with CIs
 ```
 
 **Self-play always uses the latest network.** No gating, no promotion, no
@@ -489,34 +504,119 @@ table.
 
 ### 8.1 Measurement — the part that was missing
 
+Every metric below is logged under a namespace (`selfplay/`, `buffer/`,
+`train/`, `val_frozen/`, `val_rolling/`, `curriculum/`, `ladder/`, `perf/`) to
+`metrics.jsonl` and TensorBoard. The training loop iterates whatever the
+measurement layer returns — there is no whitelist, so a metric added to
+`model/validate.py` appears without anything in the loop being edited. Read a
+run back with `uv run python -m model.report --run latest`.
+
 Every generation:
 
-- **Held-out validation set** (~5k positions from a withheld generation): policy
-  top-1 agreement with the MCTS choice, value cross-entropy, value calibration.
-  This is the fast feedback loop. It would have surfaced the previous run's
-  collapse in minutes rather than after three 24-minute generations.
-- **Data health:** decisive rate, mean plies, mean `|d|` at termination, mean
-  policy-target entropy. If target entropy sits at `ln(branching)`, search is not
-  producing information and nothing downstream matters.
+- **Two held-out sets, measuring different things.**
+  - `val_frozen/` — a whole early generation, frozen and never trained on
+    again, scored with a fixed seed so the same rows come back every
+    generation. That fixity is what makes the curve comparable and also what
+    limits it: by generation 30 it is scoring the network on positions a
+    thirty-generation-weaker network produced, so a rising loss there is as
+    likely to be *progress* as regression. **It is a drift indicator. Do not
+    gate on it.**
+  - `val_rolling/` — 10% of each generation's own games, withheld by whole
+    game from that generation's training and never sampled again. Same
+    distribution as the training data, provably never seen. `val_rolling`
+    total loss minus mean training loss is memorisation of the replay buffer
+    and nothing else; that is the one to gate on, and the loop warns when the
+    gap exceeds `validation.overfit_warn_delta`.
+- **Data health:** decisive rate, mean plies, mean `|d|` at termination,
+  `captures_per_100_plies`, and the policy-target entropy gap. If target
+  entropy sits at `ln(branching)` — a gap of zero — search is not producing
+  information and nothing downstream matters.
+- **Training intensity:** `buffer/epochs_this_gen = steps × batch / buffer`.
+  A generation taking twenty raw passes over the same positions is overfitting
+  by construction, and reading that off a loss curve after the fact is exactly
+  the ambiguity this exists to remove. `train.target_epochs_per_gen` sets the
+  step budget *in these units*, so a generation whose games came out short gets
+  a proportionally smaller budget instead of silently multiplying its epochs.
 
-Every 5 generations:
+Every `anchor_ladder.every_gens` generations:
 
-- **Anchor ladder → Elo.** Fixed opponents: `random`, `heuristic@100`,
-  `heuristic@800`, and frozen checkpoints from earlier generations. Fixed
-  opponents give a monotone curve that self-play gating cannot.
-- Eval matches must **randomise openings and temperature-sample the early plies**
-  — with a deterministic evaluator and a fixed start, N games is otherwise 1
-  game replayed N times.
+- **Anchor ladder → Elo, per rung, with intervals.** Three kinds of rung, and
+  they are not interchangeable:
+  - **floor** — `random` and one cheap `heuristic@N`. A sanity check: losing to
+    these is a bug, beating them is not a result. Few games; the answer is
+    binary.
+  - **frozen** — checkpoints at absolute generations, kept for the whole run.
+    Fixed references, so their Elo curve is comparable end to end. The headline
+    number is the mean over floor and frozen rungs.
+  - **trailing** — `gen − k`. A *moving* reference that improves as the network
+    does, so it never saturates and it is the rung with resolution left at
+    generation 45. Excluded from the headline mean precisely because it moves.
+- **Per-rung results are always reported, never only the mean**, and every Elo
+  carries its 95% interval. `ladder/clamped_fraction` says how many rungs were
+  swept to 0 or 1 and are therefore reporting a sample-size bound rather than a
+  measurement; at 1.0 the ladder measured nothing and the loop says so loudly.
+  Generation 6 of the validation run swept all four rungs 12-0-0 and reported
+  "+545" four times over — the bound for a 12-game match, not a strength.
+- Eval matches must **randomise openings and temperature-sample the early
+  plies** — with a deterministic evaluator and a fixed start, N games is
+  otherwise 1 game replayed N times.
+- The ladder is the most expensive phase of a generation by a wide margin
+  (`eval-match` sustains ~2.1k NN evaluations/s aggregate against
+  `selfplay-batch`'s ~16k on the same machine), which is why the cadence is a
+  knob and why the floor rungs get fewer games than the checkpoint rungs.
 
 ### 8.2 Success criteria, in order
 
-1. Decisive rate > 40%, mean plies < 180.
-2. Policy-target entropy well below `ln(branching)`.
-3. Value cross-entropy falling on held-out data; calibration curve near diagonal.
-4. Monotone Elo against fixed anchors.
-5. **Beats `heuristic@800` at equal simulation count.** ← the milestone
-6. Plays recognisably purposeful Abalone: coherent groups, sumito threats, edge
-   avoidance — all learned, none of it told.
+`heuristic@800` used to sit at position 5 as *the* milestone. It has been
+retired to a generation-1 sanity floor, for three reasons. Its evaluator is
+`tanh(6.0·capture_diff + …)` and `tanh(6.0) = 0.99999`, so it cannot tell being
+one marble up from four — one capture ahead it believes it has won, one behind
+it believes it has lost. Its weights were tuned under the old 400-ply
+draw-at-cap rules and were never retuned. And a 1.1M-parameter network on a
+six-generation validation run cleared it at **generation 3, after 180 total
+games of self-play**. A criterion a nearly-untrained network satisfies is a
+miscalibrated yardstick, not an achievement.
+
+1. **Sanity floor, generation 1–2.** Beats `random` and `heuristic@100`
+   decisively; policy-target entropy gap clearly above zero; `train_loss_value`
+   above 0.05 and moving. Failing any of these means the pipeline is broken,
+   not that the network is weak. Stop and diagnose.
+2. **The training signal is real.** Policy-target entropy well below
+   `ln(branching)` and the gap widening generation over generation; decisive
+   rate > 40%; value cross-entropy falling on `val_rolling`, calibration curve
+   near diagonal, and `val_rolling` loss *not* pulling away from the training
+   loss.
+3. **Sustained strength gain — the primary milestone.** ≥ **+100 Elo per 10
+   generations** against the frozen-checkpoint rungs, with 95% intervals that
+   exclude zero, sustained across at least two consecutive ladders. Elo against
+   a *frozen* opponent is the only strength number in the system that means the
+   same thing at generation 10 and generation 40. Two disqualifiers, both of
+   which the old criterion would have missed:
+   - a ladder where every rung is clamped measures nothing, whatever number it
+     prints (`ladder/clamped_fraction == 1.0`);
+   - a gain measured only against `random` or `heuristic` is a gain against a
+     ceiling that stopped moving at generation 3.
+4. **Games lengthen while still finishing — the secondary milestone, and the
+   genuine skill signal.** Unseeded games trend *toward* 60–100 moves
+   (120–200 plies) while `natural_termination_rate` stays high, with
+   `captures_per_100_plies` falling.
+
+   This is the criterion the validation run failed while appearing to succeed.
+   Natural termination went 0% → 100% and every headline number improved — but
+   mean plies went 148 → 71, and games reaching six captures in ~30 moves is
+   roughly one capture every five moves. Both sides were conceding marbles
+   almost on contact. Competent defence looks like the opposite: games get
+   *longer* because captures get *harder*, and they still finish because the
+   network can convert an advantage once it has one. Short-and-decisive is a
+   brawl; long-and-decisive is a game. If plies fall while natural termination
+   rises, the network is learning to attack an opponent that cannot defend —
+   and it is playing itself.
+5. **Held-out generalisation holds up at scale.** `val_rolling` value CE and
+   policy top-1 improving while `buffer/epochs_this_gen` stays in single
+   figures. Improving one by spending the other is not progress.
+6. **Plays recognisably purposeful Abalone:** coherent groups, sumito threats,
+   edge avoidance — all learned, none of it told. Judged from the exported
+   games in the review UI, not from a number.
 
 ---
 
@@ -543,8 +643,11 @@ are building toward, and §7.1 plus §7.2 are what make it reachable.
 - **No supervised pre-training** on human games or engine games.
 - **No opening book** beyond uniform randomisation of the first plies.
 - **No AlphaZero-scale ambitions.** Single-machine training. The target is a
-  network that clearly beats the hand-written heuristic at equal search and plays
-  purposefully — not a superhuman engine.
+  network that gains strength steadily against its own frozen past selves and
+  plays purposefully (§8.2) — not a superhuman engine. Note that the target is
+  no longer "beats the hand-written heuristic at equal search": that bar was
+  cleared at generation 3 by a 1.1M network after 180 games, which says more
+  about the heuristic than about the network.
 - **No premature distributed training.** Single-node until throughput is a proven
   wall.
 

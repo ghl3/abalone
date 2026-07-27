@@ -5,11 +5,13 @@
 # JSON, held-out validation scores, the anchor ladder plays. It is far too
 # small to learn anything; do not read the numbers as evidence about the model.
 #
-# Two generations is the minimum that exercises everything: gen 1 produces the
-# holdout set, gen 2 validates against it and plays gen 1 as a frozen ladder
-# rung. Target wall-clock: a few minutes.
+# Three generations is the minimum that exercises everything: gen 1 produces the
+# frozen holdout, gen 2 validates against it and plays gen 1 as a frozen ladder
+# rung, gen 3 is the first generation with enough trainable data outside itself
+# to take a rolling holdout and the first with a distinct trailing rung.
+# Target wall-clock: a few minutes.
 seed: 0
-gens: 2
+gens: 3
 runs_root: runs
 web_export_path: web/public/models/best.onnx
 # 6×96. The dry run measures plumbing, not capacity.
@@ -48,6 +50,7 @@ self_play:
     mode: controller
     target_natural_termination: 0.25
     step: 0.05
+    max_step_multiple: 4.0
     floor: 0.10
     min_unseeded_games: 20
     schedule: {}
@@ -63,6 +66,11 @@ self_play:
 train:
   steps_per_gen_min: 20
   steps_per_gen_max: 40
+  # 6 games x ~50 plies is ~300 positions/gen, so 40 steps x batch 32 = 1280
+  # samples is ~4 passes over a two-generation buffer. The epoch target is set
+  # anyway so the code path is exercised; steps_per_gen_min is what binds here.
+  target_epochs_per_gen: 2.0
+  epochs_per_gen_warn: 8.0
   batch_size: 32
   learning_rate: 1.0e-3
   lr_schedule: {}
@@ -92,14 +100,29 @@ validation:
   batch_size: 128
   seed: 20260727
   entropy_ratio_warn: 0.95
+  overfit_warn_delta: 0.35
+  rolling:
+    enabled: true
+    every_gens: 1
+    # A large fraction because the generation is tiny: 20% of 6 games rounds up
+    # to two whole games, which is the smallest slice that is a slice at all.
+    # Gen 2 is skipped automatically (gen 1 is the frozen holdout, so there is
+    # nothing else to train on); gen 3 is where this actually fires.
+    fraction: 0.2
+    positions: 256
 
 anchor_ladder:
   every_gens: 1
   run_on_final_gen: true
-  games: 4
+  games: 6
+  floor_games: 4
   simulations: 24
   opponents: [random, heuristic@24]
   frozen_gens: [1]
+  # gen - 1: at gen 2 this resolves onto gen 1 and is deduplicated against
+  # frozen_gens; at gen 3 it is gen 2 and is a distinct rung. Exercising the
+  # dedup is half the point of having it here.
+  trailing_gens: [1]
   batch_size: 8
   c_puct: 1.4
   opening: belgian

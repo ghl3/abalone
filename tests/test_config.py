@@ -29,9 +29,11 @@ from model.config import (
     NET_PRESETS,
     OPENINGS,
     AnchorLadderConfig,
+    RollingHoldoutConfig,
     RunConfig,
     SelfPlayConfig,
     TrainConfig,
+    ValidationConfig,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +93,17 @@ def test_configs_are_internally_consistent(path: Path) -> None:
     # Frozen ladder rungs have to be reachable and retained.
     for g in cfg.anchor_ladder.frozen_gens:
         assert 0 < g < cfg.gens, f"{path.name}: frozen ladder gen {g} outside the run"
+    # A trailing offset larger than the run never resolves onto anything.
+    for k in cfg.anchor_ladder.trailing_gens:
+        assert 0 < k < cfg.gens, (
+            f"{path.name}: trailing ladder offset {k} is not reachable in a "
+            f"{cfg.gens}-generation run"
+        )
+    # A rolling holdout is measured against the training loss, so both have to
+    # be produced by the same generation's data.
+    if cfg.validation.enabled and cfg.validation.rolling.enabled:
+        assert cfg.validation.rolling.every_gens > 0
+        assert 0.0 < cfg.validation.rolling.fraction < 1.0
 
 
 @pytest.mark.parametrize("path", CONFIG_FILES, ids=_ids(CONFIG_FILES))
@@ -136,7 +149,9 @@ def test_unknown_top_level_key_rejected(tmp_path: Path) -> None:
         ("train", "value_target_blend_start"),
         ("train", "value_loss_weight"),
         ("validation", "holdout_generation"),
+        ("validation", "rolling_fraction"),
         ("anchor_ladder", "opponent"),
+        ("anchor_ladder", "frozen_generations"),
         ("retention", "web_export_on_promotion"),
         ("export", "games"),
     ],
@@ -177,6 +192,12 @@ def test_gating_group_is_not_silently_accepted(tmp_path: Path) -> None:
         ({"train": {"steps_per_gen_min": 100, "steps_per_gen_max": 10}}, "steps_per_gen_max"),
         ({"train": {"ema": {"decay": 1.0}}}, "decay"),
         ({"validation": {"holdout_gen": 0}}, "holdout_gen"),
+        ({"validation": {"rolling": {"fraction": 1.0}}}, "rolling.fraction"),
+        ({"self_play": {"handicap_anneal": {"max_step_multiple": 0.5}}}, "max_step_multiple"),
+        ({"train": {"target_epochs_per_gen": 0}}, "target_epochs_per_gen"),
+        ({"anchor_ladder": {"floor_games": 0}}, "floor_games"),
+        ({"anchor_ladder": {"trailing_gens": [0]}}, "trailing_gens"),
+        ({"anchor_ladder": {"trailing_gens": [-3]}}, "trailing_gens"),
     ],
 )
 def test_invalid_values_rejected(tmp_path: Path, data: dict, match: str) -> None:
@@ -306,9 +327,43 @@ def test_net_presets_match_abalone_net() -> None:
 
 
 def test_anchor_ladder_defaults_are_the_documented_ladder() -> None:
-    """MODEL.md §8.1 names the anchors explicitly: fixed opponents are the only
-    thing that gives a monotone curve."""
-    assert AnchorLadderConfig().opponents == ["random", "heuristic@100", "heuristic@800"]
+    """MODEL.md §8.1. The floor anchors are a sanity check and nothing more;
+    the rungs that measure anything are the network's own past selves."""
+    la = AnchorLadderConfig()
+    assert la.opponents == ["random", "heuristic@100"]
+    assert la.frozen_gens and la.trailing_gens
+    # Checkpoint rungs get more games than floor rungs: one is a measurement,
+    # the other is a binary check.
+    assert la.games > la.floor_games
+
+
+def test_heuristic_800_is_not_a_ladder_rung_anywhere() -> None:
+    """Retired in MODEL.md §8.2. Its evaluator is `tanh(6.0 * capture_diff)`,
+    which saturates at one capture of margin, its weights were tuned under the
+    old 400-ply rules, and a 1.1M network beat it at generation 3 after 180
+    games. Leaving it configured spends ~18% of every ladder on it."""
+    assert "heuristic@800" not in AnchorLadderConfig().opponents
+    for path in CONFIG_FILES:
+        cfg = RunConfig.from_yaml(path)
+        assert "heuristic@800" not in cfg.anchor_ladder.opponents, path.name
+
+
+def test_every_config_expresses_its_step_budget_in_epochs() -> None:
+    """A step count fixed in absolute terms is an epoch count that floats with
+    how long the games happened to be — which is how generation 3 of the
+    validation run took 20 raw passes over its own replay buffer."""
+    for path in CONFIG_FILES:
+        cfg = RunConfig.from_yaml(path)
+        assert cfg.train.target_epochs_per_gen is not None, path.name
+        assert cfg.train.target_epochs_per_gen <= cfg.train.epochs_per_gen_warn, path.name
+
+
+def test_the_anneal_step_is_proportional_by_default() -> None:
+    """The validation run sat at 4x the target for three generations and still
+    moved 0.05 a generation."""
+    from model.config import HandicapAnnealConfig
+
+    assert HandicapAnnealConfig().max_step_multiple >= 3.0
 
 
 # --------------------------------------------------------------------------- #
@@ -340,7 +395,12 @@ def test_hash_is_stable_across_key_order(tmp_path: Path) -> None:
         lambda c: setattr(c.train.loss_weights, "score", 0.5),
         lambda c: setattr(c.train.ema, "decay", 0.99),
         lambda c: setattr(c.validation, "holdout_gen", 3),
+        lambda c: setattr(c.validation.rolling, "fraction", 0.25),
+        lambda c: setattr(c.validation.rolling, "every_gens", 5),
+        lambda c: setattr(c.train, "target_epochs_per_gen", 3.0),
+        lambda c: setattr(c.self_play.handicap_anneal, "max_step_multiple", 2.0),
         lambda c: setattr(c.anchor_ladder, "games", 100),
+        lambda c: setattr(c.anchor_ladder, "trailing_gens", [3]),
     ],
 )
 def test_semantic_changes_change_the_hash(mutate) -> None:
@@ -363,7 +423,9 @@ def test_semantic_changes_change_the_hash(mutate) -> None:
         lambda c: setattr(c.self_play, "worker_threads", 3),
         lambda c: setattr(c.self_play, "shard_games_per_file", 64),
         lambda c: setattr(c.train, "steps_per_gen_max", 12345),
+        lambda c: setattr(c.train, "epochs_per_gen_warn", 3.0),
         lambda c: setattr(c.train, "poll_interval_ms", 1000),
+        lambda c: setattr(c.validation, "overfit_warn_delta", 0.9),
         lambda c: setattr(c.anchor_ladder, "threads", 2),
         lambda c: setattr(c.export, "games_per_gen", 1),
         lambda c: setattr(c.retention, "keep_last_onnx", 1),
@@ -418,3 +480,34 @@ def test_learning_rate_schedule_is_order_independent() -> None:
 def test_empty_lr_schedule_is_constant() -> None:
     tr = TrainConfig(learning_rate=7e-4)
     assert all(tr.learning_rate_at(g) == pytest.approx(7e-4) for g in range(1, 100))
+
+
+# --------------------------------------------------------------------------- #
+# The rolling holdout cadence                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_rolling_holdout_never_claims_the_frozen_generation() -> None:
+    """Generation 1 is the frozen holdout and is trained on during its own
+    generation because there is nothing else. Withholding a slice of it too
+    would leave that generation with strictly less than nothing."""
+    v = ValidationConfig(holdout_gen=1)
+    assert not v.is_rolling_holdout_gen(1)
+    assert v.is_rolling_holdout_gen(2)
+
+
+def test_rolling_holdout_cadence_counts_from_the_frozen_holdout() -> None:
+    v = ValidationConfig(holdout_gen=2, rolling=RollingHoldoutConfig(every_gens=3))
+    assert [g for g in range(1, 13) if v.is_rolling_holdout_gen(g)] == [5, 8, 11]
+
+
+@pytest.mark.parametrize(
+    "v",
+    [
+        ValidationConfig(enabled=False),
+        ValidationConfig(rolling=RollingHoldoutConfig(enabled=False)),
+        ValidationConfig(rolling=RollingHoldoutConfig(every_gens=0)),
+    ],
+)
+def test_rolling_holdout_can_be_switched_off(v: ValidationConfig) -> None:
+    assert not any(v.is_rolling_holdout_gen(g) for g in range(1, 20))

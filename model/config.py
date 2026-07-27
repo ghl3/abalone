@@ -88,8 +88,15 @@ class HandicapAnnealConfig:
     mode: str = "controller"
     #: Step down once this fraction of unseeded games ends on captures.
     target_natural_termination: float = 0.25
-    #: Absolute decrement per firing. One step per generation, at most.
+    #: Base decrement per firing, at a signal sitting exactly on the target.
     step: float = 0.05
+    #: The step is *proportional*: `step × clamp(signal / target, 1, K)`, where
+    #: K is this. A fixed step is too timid once the signal saturates — the
+    #: six-generation validation run measured `natural_termination_rate = 1.00`
+    #: (four times the 0.25 target) from generation 4 and still crawled down by
+    #: 0.05 a generation, needing eight more generations to reach the floor.
+    #: At K = 4 a saturated signal retires the crutch in three.
+    max_step_multiple: float = 4.0
     #: The rate never goes below this, in any mode. Deliberately non-zero:
     #: positions at 5–4 captures are strategically critical and essentially
     #: never visited by self-play from a fresh start (MODEL.md §4), so a
@@ -113,6 +120,11 @@ class HandicapAnnealConfig:
             "self_play.handicap_anneal.target_natural_termination must be in [0, 1]",
         )
         _require(self.step > 0.0, "self_play.handicap_anneal.step must be > 0")
+        _require(
+            self.max_step_multiple >= 1.0,
+            "self_play.handicap_anneal.max_step_multiple must be >= 1 (1 is the old "
+            "fixed-step behaviour; below 1 would shrink the configured step)",
+        )
         _require(0.0 <= self.floor <= 1.0, "self_play.handicap_anneal.floor must be in [0, 1]")
         _require(
             self.min_unseeded_games >= 0,
@@ -246,6 +258,19 @@ class TrainConfig:
     # Cap when self-play is still running after the minimum: keep consuming
     # otherwise-idle wall-clock up to here. null behaves like a fixed budget.
     steps_per_gen_max: int | None = None
+    #: Preferred step budget expressed as *passes over the replay buffer*:
+    #: `steps = epochs × buffer_size / batch_size`, clamped into
+    #: `[steps_per_gen_min, steps_per_gen_max]`. A step count fixed in absolute
+    #: terms silently becomes an epoch count that depends on how long the games
+    #: happened to be: the validation run's generation 3 took 1500 steps × 256
+    #: over a 19k-position buffer — **20 raw epochs in one generation** — purely
+    #: because games had shortened from 148 plies to 67. null = old behaviour
+    #: (run to `steps_per_gen_max` whenever self-play is still going).
+    target_epochs_per_gen: float | None = None
+    #: WARN above this many raw epochs over the buffer in one generation.
+    #: "Raw" ignores D6 augmentation, which multiplies distinct samples by 12;
+    #: the buffer is still only as diverse as the positions in it.
+    epochs_per_gen_warn: float = 8.0
     batch_size: int = 256
     learning_rate: float = 1.0e-3
     #: Step decay keyed to generation milestones: `{gen: lr}`, meaning "from
@@ -282,6 +307,13 @@ class TrainConfig:
             or self.steps_per_gen_max >= self.steps_per_gen_min,
             "train.steps_per_gen_max must be >= steps_per_gen_min",
         )
+        _require(
+            self.target_epochs_per_gen is None or self.target_epochs_per_gen > 0,
+            "train.target_epochs_per_gen must be > 0 (null to disable)",
+        )
+        _require(
+            self.epochs_per_gen_warn > 0, "train.epochs_per_gen_warn must be > 0"
+        )
         _require(self.batch_size > 0, "train.batch_size must be > 0")
         _require(self.learning_rate > 0, "train.learning_rate must be > 0")
         _require(self.replay_buffer_gens > 0, "train.replay_buffer_gens must be > 0")
@@ -295,6 +327,43 @@ class TrainConfig:
 
 
 @dataclass
+class RollingHoldoutConfig:
+    """The *current-distribution* held-out set (MODEL.md §8.1).
+
+    `ValidationConfig.holdout_gen` is frozen forever, which is what makes its
+    curve comparable — and also what makes it progressively less relevant: by
+    generation 30 it is scoring the network on positions produced by a network
+    thirty generations weaker. It cannot cleanly show overfitting to the replay
+    buffer, because "worse on generation 1" and "different from generation 1"
+    look the same.
+
+    The rolling holdout fixes that without a second self-play run:
+    `ReplayBuffer.mark_rolling_holdout` withholds `fraction` of generation `N`'s
+    own games — **by whole game**, since positions inside a game share `z` and
+    are near-duplicates — and those rows are never sampled into a training
+    batch, ever. They are the newest positions in existence and the network has
+    provably never seen them, so `val_rolling/loss_total` against the
+    generation's mean training loss is memorisation and nothing else.
+
+    Skipped automatically whenever the trainable pool outside the generation is
+    below `train.replay_buffer_min_size` (generation 2, where generation 1 is
+    already the frozen holdout, is the case that matters).
+    """
+
+    enabled: bool = True
+    #: Cadence, counted from `ValidationConfig.holdout_gen`. 1 = every
+    #: generation, which is the point — a holdout that is stale is the problem
+    #: this group exists to solve. 0 disables.
+    every_gens: int = 1
+    #: Fraction of the generation's games withheld. The cost is real and
+    #: permanent — at `every_gens: 1` the run trains on 90% of its data — and it
+    #: buys the only clean overfitting signal in the system.
+    fraction: float = 0.10
+    #: Positions per scoring pass. Sampled with replacement from the slice.
+    positions: int = 4096
+
+
+@dataclass
 class ValidationConfig:
     """Held-out validation (MODEL.md §8.1) — the feedback loop the failed run
     lacked. `holdout_gen` is frozen once produced and never trained on again.
@@ -303,6 +372,13 @@ class ValidationConfig:
     generation's training, because a generation with nothing to train on is
     worse than a slightly warm validation set. It is frozen from the following
     generation onward, which is where the curve starts meaning something.
+
+    Two holdouts, two jobs. The frozen one (`val_frozen/…`) is a fixed ruler:
+    same rows, same seed, every generation, so its curve is comparable end to
+    end. The rolling one (`val_rolling/…`, see `RollingHoldoutConfig`) is
+    always current-distribution, which is the only way to see the network
+    overfitting the replay buffer rather than merely drifting away from
+    generation 1.
     """
 
     enabled: bool = True
@@ -317,27 +393,85 @@ class ValidationConfig:
     #: At 1.0 search produced zero information and nothing downstream means
     #: anything — that is exactly how the previous run died.
     entropy_ratio_warn: float = 0.95
+    #: WARN when `val_rolling/loss_total` exceeds the generation's mean training
+    #: loss by more than this. Both are the same weighted total over the same
+    #: distribution — one on data the network trained on, one on data it has
+    #: never seen — so a widening gap is overfitting to the buffer and nothing
+    #: else. Absolute, in nats, because the total loss is a sum of CEs.
+    overfit_warn_delta: float = 0.35
+    rolling: RollingHoldoutConfig = field(default_factory=RollingHoldoutConfig)
+
+    def is_rolling_holdout_gen(self, gen: int) -> bool:
+        """True when generation `gen`'s own shards are withheld from its own
+        training. Never the frozen holdout generation — that one is already
+        special-cased and has nothing else to train on."""
+        r = self.rolling
+        if not (self.enabled and r.enabled and r.every_gens > 0):
+            return False
+        if gen <= self.holdout_gen:
+            return False
+        return (gen - self.holdout_gen) % r.every_gens == 0
 
 
 @dataclass
 class AnchorLadderConfig:
-    """Fixed opponents, run every N generations, converted to Elo (MODEL.md
-    §8.1). Fixed anchors give a monotone curve; self-play gating cannot."""
+    """The measurement of strength (MODEL.md §8.1).
+
+    **The rungs are mostly the network's own past selves.** The
+    six-generation validation run swept every rung of the old ladder 12-0-0 by
+    generation 6 — `random`, `heuristic@100`, `heuristic@800` and frozen
+    `gen_001` — and every one of them clamped at the same +545 Elo sample-size
+    bound. A mean over four clamped rungs is not a measurement, and averaging
+    it into `best.onnx` selection made that selection arbitrary. Anchors have
+    to span the strength range, and the only opponents guaranteed to keep pace
+    with the network are earlier copies of it.
+
+    Three kinds of rung, and they are not interchangeable:
+
+    * **floor** (`opponents`) — `random` and one cheap `heuristic@N`. A sanity
+      check: losing to these is a bug, beating them is not an achievement.
+      Deliberately fewer games (`floor_games`) because the answer is binary.
+    * **frozen** (`frozen_gens`) — absolute generations, kept for the whole
+      run. Fixed reference points, so their Elo curve is comparable end to end
+      and is what the headline number averages.
+    * **trailing** (`trailing_gens`) — `gen − k`. A *moving* reference: it
+      improves as the network does, so it never saturates and it is the rung
+      that still has resolution at generation 40. Excluded from the headline
+      mean precisely because it moves.
+
+    `heuristic@800` is gone. Its evaluator is `tanh(6.0·capture_diff + …)` and
+    `tanh(6.0) = 0.99999`, so it cannot tell being one marble up from four: one
+    capture ahead it believes it has won, one behind it believes it has lost.
+    Its weights were also tuned under the old 400-ply draw-at-cap rules. It is
+    not a yardstick, and MODEL.md §8.2 no longer treats beating it as a
+    milestone.
+    """
 
     every_gens: int = 5  # 0 disables the ladder entirely
     #: Always run on the last generation of a run, whatever the cadence — the
     #: final number is the one anybody quotes.
     run_on_final_gen: bool = True
+    #: Games per *checkpoint* rung (frozen and trailing). 12 was far too few:
+    #: ±0.5/√12 on the score is a ±145 Elo confidence interval, wider than any
+    #: generation-to-generation gain the ladder exists to detect.
     games: int = 40
+    #: Games per *floor* rung. A sanity check needs a fraction of the games a
+    #: measurement does, and the floor rungs are the ones that clamp anyway.
+    floor_games: int = 16
     #: Fallback sims; `@N` in an opponent spec overrides it for that opponent.
-    simulations: int = 400
-    opponents: list = field(
-        default_factory=lambda: ["random", "heuristic@100", "heuristic@800"]
-    )
-    #: Earlier generations to freeze as extra rungs. A rung is skipped when the
-    #: generation is not strictly earlier than the current one, or its ONNX has
-    #: been collected by retention.
+    #: 200 rather than 400: ladder cost is games × plies × sims, and games buy
+    #: resolution while sims buy an absolute strength nobody reads off a ladder.
+    simulations: int = 200
+    #: Floor anchors only. Checkpoint rungs come from `frozen_gens` /
+    #: `trailing_gens` and are resolved against the run's own checkpoint dir.
+    opponents: list = field(default_factory=lambda: ["random", "heuristic@100"])
+    #: Absolute earlier generations to freeze as rungs. A rung is skipped when
+    #: the generation is not strictly earlier than the current one, or its ONNX
+    #: has been collected by retention.
     frozen_gens: list = field(default_factory=lambda: [1])
+    #: Offsets back from the current generation: `[5]` plays `gen − 5`. The
+    #: rung that keeps its resolution once the fixed anchors are all swept.
+    trailing_gens: list = field(default_factory=lambda: [5])
     batch_size: int = 32
     c_puct: float = 1.4
     # Openings and early-ply sampling are what make N games N samples rather
@@ -356,9 +490,15 @@ class AnchorLadderConfig:
             f"anchor_ladder.opening must be one of {list(OPENINGS)}",
         )
         _require(self.games > 0, "anchor_ladder.games must be > 0")
+        _require(self.floor_games > 0, "anchor_ladder.floor_games must be > 0")
         for spec in self.opponents:
             _require(
                 isinstance(spec, str), f"anchor_ladder.opponents must be strings, got {spec!r}"
+            )
+        for k in self.trailing_gens:
+            _require(
+                isinstance(k, int) and not isinstance(k, bool) and k > 0,
+                f"anchor_ladder.trailing_gens are positive generation offsets, got {k!r}",
             )
 
 
@@ -437,6 +577,11 @@ class RunConfig:
             self.validation.holdout_gen >= 1,
             "validation.holdout_gen must be >= 1 (generations are 1-indexed)",
         )
+        _require(
+            0.0 <= self.validation.rolling.fraction < 1.0,
+            "validation.rolling.fraction must be in [0, 1); 1.0 would withhold the "
+            "entire generation from its own training",
+        )
 
     # -- hashing ---------------------------------------------------------------
 
@@ -471,7 +616,9 @@ HASH_EXCLUDED: frozenset[str] = frozenset(
         "self_play.worker_threads",
         "self_play.shard_games_per_file",
         "train.steps_per_gen_max",
+        "train.epochs_per_gen_warn",
         "train.poll_interval_ms",
+        "validation.overfit_warn_delta",
         "anchor_ladder.threads",
         "export",
         "retention",
@@ -549,6 +696,7 @@ __all__ = [
     "HandicapAnnealConfig",
     "LossWeightsConfig",
     "RetentionConfig",
+    "RollingHoldoutConfig",
     "RunConfig",
     "SelfPlayConfig",
     "TrainConfig",

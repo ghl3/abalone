@@ -6,13 +6,22 @@ One generation, end to end ([ARCHITECTURE §4](../docs/ARCHITECTURE.md)):
   1. self-play      selfplay-batch with the latest ONNX; writes shards
   2. train          (overlaps 1) ingest shards, AdamW steps, EMA update
   3. export         checkpoint .pt + ONNX from the EMA weights
-  4. validate       held-out policy/value/score/capture metrics
+  4. validate       frozen holdout + rolling (this generation's own, unseen)
      games          export reviewable JSON + the data-health line
      curriculum     ratchet `handicap_rate` down (MODEL.md §4)
-  5. anchor ladder  every N gens: random / heuristic@100 / heuristic@800 /
-                    frozen earlier checkpoints → Elo
+  5. anchor ladder  every N gens: floor anchors + frozen and trailing
+                    checkpoints of this run → Elo, per rung, with CIs
   6. commit         metrics.jsonl, TensorBoard, retention, atomic state.json
 ```
+
+**Metrics are logged generically.** The measurement layer returns namespaced
+dicts (`selfplay/`, `buffer/`, `train/`, `val_frozen/`, `val_rolling/`,
+`curriculum/`, `ladder/`, `perf/`) and this module iterates whatever it is
+handed into `metrics.jsonl` and TensorBoard. There is deliberately no
+whitelist: a metric added downstream must show up here without anyone editing
+a list, because the alternative is a new diagnostic that exists in code and
+nowhere a human will ever read it. Only the human-readable summary line and
+the warnings name specific keys.
 
 **The handicap rate lives in `state.json`, not in the config.** The config's
 `handicap_rate` is the initial condition; the live value is annealed down once
@@ -49,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import json
 import math
 import os
@@ -58,7 +68,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -73,7 +83,6 @@ from model.abalone_net import (
     AbaloneNet,
     build,
 )
-from model.batch import Batch
 from model.config import RunConfig
 from model.curriculum import AnnealStats, decide_handicap_rate, resolve_initial_rate
 from model.encoder import (
@@ -83,14 +92,34 @@ from model.encoder import (
     VALID_CELL_MASK,
     VALID_MASK_PLANE,
 )
-from model.eval import LadderRung, mean_elo, model_spec, run_ladder, start_self_play
-from model.export_game import export_generation, format_generation_report, summarise_generation
+from model.eval import (
+    KIND_FLOOR,
+    KIND_FROZEN,
+    KIND_TRAILING,
+    LadderOpponent,
+    LadderRung,
+    ladder_summary,
+    model_spec,
+    run_ladder,
+    start_self_play,
+)
+from model.export_game import (
+    export_generation,
+    format_generation_report,
+    selfplay_metrics,
+    summarise_generation,
+)
 from model.export_onnx import export as export_onnx
 from model.replay_buffer import ReplayBuffer, find_shards_for_gen
 from model.run_id import generate_unique
 from model.state import GenRecord, RunState
 from model.train_step import LossWeights, StepMetrics, train_step
-from model.validate import validate
+from model.validate import (
+    VAL_FROZEN_PREFIX,
+    VAL_ROLLING_PREFIX,
+    scalar_metrics,
+    validate,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -192,32 +221,138 @@ def retention_victims(files: list[Path], keep: int, protected: set[Path]) -> lis
     return [f for f in doomed if f not in protected]
 
 
-def opponent_label(spec: str) -> str:
-    """Short display name for a ladder rung. Frozen checkpoints are passed to
-    `eval-match` as absolute paths, and an absolute path in a log line buries
-    the numbers it is there to show."""
-    if spec.startswith("model:"):
-        head, sep, sims = spec[len("model:") :].partition("@")
-        return f"model:{Path(head).name}" + (sep + sims if sep else "")
-    return spec
-
-
 def ladder_opponents(
-    fixed: list[str], frozen_gens: list[int], gen: int, ckpt_dir: Path
-) -> list[str]:
-    """Fixed anchors plus any frozen earlier checkpoint that exists on disk.
+    fixed: list[str],
+    frozen_gens: list[int],
+    trailing_gens: list[int],
+    gen: int,
+    ckpt_dir: Path,
+    *,
+    games: int = 40,
+    floor_games: int = 16,
+) -> list[LadderOpponent]:
+    """Build the rungs for generation `gen`.
 
-    Strictly earlier: a generation cannot be its own opponent, and a rung
-    whose ONNX retention has collected is silently dropped rather than
-    crashing a ladder five hours into a run.
+    Floor anchors first (cheap, `floor_games` each), then the absolute frozen
+    checkpoints ascending, then the trailing `gen − k` checkpoints. Checkpoint
+    rungs get the full `games` budget: they are the ones being *measured*, and
+    12 games is a ±145 Elo interval.
+
+    Strictly earlier: a generation cannot be its own opponent. A checkpoint that
+    retention has collected is silently dropped rather than crashing a ladder
+    five hours into a run, and a trailing offset that resolves onto a generation
+    already covered by `frozen_gens` is deduplicated rather than played twice.
     """
-    out = list(fixed)
-    for g in sorted(set(int(x) for x in frozen_gens)):
-        if g <= 0 or g >= gen:
-            continue
+    out = [LadderOpponent(spec=s, games=floor_games, kind=KIND_FLOOR) for s in fixed]
+    seen: set[int] = set()
+
+    def add(g: int, kind: str) -> None:
+        if g <= 0 or g >= gen or g in seen:
+            return
         path = ckpt_dir / f"gen_{g:03d}.onnx"
-        if path.exists():
-            out.append(model_spec(path))
+        if not path.exists():
+            return
+        seen.add(g)
+        out.append(LadderOpponent(spec=model_spec(path), games=games, kind=kind))
+
+    for g in sorted({int(x) for x in frozen_gens}):
+        add(g, KIND_FROZEN)
+    # Largest offset first, so the rungs come out in ascending generation order
+    # like the frozen ones — a ladder log that reads oldest-to-newest is a
+    # progression, and one that reads in config order is a list.
+    for k in sorted({int(x) for x in trailing_gens}, reverse=True):
+        add(gen - k, KIND_TRAILING)
+    return out
+
+
+def epoch_budget_steps(
+    buffer_size: int,
+    batch_size: int,
+    target_epochs: float | None,
+    min_steps: int,
+    max_steps: int,
+) -> int:
+    """SGD steps that amount to `target_epochs` passes over the buffer.
+
+    `steps = epochs × buffer_size / batch_size`, clamped into
+    `[min_steps, max_steps]`. `target_epochs is None` keeps the old behaviour of
+    running to `max_steps` whenever there is wall-clock to spend.
+
+    The reason this exists: a step budget fixed in absolute terms is an epoch
+    budget that floats with how long the games happened to be. The validation
+    run's generation 3 spent 1500 steps × 256 over a 19k-position buffer — 20
+    raw passes over the same data in one generation — not because anyone chose
+    20, but because games had shortened from 148 plies to 67 and the buffer had
+    shrunk underneath a constant.
+    """
+    hi = max(int(max_steps), int(min_steps))
+    if target_epochs is None:
+        return hi
+    if buffer_size <= 0 or batch_size <= 0:
+        return int(min_steps)
+    want = round(float(target_epochs) * buffer_size / batch_size)
+    return max(int(min_steps), min(hi, want))
+
+
+def epochs_over_buffer(steps: int, batch_size: int, buffer_size: int) -> float:
+    """Raw passes over the replay buffer, ignoring D6 augmentation.
+
+    Augmentation multiplies distinct *tensors* by 12 but not distinct
+    *positions*, so this is the honest number: it is how many times the network
+    saw each recorded position, up to a symmetry.
+    """
+    if buffer_size <= 0:
+        return float("nan")
+    return steps * batch_size / buffer_size
+
+
+def epochs_alarm(epochs: float | None, threshold: float) -> bool:
+    """True when a single generation made far too many passes over the same
+    positions. Overfitting the buffer looks like progress on the training loss
+    and like nothing at all on the frozen holdout."""
+    if epochs is None:
+        return False
+    try:
+        e = float(epochs)
+    except (TypeError, ValueError):
+        return False
+    return not math.isnan(e) and e > threshold
+
+
+def overfit_alarm(
+    rolling_loss: float | None, train_loss: float | None, delta: float
+) -> bool:
+    """True when this generation's loss on data it has never seen exceeds its
+    loss on the buffer by more than `delta`.
+
+    Both numbers are the same weighted total over the same distribution — the
+    rolling holdout is this generation's own shards — so the gap between them
+    is memorisation and nothing else. The frozen gen-1 holdout could not show
+    this cleanly: a rising gap there is "different from generation 1", which is
+    also what *progress* looks like.
+    """
+    for v in (rolling_loss, train_loss):
+        if v is None:
+            return False
+    try:
+        r, t = float(rolling_loss), float(train_loss)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if math.isnan(r) or math.isnan(t):
+        return False
+    return (r - t) > delta
+
+
+def namespaced(prefix: str, metrics: Mapping[str, object]) -> dict[str, object]:
+    """`{prefix}/{key}` for every key that is not already namespaced.
+
+    The pass-through matters: the measurement layer is being changed under this
+    one to emit its own prefixes, and a consumer that blindly re-prefixed would
+    produce `val_frozen/val_frozen/loss_total` the day it landed.
+    """
+    out: dict[str, object] = {}
+    for key, value in metrics.items():
+        out[key if "/" in key else f"{prefix}/{key}"] = value
     return out
 
 
@@ -319,8 +454,9 @@ def _dump_config(cfg: RunConfig, workers_resolved: str) -> None:
     an = sp.handicap_anneal
     if an.mode == "controller":
         p(
-            f"    handicap_anneal:     controller — step {an.step:.2f} down to floor "
-            f"{an.floor:.2f} once natural termination of unseeded games reaches "
+            f"    handicap_anneal:     controller — step {an.step:.2f} × up to "
+            f"{an.max_step_multiple:.1f} (proportional to signal/target), down to floor "
+            f"{an.floor:.2f}, once natural termination of unseeded games reaches "
             f"{an.target_natural_termination:.0%}"
         )
         p(
@@ -348,6 +484,15 @@ def _dump_config(cfg: RunConfig, workers_resolved: str) -> None:
     p("  train:")
     steps_max = str(tr.steps_per_gen_max) if tr.steps_per_gen_max is not None else "(none)"
     p(f"    steps_per_gen:       min={tr.steps_per_gen_min}, max={steps_max}")
+    p(
+        "    target_epochs/gen:   "
+        + (
+            f"{tr.target_epochs_per_gen:g} passes over the buffer "
+            f"(warn > {tr.epochs_per_gen_warn:g})"
+            if tr.target_epochs_per_gen is not None
+            else f"(none — run to max; warn > {tr.epochs_per_gen_warn:g})"
+        )
+    )
     p(f"    batch_size:          {tr.batch_size}")
     sched = (
         ", ".join(f"gen>={k}→{tr.lr_schedule[k]}" for k in sorted(tr.lr_schedule))
@@ -367,20 +512,40 @@ def _dump_config(cfg: RunConfig, workers_resolved: str) -> None:
     p(f"    replay_buffer:       {tr.replay_buffer_gens} gens, min {tr.replay_buffer_min_size}")
     p(f"    symmetry_augment:    {str(tr.symmetry_augment).lower()}")
     p("  validation:")
-    p(
-        f"    holdout gen {va.holdout_gen}, every {va.every_gens} gen(s), "
-        f"{va.positions} positions, entropy-ratio warn > {va.entropy_ratio_warn}"
-        if va.enabled
-        else "    (disabled)"
-    )
+    if va.enabled:
+        p(
+            f"    frozen:              gen {va.holdout_gen}, every {va.every_gens} gen(s), "
+            f"{va.positions} positions, entropy-ratio warn > {va.entropy_ratio_warn}"
+        )
+        if va.rolling.enabled and va.rolling.every_gens > 0:
+            p(
+                f"    rolling:             every {va.rolling.every_gens} gen(s), "
+                f"{va.rolling.positions} positions from the generation's *own* shards, "
+                f"withheld from its own training"
+            )
+            p(
+                f"                         overfit warn when val_rolling loss exceeds "
+                f"train loss by > {va.overfit_warn_delta}"
+            )
+        else:
+            p("    rolling:             (disabled)")
+    else:
+        p("    (disabled)")
     p("  anchor_ladder:")
     if la.every_gens > 0:
         p(
-            f"    every {la.every_gens} gen(s), {la.games} games @ {la.simulations} sims, "
-            f"opening {la.opening} +{la.random_opening_plies} random plies"
+            f"    every {la.every_gens} gen(s) @ {la.simulations} sims, opening "
+            f"{la.opening} +{la.random_opening_plies} random plies"
         )
-        p(f"    opponents:           {', '.join(la.opponents)}")
-        p(f"    frozen checkpoints:  {la.frozen_gens or '(none)'}")
+        p(
+            f"    floor anchors:       {', '.join(la.opponents) or '(none)'} "
+            f"× {la.floor_games} games"
+        )
+        p(f"    frozen checkpoints:  {la.frozen_gens or '(none)'} × {la.games} games")
+        p(
+            f"    trailing (gen − k):  {la.trailing_gens or '(none)'} × {la.games} games "
+            f"— the rung that does not saturate"
+        )
     else:
         p("    (disabled)")
     print(flush=True)
@@ -578,9 +743,13 @@ def _apply_retention(run_dir: Path, cfg: RunConfig, state: RunState, gen: int) -
     for rel in (state.best_onnx, state.current_onnx):
         if rel:
             protected.add(run_dir / rel)
-    # Frozen ladder rungs must survive long enough to be played again.
+    # Frozen ladder rungs must survive long enough to be played again — and so
+    # must every trailing rung the next few ladders will reach back for.
     for g in cfg.anchor_ladder.frozen_gens:
         protected.add(ckpt_dir / f"gen_{int(g):03d}.onnx")
+    for k in cfg.anchor_ladder.trailing_gens:
+        for future in range(gen, gen + max(cfg.anchor_ladder.every_gens, 1) + 1):
+            protected.add(ckpt_dir / f"gen_{future - int(k):03d}.onnx")
 
     for pattern, keep in (
         ("gen_*.pt", cfg.retention.keep_last_checkpoints),
@@ -601,8 +770,8 @@ def _apply_retention(run_dir: Path, cfg: RunConfig, state: RunState, gen: int) -
                 n = int(d.name.split("_", 1)[1])
             except (IndexError, ValueError):
                 continue
-            # The holdout generation is the validation set; it outlives the
-            # rolling window by design.
+            # The frozen holdout generation is the validation set; it outlives
+            # the rolling window by design.
             if n < threshold and n != cfg.validation.holdout_gen:
                 shutil.rmtree(d, ignore_errors=True)
 
@@ -661,18 +830,64 @@ def _train_phase(
     loss_weights: LossWeights,
     writer: SummaryWriter | None = None,
     phase_start_time: float | None = None,
+    hold_rolling: bool = False,
 ) -> tuple[int, StepMetrics | None, float, float]:
     """Train while self-play runs. The exit rule is dynamic:
 
       - always at least `train.steps_per_gen_min` steps;
-      - if `steps_per_gen_max` is set and self-play is *still running* at the
-        minimum, keep going (on otherwise-idle wall-clock) up to the maximum;
+      - the budget above that is `train.target_epochs_per_gen` passes over the
+        *current* buffer, recomputed as shards arrive and clamped to
+        `steps_per_gen_max` — so a generation that produced short games gets a
+        proportionally smaller budget instead of 20 silent epochs;
+      - if `target_epochs_per_gen` is null the budget is `steps_per_gen_max`,
+        which is the old behaviour;
       - if self-play exits first and we are past the minimum, stop.
+
+    `hold_rolling` withholds a slice of *this* generation for validation. The
+    slice can only be drawn once every shard has landed — it is taken by whole
+    game and is idempotent, so drawing it early would fix it on whichever two
+    games happened to finish first — so this generation is excluded from
+    sampling entirely until self-play exits, at which point the slice is marked
+    and the other ~90% joins the pool. The held rows are then never sampled
+    again for the life of the run.
 
     Returns `(steps_done, mean_metrics, self_play_seconds, active_train_seconds)`.
     """
     min_steps = cfg.train.steps_per_gen_min
-    max_steps = max(cfg.train.steps_per_gen_max or min_steps, min_steps)
+    hard_max = max(cfg.train.steps_per_gen_max or min_steps, min_steps)
+    exclude: tuple[int, ...] = (new_gen,) if hold_rolling else ()
+    rolling_held = -1
+
+    def mark_rolling() -> None:
+        """Fix this generation's rolling slice and release the rest to the
+        training pool. Idempotent, both here and in the buffer."""
+        nonlocal exclude, rolling_held
+        if not hold_rolling or rolling_held >= 0:
+            return
+        rolling_held = buffer.mark_rolling_holdout(
+            new_gen,
+            fraction=cfg.validation.rolling.fraction,
+            seed=cfg.validation.seed,
+        )
+        exclude = ()
+        _log(
+            f"holdout: gen {new_gen} rolling slice of {rolling_held} positions "
+            f"({cfg.validation.rolling.fraction:.0%} of its games) — never trained on",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
+
+    def budget() -> int:
+        """The step cap right now, from the buffer as it currently stands."""
+        return epoch_budget_steps(
+            buffer.total_size(),
+            cfg.train.batch_size,
+            cfg.train.target_epochs_per_gen,
+            min_steps,
+            hard_max,
+        )
+
+    max_steps = hard_max
     # TB global step uses the *minimum* as the per-gen budget so plots line up
     # across generations even when the actual step count varies.
     step_offset = (new_gen - 1) * min_steps
@@ -754,11 +969,14 @@ def _train_phase(
 
     while True:
         ingest_new()
+        max_steps = budget()
 
         if not sp_done_announced and sp_proc is not None and sp_proc.poll() is not None:
             sp_seconds = time.time() - phase_start
             sp_done_announced = True
             if sp_proc.returncode == 0:
+                ingest_new()
+                mark_rolling()
                 games_done, avg_plies = _count_completed_games(selfplay_log_path)
                 _log(
                     f"self-play complete in {_fmt_secs(sp_seconds)}  ·  {games_done} games  ·  "
@@ -789,11 +1007,16 @@ def _train_phase(
         if steps_done >= min_steps and not sp_alive_now:
             break
 
-        if buffer.total_size() < cfg.train.replay_buffer_min_size:
+        trainable = buffer.total_size() - (
+            buffer.chunk_size(new_gen) - buffer.rolling_holdout_size(new_gen)
+            if exclude
+            else 0
+        )
+        if trainable < cfg.train.replay_buffer_min_size:
             if sp_alive_now:
                 time.sleep(poll_interval)
                 continue
-            if buffer.total_size() == 0:
+            if trainable <= 0:
                 raise RuntimeError(
                     "self-play produced no trainable data. If "
                     f"validation.holdout_gen ({cfg.validation.holdout_gen}) is the only "
@@ -802,7 +1025,7 @@ def _train_phase(
             # Otherwise proceed on a short buffer rather than stall.
 
         for _ in range(min(STEPS_PER_POLL, max_steps - steps_done)):
-            batch = buffer.sample(cfg.train.batch_size, rng)
+            batch = buffer.sample(cfg.train.batch_size, rng, exclude_gens=exclude)
             m = train_step(
                 model,
                 optimizer,
@@ -861,6 +1084,10 @@ def _train_phase(
                 total_gens=cfg.gens,
             )
 
+    # Every shard is in by here, whichever branch got us out of the loop. The
+    # slice must exist before validation looks for it.
+    mark_rolling()
+
     if steps_done == 0:
         return 0, None, sp_seconds or 0.0, 0.0
     mean = StepMetrics(**{k: v / steps_done for k, v in sums.items()})
@@ -877,21 +1104,46 @@ def _train_phase(
 # --------------------------------------------------------------------------- #
 
 
-def _holdout_batches(
-    buffer: ReplayBuffer, gen: int, positions: int, batch_size: int, seed: int
-) -> Iterator[Batch]:
-    """Fixed-seed draws from the held-out generation, augmentation off.
+def _score_holdout(
+    *,
+    model: AbaloneNet,
+    buffer: ReplayBuffer,
+    cfg: RunConfig,
+    kind: str,
+    prefix: str,
+    positions: int,
+    device: torch.device,
+    loss_weights: LossWeights,
+    gens: list[int] | None = None,
+) -> dict[str, object]:
+    """One holdout, scored. `{}` when that holdout has nothing in it.
 
-    Sampling is with replacement, so this is a bootstrap of the generation
-    rather than an enumeration — but with a fixed seed it is the *same*
-    bootstrap every generation, which is what makes the curve comparable.
+    Both holdouts go through the same function under different namespaces —
+    `val_frozen/` and `val_rolling/` — so a metric added to `model.validate`
+    appears under both without anything here being touched.
     """
-    rng = np.random.default_rng(seed)
-    remaining = positions
-    while remaining > 0:
-        n = min(batch_size, remaining)
-        yield buffer.sample_from_gens([gen], n, rng, augment=False)
-        remaining -= n
+    batches = buffer.iter_holdout_batches(
+        kind=kind,
+        positions=positions,
+        batch_size=cfg.validation.batch_size,
+        seed=cfg.validation.seed,
+        gens=gens,
+    )
+    metrics = validate(
+        model,
+        batches,
+        device,
+        weights=loss_weights,
+        max_plies=cfg.self_play.max_plies,
+        prefix=prefix,
+    )
+    # `positions` is the accumulator's own row count: zero means the iterator
+    # yielded nothing, which is "no holdout yet", not "a holdout of zero".
+    return {} if not float(metrics.get(f"{prefix}positions", 0) or 0) else metrics
+
+
+def _prefixed_get(metrics: Mapping[str, object], prefix: str, key: str) -> object:
+    return metrics.get(f"{prefix}{key}")
 
 
 def _validation_phase(
@@ -902,65 +1154,96 @@ def _validation_phase(
     new_gen: int,
     device: torch.device,
     loss_weights: LossWeights,
-) -> dict[str, object] | None:
-    """Score the exported (EMA) weights on the frozen holdout generation."""
-    holdout = cfg.validation.holdout_gen
-    if buffer.chunk_size(holdout) == 0:
-        _log(
-            f"phase: validate  (skipped — holdout gen {holdout} has no rows in the buffer)",
-            gen=new_gen,
-            total_gens=cfg.gens,
-        )
-        return None
-    positions = min(cfg.validation.positions, max(buffer.chunk_size(holdout), 1) * 4)
+) -> dict[str, object]:
+    """Score the exported (EMA) weights on both holdouts.
+
+    The frozen holdout is a fixed ruler and a **drift** indicator: by
+    generation 30 its rows come from a network thirty generations weaker, so a
+    rising loss there is as likely to be progress as regression. The rolling
+    holdout is this generation's own withheld games — same distribution as the
+    training data, never trained on — and is the one that can be gated on.
+    """
+    out: dict[str, object] = {}
     t = time.time()
-    metrics = validate(
-        model,
-        _holdout_batches(
-            buffer,
-            holdout,
-            positions,
-            cfg.validation.batch_size,
-            cfg.validation.seed,
+
+    frozen = _score_holdout(
+        model=model,
+        buffer=buffer,
+        cfg=cfg,
+        kind="frozen",
+        prefix=VAL_FROZEN_PREFIX,
+        positions=min(
+            cfg.validation.positions,
+            max(buffer.chunk_size(cfg.validation.holdout_gen), 1) * 4,
         ),
-        device,
-        weights=loss_weights,
-        max_plies=cfg.self_play.max_plies,
+        device=device,
+        loss_weights=loss_weights,
     )
-    _log(
-        f"phase: validate  ({positions} positions from held-out gen {holdout}, "
-        f"{_fmt_secs(time.time() - t)})",
-        gen=new_gen,
-        total_gens=cfg.gens,
+    rolling = _score_holdout(
+        model=model,
+        buffer=buffer,
+        cfg=cfg,
+        kind="rolling",
+        prefix=VAL_ROLLING_PREFIX,
+        positions=min(
+            cfg.validation.rolling.positions,
+            max(buffer.rolling_holdout_size(buffer.rolling_holdout_gen), 1) * 4,
+        )
+        if buffer.rolling_holdout_gen is not None
+        else 0,
+        device=device,
+        loss_weights=loss_weights,
     )
-    _log(
-        f"  val  loss {_fmt(metrics['loss_total'], 4)}  ·  policy top-1 "
-        f"{_fmt(metrics['policy_top1_agreement'])}  ·  value CE "
-        f"{_fmt(metrics['value_ce'], 4)} (acc {_fmt(metrics['value_accuracy'])}, ECE "
-        f"{_fmt(metrics['value_ece'])})",
-        gen=new_gen,
-        total_gens=cfg.gens,
-    )
-    _log(
-        f"  val  score CE {_fmt(metrics['score_ce'], 4)} (MAE {_fmt(metrics['score_mae'], 2)} "
-        f"marbles)  ·  capture-map AUC {_fmt(metrics['capture_map_auc'])}  ·  "
-        f"policy entropy {_fmt(metrics['policy_target_entropy'])} / "
-        f"{_fmt(metrics['policy_uniform_entropy'])} = "
-        f"{_fmt(metrics['policy_entropy_ratio'])}",
-        gen=new_gen,
-        total_gens=cfg.gens,
-    )
-    if entropy_ratio_alarm(
-        metrics.get("policy_entropy_ratio"), cfg.validation.entropy_ratio_warn
-    ):
-        _warn(
-            f"held-out policy target entropy is {_fmt(metrics['policy_entropy_ratio'])} of "
-            f"ln(mean legal moves) — search is producing (near) no information, and no "
-            f"downstream metric means anything until that is fixed",
+    out.update(frozen)
+    out.update(rolling)
+
+    if not out:
+        _log(
+            "phase: validate  (skipped — neither holdout has rows in the buffer yet)",
             gen=new_gen,
             total_gens=cfg.gens,
         )
-    return metrics
+        return out
+
+    _log(f"phase: validate  ({_fmt_secs(time.time() - t)})", gen=new_gen, total_gens=cfg.gens)
+    for label, prefix, m in (
+        (f"frozen gen {cfg.validation.holdout_gen}", VAL_FROZEN_PREFIX, frozen),
+        (f"rolling gen {buffer.rolling_holdout_gen}", VAL_ROLLING_PREFIX, rolling),
+    ):
+        if not m:
+            continue
+        g = functools.partial(_prefixed_get, m, prefix)
+        _log(
+            f"  val [{label}]  {int(g('positions') or 0)} pos  ·  loss "
+            f"{_fmt(g('loss_total'), 4)}  ·  policy top-1 {_fmt(g('policy_top1_agreement'))}"
+            f"  ·  value CE {_fmt(g('value_ce'), 4)} (acc {_fmt(g('value_accuracy'))}, "
+            f"ECE {_fmt(g('value_ece'))})",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
+        _log(
+            f"  val [{label}]  score CE {_fmt(g('score_ce'), 4)} (MAE "
+            f"{_fmt(g('score_mae'), 2)} marbles)  ·  capture-map AUC "
+            f"{_fmt(g('capture_map_auc'))}  ·  policy entropy "
+            f"{_fmt(g('data_policy_target_entropy'))} / "
+            f"{_fmt(g('data_policy_uniform_entropy'))} = "
+            f"{_fmt(g('data_policy_entropy_ratio'))}",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
+
+    ratio = out.get(f"{VAL_ROLLING_PREFIX}data_policy_entropy_ratio") or out.get(
+        f"{VAL_FROZEN_PREFIX}data_policy_entropy_ratio"
+    )
+    if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn):
+        _warn(
+            f"held-out policy target entropy is {_fmt(ratio)} of ln(mean legal moves) — "
+            f"search is producing (near) no information, and no downstream metric means "
+            f"anything until that is fixed",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -977,22 +1260,36 @@ def _ladder_phase(
     ckpt_dir: Path,
 ) -> list[LadderRung]:
     la = cfg.anchor_ladder
-    opponents = ladder_opponents(list(la.opponents), list(la.frozen_gens), new_gen, ckpt_dir)
+    opponents = ladder_opponents(
+        list(la.opponents),
+        list(la.frozen_gens),
+        list(la.trailing_gens),
+        new_gen,
+        ckpt_dir,
+        games=la.games,
+        floor_games=la.floor_games,
+    )
     if not opponents:
         return []
+    total_games = sum(o.games for o in opponents)
     _log(
-        f"phase: anchor ladder  ({len(opponents)} opponents × {la.games} games @ "
+        f"phase: anchor ladder  ({len(opponents)} rungs, {total_games} games @ "
         f"{la.simulations} sims)",
         gen=new_gen,
         total_gens=cfg.gens,
     )
+    for o in opponents:
+        _log(f"    rung  {o.label:<26} {o.kind:<9} {o.games} games", gen=new_gen, total_gens=cfg.gens)
 
     def on_rung(rung: LadderRung) -> None:
-        label = opponent_label(rung.opponent)
-        _log(f"  vs {label:<22} {rung.result.summary()}", gen=new_gen, total_gens=cfg.gens)
+        _log(
+            f"  vs {rung.label:<26} {rung.result.summary()}",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
         if rung.result.suspicious_transcripts:
             _warn(
-                f"{rung.result.games} games vs {label} produced only "
+                f"{rung.result.games} games vs {rung.label} produced only "
                 f"{rung.result.distinct_transcripts} distinct transcript(s) — the openings and "
                 f"temperature sampling are not randomising the match, so this result is one "
                 f"game with a large denominator",
@@ -1003,7 +1300,6 @@ def _ladder_phase(
     return run_ladder(
         model_onnx=onnx_path,
         opponents=opponents,
-        games=la.games,
         simulations=la.simulations,
         c_puct=la.c_puct,
         batch_size=la.batch_size,
@@ -1020,6 +1316,50 @@ def _ladder_phase(
         threads=la.threads,
         on_rung=on_rung,
     )
+
+
+def _report_ladder(rungs: list[LadderRung], gen: int, total_gens: int) -> float | None:
+    """Per-rung results, then the headline — never the headline alone.
+
+    The generation-6 ladder of the validation run swept all four rungs 12-0-0
+    and reported "+545" as if that were a measurement. It was the sample-size
+    bound, four times over. When every rung clamps, the ladder has no
+    resolution left and says so loudly enough to be acted on.
+    """
+    if not rungs:
+        return None
+    _log("  ladder:", gen=gen, total_gens=total_gens)
+    for r in rungs:
+        _log(
+            f"    {r.label:<26} {r.kind:<9} {r.result.wins_a}-{r.result.wins_b}-"
+            f"{r.result.draws}  score {r.score:.3f}±{r.result.score_a_stderr:.3f}  "
+            f"elo {r.elo_str()}",
+            gen=gen,
+            total_gens=total_gens,
+        )
+    summary = ladder_summary(rungs)
+    elo = summary.get("ladder/elo_mean")
+    lo, hi = summary.get("ladder/elo_mean_ci95_lo"), summary.get("ladder/elo_mean_ci95_hi")
+    ci = f" [{lo:+.0f}, {hi:+.0f}]" if lo is not None and hi is not None else ""
+    frac = summary.get("ladder/clamped_fraction", float("nan"))
+    _log(
+        f"  ladder Elo (mean over fixed-reference rungs): {elo:+.0f}{ci}  ·  "
+        f"{int(summary['ladder/rungs_clamped'])}/{int(summary['ladder/rungs_measured'])} "
+        f"rungs clamped ({frac:.0%})  ·  {_fmt_secs(summary['ladder/seconds'])}",
+        gen=gen,
+        total_gens=total_gens,
+    )
+    if summary.get("ladder/all_clamped"):
+        _warn(
+            "ladder has no resolution — every rung was swept, so every Elo is the "
+            "sample-size bound for the game count rather than a measurement of "
+            "anything. Add a stronger anchor: raise anchor_ladder.trailing_gens to a "
+            "more recent checkpoint, or add a frozen_gens entry from a later "
+            "generation. The mean above is a lower bound, not a number",
+            gen=gen,
+            total_gens=total_gens,
+        )
+    return None if elo is None or math.isnan(elo) else float(elo)
 
 
 # --------------------------------------------------------------------------- #
@@ -1237,6 +1577,28 @@ def main(argv: list[str] | None = None) -> int:
     for gen in sorted(gens_to_load):
         for shard in find_shards_for_gen(run_dir / "shards", gen):
             buffer.ingest_shard(shard, gen=gen)
+    # Re-take every rolling slice a resumed run had already taken. The
+    # selection is deterministic in `(seed, gen)` and the marking is idempotent,
+    # so this reproduces the *same* rows — without it, "never trained on" would
+    # quietly become "never trained on unless the run was ever restarted", and
+    # the one clean generalisation measurement in the system would be silently
+    # contaminated by a crash. Driven off `state.history` rather than off the
+    # config predicate: a generation whose slice was skipped by the
+    # minimum-buffer guard was trained on in full and must stay that way.
+    held_before = {
+        r.gen: r.rolling_holdout_positions
+        for r in state.history
+        if r.rolling_holdout_positions
+    }
+    restored = 0
+    for gen in sorted(gens_to_load):
+        if gen not in held_before:
+            continue
+        restored += buffer.mark_rolling_holdout(
+            gen, fraction=cfg.validation.rolling.fraction, seed=cfg.validation.seed
+        )
+    if restored:
+        _log(f"rolling holdout: {restored} position(s) restored across resumed generations")
     if cfg.validation.enabled and holdout_gen <= state.current_gen:
         buffer.mark_holdout(holdout_gen)
         _log(f"holdout: gen {holdout_gen} frozen ({buffer.holdout_size()} positions)")
@@ -1370,6 +1732,23 @@ def _run_outer_loop(
         state.current_phase = "training"
         state.save_atomic(run_dir / "state.json")
         train_t = time.time()
+        # Decided here, once, against the buffer as it stands *before* this
+        # generation's first shard lands: that is exactly the pool training
+        # would be left with while the generation is withheld. Generation 2 of
+        # a run whose generation 1 is the frozen holdout has nothing else, and
+        # must not withhold anything.
+        hold_rolling = (
+            cfg.validation.is_rolling_holdout_gen(new_gen)
+            and buffer.total_size() >= cfg.train.replay_buffer_min_size
+        )
+        if cfg.validation.is_rolling_holdout_gen(new_gen) and not hold_rolling:
+            _log(
+                f"rolling holdout: skipped for gen {new_gen} — only {buffer.total_size()} "
+                f"trainable positions outside it, below replay_buffer_min_size "
+                f"{cfg.train.replay_buffer_min_size}",
+                gen=new_gen,
+                total_gens=cfg.gens,
+            )
         steps_done, mean_metrics, sp_seconds, active_train_secs = _train_phase(
             model=model,
             optimizer=optimizer,
@@ -1385,18 +1764,31 @@ def _run_outer_loop(
             loss_weights=loss_weights,
             writer=writer,
             phase_start_time=sp_t,
+            hold_rolling=hold_rolling,
         )
         sp_state[0] = None
         sp_log_file.close()
         train_seconds = time.time() - train_t
+        epochs = epochs_over_buffer(steps_done, cfg.train.batch_size, buffer.total_size())
         if mean_metrics is not None:
             rate = steps_done / active_train_secs if active_train_secs > 0 else 0.0
             _log(
                 f"training complete: {steps_done} steps in {_fmt_secs(active_train_secs)} "
-                f"({rate:.1f} steps/s) @ lr {lr:g}  ·  loss {mean_metrics.loss_total:.4f} "
+                f"({rate:.1f} steps/s) @ lr {lr:g}  ·  {_fmt(epochs, 1)} raw epochs over "
+                f"{buffer.total_size()} positions  ·  loss {mean_metrics.loss_total:.4f} "
                 f"(policy {mean_metrics.loss_policy:.4f}, value {mean_metrics.loss_value:.4f}, "
                 f"score {mean_metrics.loss_score:.4f}, cap {mean_metrics.loss_capture_map:.4f})"
                 f"  ·  grad {mean_metrics.grad_norm:.2f}",
+                gen=new_gen,
+                total_gens=cfg.gens,
+            )
+        if epochs_alarm(epochs, cfg.train.epochs_per_gen_warn):
+            _warn(
+                f"{_fmt(epochs, 1)} raw passes over the replay buffer in one generation "
+                f"(warn above {cfg.train.epochs_per_gen_warn:g}). The buffer is only as "
+                f"diverse as the positions in it — D6 augmentation multiplies tensors, not "
+                f"positions. Lower train.target_epochs_per_gen / steps_per_gen_max, or raise "
+                f"self_play.games_per_gen: self-play is the cheap half",
                 gen=new_gen,
                 total_gens=cfg.gens,
             )
@@ -1449,8 +1841,8 @@ def _run_outer_loop(
         # the two would otherwise redo this generation's self-play at the new
         # rate, having thrown away the data that justified it.
 
-        # ---- 4b. held-out validation ----
-        val_metrics: dict[str, object] | None = None
+        # ---- 4b. held-out validation (frozen ruler + rolling holdout) ----
+        val_metrics: dict[str, object] = {}
         if should_validate(
             new_gen,
             enabled=cfg.validation.enabled,
@@ -1486,13 +1878,7 @@ def _run_outer_loop(
                 run_dir=run_dir,
                 ckpt_dir=ckpt_dir,
             )
-            if rungs:
-                ladder_elo = mean_elo(rungs)
-                _log(
-                    f"  ladder Elo (mean over fixed anchors): {ladder_elo:+.0f}",
-                    gen=new_gen,
-                    total_gens=cfg.gens,
-                )
+            ladder_elo = _report_ladder(rungs, new_gen, cfg.gens)
 
         # ---- best-by-Elo tracking; this is all `best.onnx` means now ----
         if ladder_elo is not None and not math.isnan(ladder_elo):
@@ -1521,6 +1907,58 @@ def _run_outer_loop(
         # ---- 6. commit ----
         gen_shards = find_shards_for_gen(run_dir / "shards", new_gen)
         gen_positions = buffer.chunk_size(new_gen)
+        gen_seconds = time.time() - gen_t
+
+        # Every measurement, under its own namespace, in one dict. Nothing here
+        # enumerates metric names: a key added in `model.validate`,
+        # `model.export_game` or `model.replay_buffer` lands in metrics.jsonl
+        # and TensorBoard without this file being edited.
+        metrics: dict[str, object] = {}
+        metrics.update(selfplay_metrics(health))
+        metrics.update(
+            buffer.buffer_metrics(
+                gen=new_gen, steps=steps_done, batch_size=cfg.train.batch_size
+            )
+        )
+        metrics.update(
+            namespaced(
+                "train",
+                {
+                    "steps": steps_done,
+                    "learning_rate": lr,
+                    "epochs_over_buffer": epochs,
+                    **(asdict_metrics(mean_metrics)),
+                },
+            )
+        )
+        metrics.update(val_metrics)
+        metrics.update(
+            namespaced(
+                "curriculum",
+                {
+                    "handicap_rate": decision.previous,
+                    "handicap_rate_next": decision.rate,
+                    "stepped": float(decision.stepped),
+                    "unseeded_games": anneal_stats.unseeded_games,
+                    "natural_termination_rate": anneal_stats.natural_termination_rate,
+                },
+            )
+        )
+        if rungs:
+            metrics.update(ladder_summary(rungs))
+        metrics.update(
+            namespaced(
+                "perf",
+                {
+                    "self_play_seconds": sp_seconds,
+                    "train_seconds": train_seconds,
+                    "train_active_seconds": active_train_secs,
+                    "gen_seconds": gen_seconds,
+                    "shard_count": len(gen_shards),
+                },
+            )
+        )
+
         record = GenRecord(
             gen=new_gen,
             train_steps=steps_done,
@@ -1530,17 +1968,31 @@ def _run_outer_loop(
             train_loss_score=_opt(mean_metrics, "loss_score"),
             train_loss_capture_map=_opt(mean_metrics, "loss_capture_map"),
             train_grad_norm=_opt(mean_metrics, "grad_norm"),
+            train_epochs_over_buffer=_finite(epochs),
             learning_rate=lr,
-            val_loss_total=_num(val_metrics, "loss_total"),
-            val_policy_top1=_num(val_metrics, "policy_top1_agreement"),
-            val_policy_entropy_ratio=_num(val_metrics, "policy_entropy_ratio"),
-            val_value_ce=_num(val_metrics, "value_ce"),
-            val_value_accuracy=_num(val_metrics, "value_accuracy"),
+            rolling_holdout_positions=buffer.rolling_holdout_size(new_gen),
+            val_loss_total=_num(metrics, f"{VAL_FROZEN_PREFIX}loss_total"),
+            val_policy_top1=_num(metrics, f"{VAL_FROZEN_PREFIX}policy_top1_agreement"),
+            val_policy_entropy_ratio=_num(
+                metrics, f"{VAL_FROZEN_PREFIX}data_policy_entropy_ratio"
+            ),
+            val_value_ce=_num(metrics, f"{VAL_FROZEN_PREFIX}value_ce"),
+            val_value_accuracy=_num(metrics, f"{VAL_FROZEN_PREFIX}value_accuracy"),
+            val_rolling_loss_total=_num(metrics, f"{VAL_ROLLING_PREFIX}loss_total"),
+            val_rolling_policy_top1=_num(
+                metrics, f"{VAL_ROLLING_PREFIX}policy_top1_agreement"
+            ),
+            val_rolling_value_ce=_num(metrics, f"{VAL_ROLLING_PREFIX}value_ce"),
+            val_rolling_value_accuracy=_num(
+                metrics, f"{VAL_ROLLING_PREFIX}value_accuracy"
+            ),
             decisive_rate=_num(health, "decisive_rate"),
             mean_plies=_num(health, "mean_plies"),
             mean_abs_score_diff=_num(health, "mean_abs_score_diff"),
             policy_target_entropy=_num(health, "policy_target_entropy"),
             policy_uniform_entropy=_num(health, "policy_uniform_entropy"),
+            policy_entropy_gap=_num(health, "policy_entropy_gap"),
+            captures_per_100_plies=_num(health, "captures_per_100_plies"),
             handicap_rate=decision.previous,
             handicap_rate_next=decision.rate,
             unseeded_games=anneal_stats.unseeded_games,
@@ -1548,32 +2000,42 @@ def _run_outer_loop(
             # different facts, and only one of them belongs in a plot.
             natural_termination_rate=_finite(anneal_stats.natural_termination_rate),
             ladder_elo=ladder_elo,
+            ladder_elo_ci95_lo=_num(metrics, "ladder/elo_mean_ci95_lo"),
+            ladder_elo_ci95_hi=_num(metrics, "ladder/elo_mean_ci95_hi"),
+            ladder_clamped_fraction=_num(metrics, "ladder/clamped_fraction"),
             self_play_seconds=sp_seconds,
             train_seconds=train_seconds,
-            gen_seconds=time.time() - gen_t,
+            gen_seconds=gen_seconds,
             buffer_size=buffer.total_size(),
             shard_count=len(gen_shards),
             positions=gen_positions,
         )
         state.append_history(record)
 
-        # metrics.jsonl carries strictly more than `state.history`: every
-        # validation metric, the full data-health block, and every ladder rung.
-        entry: dict[str, object] = {"git_sha": git_sha, **asdict(record)}
-        entry.update({f"data_{k}": v for k, v in health.items()})
-        entry["handicap_anneal_reason"] = decision.reason
-        entry["handicap_anneal_stepped"] = decision.stepped
-        if val_metrics is not None:
-            entry.update({f"val_{k}": v for k, v in val_metrics.items()})
+        # metrics.jsonl carries strictly more than `state.history`: every metric
+        # every measurement module emitted, plus the non-scalar payloads
+        # (`value_calibration`, the handicap histogram, every ladder rung).
+        entry: dict[str, object] = {
+            "gen": new_gen,
+            "git_sha": git_sha,
+            **metrics,
+            "handicap_distribution": health.get("handicap_distribution"),
+            "handicap_anneal_reason": decision.reason,
+            "handicap_anneal_stepped": decision.stepped,
+        }
         if rungs:
             entry["ladder"] = [
-                {"opponent": r.opponent, **{k: v for k, v in r.result.raw.items() if k != "per_game"}}
+                {
+                    "opponent": r.opponent,
+                    "kind": r.kind,
+                    **{k: v for k, v in r.result.raw.items() if k != "per_game"},
+                }
                 for r in rungs
             ]
         with (run_dir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
-        _write_tb(writer, record, health, val_metrics, rungs, new_gen)
+        _write_tb(writer, metrics, new_gen)
 
         # Freeze the holdout generation once it has been produced *and*
         # trained on. From here it is validation-only and survives eviction.
@@ -1602,20 +2064,26 @@ def _run_outer_loop(
         state.save_atomic(run_dir / "state.json")
 
         # ---- the per-generation summary line ----
+        # The one place that names specific metrics on purpose: a human reads it.
         ratio = health.get("policy_entropy_ratio")
+        gap = health.get("policy_entropy_gap")
         entropy_str = (
-            f"policy entropy {_fmt(health.get('policy_target_entropy'))}"
+            f"entropy {_fmt(health.get('policy_target_entropy'))}"
             f"/{_fmt(health.get('policy_uniform_entropy'))}"
-            f" = {_fmt(ratio)}"
+            f" = {_fmt(ratio)} (gap {_fmt(gap)})"
         )
+        rolling_loss = _num(metrics, f"{VAL_ROLLING_PREFIX}loss_total")
         _log(
-            f"complete in {_fmt_secs(time.time() - gen_t)}  ·  "
-            f"loss {_fmt(record.train_loss_total, 4)}  ·  "
-            f"decisive {_fmt(health.get('decisive_rate'), 2)}  ·  "
+            f"complete in {_fmt_secs(gen_seconds)}  ·  "
+            f"loss {_fmt(record.train_loss_total, 4)}"
+            + (f" (rolling {_fmt(rolling_loss, 4)})" if rolling_loss is not None else "")
+            + f"  ·  decisive {_fmt(health.get('decisive_rate'), 2)}  ·  "
             f"plies {_fmt(health.get('mean_plies'), 0)}  ·  "
+            f"nat.term {_fmt(anneal_stats.natural_termination_rate, 2)}  ·  "
             f"handicap {decision.previous:.2f}"
             + (f"→{decision.rate:.2f}" if decision.stepped else "")
             + f"  ·  {entropy_str}"
+            + (f"  ·  {_fmt(epochs, 1)} epochs" if not math.isnan(epochs) else "")
             + (f"  ·  elo {ladder_elo:+.0f}" if ladder_elo is not None else ""),
             gen=new_gen,
             total_gens=cfg.gens,
@@ -1626,6 +2094,19 @@ def _run_outer_loop(
                 f"ln(mean legal moves) — MCTS visit distributions are ~uniform, so this "
                 f"generation's data teaches the policy head nothing. Raise sims_full or "
                 f"check the search before spending more compute",
+                gen=new_gen,
+                total_gens=cfg.gens,
+            )
+        if overfit_alarm(
+            rolling_loss, record.train_loss_total, cfg.validation.overfit_warn_delta
+        ):
+            _warn(
+                f"val_rolling loss {_fmt(rolling_loss, 4)} exceeds this generation's mean "
+                f"training loss {_fmt(record.train_loss_total, 4)} by more than "
+                f"{cfg.validation.overfit_warn_delta} — the rolling holdout is the same "
+                f"distribution as the training data, so the gap is memorisation of the "
+                f"replay buffer. Cut train.target_epochs_per_gen, widen "
+                f"train.replay_buffer_gens, or make more games per generation",
                 gen=new_gen,
                 total_gens=cfg.gens,
             )
@@ -1648,6 +2129,15 @@ def _opt(metrics: StepMetrics | None, name: str) -> float | None:
     return float(getattr(metrics, name)) if metrics is not None else None
 
 
+def asdict_metrics(metrics: StepMetrics | None) -> dict[str, float]:
+    """`StepMetrics` as a plain dict, or `{}` when a generation took no steps.
+
+    Generic on purpose: `StepMetrics` gaining a field must show up in
+    `metrics.jsonl` without anyone editing this module.
+    """
+    return dict(metrics.as_dict()) if metrics is not None else {}
+
+
 def _finite(value: float | None) -> float | None:
     """`None` for anything that is not a real number, so `state.json` carries a
     JSON `null` rather than a `NaN` token no strict parser will read back."""
@@ -1667,36 +2157,20 @@ def _num(d: dict | None, key: str) -> float | None:
     return float(v)
 
 
-def _write_tb(
-    writer: SummaryWriter | None,
-    record: GenRecord,
-    health: dict,
-    val_metrics: dict | None,
-    rungs: list[LadderRung],
-    gen: int,
-) -> None:
+def _write_tb(writer: SummaryWriter | None, metrics: Mapping[str, object], gen: int) -> None:
+    """Every scalar in `metrics`, under the namespace it arrived with.
+
+    Deliberately not a whitelist. TensorBoard groups by the part before the
+    first `/`, which is exactly what the `selfplay/`, `buffer/`, `train/`,
+    `val_frozen/`, `val_rolling/`, `curriculum/`, `ladder/` and `perf/`
+    prefixes are for — so a metric added anywhere downstream appears in the
+    right panel with no change here.
+    """
     if writer is None:
         return
-    for name, value in asdict(record).items():
-        # `val_*` are a hand-picked subset of `val_metrics`, which is logged in
-        # full below; emitting both would put the same number under two tags.
-        if name == "gen" or value is None or name.startswith("val_"):
-            continue
-        writer.add_scalar(
-            f"{'perf/' if name.endswith('_seconds') else 'gen/'}{name}", float(value), gen
-        )
-    for name, value in health.items():
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            writer.add_scalar(f"data/{name}", float(value), gen)
-    for name, value in (val_metrics or {}).items():
-        # `value_calibration` is a curve, not a scalar; it lives in metrics.jsonl.
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            writer.add_scalar(f"val/{name}", float(value), gen)
-    for rung in rungs:
-        tag = opponent_label(rung.opponent).replace("/", "_")
-        writer.add_scalar(f"ladder/elo/{tag}", rung.elo, gen)
-        writer.add_scalar(f"ladder/score/{tag}", rung.score, gen)
-        writer.add_scalar(f"ladder/distinct_transcripts/{tag}", rung.result.distinct_transcripts, gen)
+    for name, value in scalar_metrics(dict(metrics)).items():
+        if not math.isnan(value):
+            writer.add_scalar(name, value, gen)
     writer.flush()
 
 

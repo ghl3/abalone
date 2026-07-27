@@ -36,6 +36,7 @@ import pytest
 from model.encoder import MOVE_SPACE
 from model.export_game import (
     REQUIRED_COLUMNS,
+    SELFPLAY_PREFIX,
     SHARD_COLUMNS,
     ExportResult,
     ShardError,
@@ -48,11 +49,13 @@ from model.export_game import (
     load_exported_games,
     main,
     read_shard,
+    selfplay_metrics,
     split_games,
     summarise_generation,
     terminated_naturally,
     visit_entropy,
 )
+from model.validate import VAL_FROZEN_PREFIX, VAL_ROLLING_PREFIX
 
 # --------------------------------------------------------------------------- #
 # Fixtures — the v2 shard schema, verbatim from ARCHITECTURE §5.4              #
@@ -131,6 +134,7 @@ def make_game(
     full_search_period=1,
     child_idxs=(1204, 881, 42, 900),
     child_visits=(10, 40, 20, 30),
+    losses=None,
 ):
     """A whole game's rows, POV-flipped per ply exactly as the writer must.
 
@@ -138,11 +142,17 @@ def make_game(
     row stores them relative to whoever is to move at that ply. That flip is the
     thing the export has to undo, so the fixture applies it explicitly rather
     than letting a helper hide it.
+
+    `losses` is the per-ply `(black_losses, white_losses)` *before* that ply's
+    move, matching the writer. It defaults to the handicap held constant, which
+    is a game in which nothing was ever pushed off; pass a ramp to give the game
+    captures.
     """
     rows = []
     for ply in range(n_plies):
         turn = ply % 2
         sign = 1 if turn == 0 else -1
+        lost = tuple(handicap) if losses is None else tuple(losses[ply])
         rows.append(
             make_row(
                 game_id=game_id,
@@ -150,6 +160,8 @@ def make_game(
                 opening=opening,
                 handicap_black=handicap[0],
                 handicap_white=handicap[1],
+                black_losses=int(lost[0]),
+                white_losses=int(lost[1]),
                 turn=turn,
                 ply=ply,
                 max_plies=max_plies,
@@ -163,6 +175,21 @@ def make_game(
             )
         )
     return rows
+
+
+def losses_ramp(n_plies, handicap, captures_before_last):
+    """Per-ply `(black_losses, white_losses)` for a game in which
+    `captures_before_last` marbles come off Black over the first plies.
+
+    The final move's capture is deliberately absent — the writer records losses
+    *before* each move, so the capture that ends a game is in no row, and
+    reconstructing it is `export_game`'s job.
+    """
+    out = []
+    for ply in range(n_plies):
+        taken = min(captures_before_last, max(0, ply))
+        out.append((handicap[0] + taken, handicap[1]))
+    return out
 
 
 def write_shard(path, rows):
@@ -753,9 +780,209 @@ def test_summary_of_nothing_is_nan_not_a_misleading_zero():
         "policy_target_entropy",
         "policy_uniform_entropy",
         "policy_entropy_ratio",
+        "policy_entropy_gap",
         "mean_legal_moves",
+        "captures_per_100_plies",
+        "mean_captures",
+        "unseeded_captures_per_100_plies",
+        "seeded_captures_per_100_plies",
     ):
         assert math.isnan(summary[key]), key
+
+
+# --------------------------------------------------------------------------- #
+# captures — the bloodbath indicator                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _capture_game(game_id, *, plies, max_plies, handicap, captures_before_last):
+    return export_game(
+        make_game(
+            game_id=game_id,
+            n_plies=plies,
+            max_plies=max_plies,
+            handicap=handicap,
+            losses=losses_ramp(plies, handicap, captures_before_last),
+        ),
+        "r",
+        0,
+    )
+
+
+def test_a_natural_termination_counts_the_final_capture_that_no_row_records():
+    """The writer records losses *before* each move, so the capture that ends
+    the game is in no row. A game short of its cap ended *because* the sixth
+    capture landed, and a move pushes off at most one marble — so the missing
+    count is exactly one."""
+    game = _capture_game(1, plies=30, max_plies=200, handicap=(0, 0), captures_before_last=5)
+    assert game["result"]["captures"] == 6
+    assert game["result"]["captures_in_play"] == 6
+
+
+def test_a_capped_game_does_not_invent_a_final_capture():
+    """At the cap the last move's capture is genuinely unknowable. Counting one
+    anyway would inflate the rate on exactly the games — long, grinding ones —
+    where the indicator is supposed to read low."""
+    game = _capture_game(2, plies=200, max_plies=200, handicap=(0, 0), captures_before_last=3)
+    assert game["result"]["captures"] == 3
+    assert game["result"]["captures_in_play"] == 3
+
+
+def test_the_seeded_head_start_is_not_counted_as_captures_in_play():
+    """A game seeded at (3, 2) was *given* five captures. Counting them would
+    make every seeded game read as a bloodbath and make the indicator track the
+    handicap rate instead of the play."""
+    game = _capture_game(3, plies=20, max_plies=200, handicap=(3, 2), captures_before_last=0)
+    assert game["result"]["captures"] == 6  # 3 + 2 given, plus the one that ended it
+    assert game["result"]["captures_in_play"] == 1
+
+
+def test_captures_per_100_plies_on_games_with_known_capture_counts():
+    """Two unseeded games: 6 captures in 30 plies and 6 in 90. Pooled that is
+    12 captures over 120 plies = 10.0 per 100 plies."""
+    games = [
+        _capture_game(1, plies=30, max_plies=200, handicap=(0, 0), captures_before_last=5),
+        _capture_game(2, plies=90, max_plies=200, handicap=(0, 0), captures_before_last=5),
+    ]
+    summary = summarise_generation(games)
+    assert summary["captures_per_100_plies"] == pytest.approx(100.0 * 12 / 120)
+    assert summary["mean_captures"] == pytest.approx(6.0)
+    assert summary["unseeded_captures_per_100_plies"] == pytest.approx(10.0)
+    assert math.isnan(summary["seeded_captures_per_100_plies"])
+
+
+def test_captures_per_100_plies_falls_as_games_lengthen():
+    """The direction the metric has to move in. Same six captures, three times
+    the plies: a third of the rate. If this ever reads flat, the indicator
+    cannot distinguish a bloodbath from positional play."""
+    short = summarise_generation(
+        [_capture_game(1, plies=30, max_plies=400, handicap=(0, 0), captures_before_last=5)]
+    )
+    long = summarise_generation(
+        [_capture_game(1, plies=90, max_plies=400, handicap=(0, 0), captures_before_last=5)]
+    )
+    assert short["captures_per_100_plies"] == pytest.approx(20.0)
+    assert long["captures_per_100_plies"] == pytest.approx(20.0 / 3.0)
+
+
+def test_captures_split_by_seeding():
+    """Seeded games need one capture to finish and unseeded ones need six, so a
+    pooled rate moves with the curriculum even when neither population does."""
+    games = [
+        _capture_game(1, plies=50, max_plies=200, handicap=(0, 0), captures_before_last=5),
+        _capture_game(2, plies=10, max_plies=200, handicap=(5, 5), captures_before_last=0),
+    ]
+    summary = summarise_generation(games)
+    assert summary["unseeded_mean_captures"] == pytest.approx(6.0)
+    assert summary["seeded_mean_captures"] == pytest.approx(1.0)
+    assert summary["unseeded_captures_per_100_plies"] == pytest.approx(12.0)
+    assert summary["seeded_captures_per_100_plies"] == pytest.approx(10.0)
+    assert summary["captures_per_100_plies"] == pytest.approx(100.0 * 7 / 60)
+
+
+def test_captures_are_nan_for_games_exported_before_the_metric_existed():
+    """An old `runs/` directory must read back as "not measured", never as zero
+    captures — which would look like the best positional play ever recorded."""
+    game = _capture_game(1, plies=30, max_plies=200, handicap=(0, 0), captures_before_last=5)
+    del game["result"]["captures_in_play"]
+    summary = summarise_generation([game])
+    assert math.isnan(summary["captures_per_100_plies"])
+    assert math.isnan(summary["mean_captures"])
+    # Everything else is still measurable from an old export.
+    assert summary["mean_plies"] == pytest.approx(30.0)
+
+
+# --------------------------------------------------------------------------- #
+# entropy gap, the full split, and the `selfplay/` namespace                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_policy_entropy_gap_is_uniform_minus_target():
+    """MODEL.md §8.2 states the criterion as a gap. Reporting it directly means
+    a reader checks the criterion instead of subtracting two logged numbers."""
+    n_legal = 62
+    idxs = tuple(range(n_legal))
+    peaked = (800 - (n_legal - 1),) + (1,) * (n_legal - 1)
+    summary = summarise_generation(
+        [export_game(make_game(n_plies=2, child_idxs=idxs, child_visits=peaked), "r", 0)]
+    )
+    assert summary["policy_entropy_gap"] == pytest.approx(
+        summary["policy_uniform_entropy"] - summary["policy_target_entropy"]
+    )
+    assert summary["policy_entropy_gap"] > 0.0
+
+    flat = summarise_generation(
+        [export_game(make_game(n_plies=2, child_idxs=idxs, child_visits=(8,) * n_legal), "r", 0)]
+    )
+    # The pathological case: search learned nothing, so the gap is zero.
+    assert flat["policy_entropy_gap"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_every_rate_is_reported_on_both_sides_of_the_split():
+    """No rate may exist pooled-only or on one side only: a reader comparing
+    generations needs the same key set every time."""
+    summary = summarise_generation(
+        [
+            _capture_game(1, plies=30, max_plies=200, handicap=(0, 0), captures_before_last=5),
+            _capture_game(2, plies=10, max_plies=200, handicap=(4, 1), captures_before_last=0),
+        ]
+    )
+    split_keys = {
+        "decisive_rate",
+        "draw_rate",
+        "black_win_rate",
+        "white_win_rate",
+        "natural_termination_rate",
+        "mean_plies",
+        "mean_abs_score_diff",
+        "mean_captures",
+        "captures_per_100_plies",
+        "full_search_rate",
+        "positions",
+    }
+    for key in split_keys:
+        assert f"unseeded_{key}" in summary, key
+        assert f"seeded_{key}" in summary, key
+    # `natural_termination_rate` bare is the UNSEEDED rate — the curriculum
+    # control signal — not a pooled one. `model/curriculum.py` reads it.
+    assert summary["natural_termination_rate"] == summary["unseeded_natural_termination_rate"]
+    assert summary["unseeded_positions"] + summary["seeded_positions"] == summary["positions"]
+
+
+def test_selfplay_metrics_namespaces_every_number_and_drops_the_histogram():
+    summary = summarise_generation(
+        [_capture_game(1, plies=30, max_plies=200, handicap=(0, 0), captures_before_last=5)]
+    )
+    metrics = selfplay_metrics(summary)
+
+    assert all(k.startswith(SELFPLAY_PREFIX) for k in metrics)
+    assert all(isinstance(v, float) for v in metrics.values())
+    assert f"{SELFPLAY_PREFIX}captures_per_100_plies" in metrics
+    assert f"{SELFPLAY_PREFIX}policy_entropy_gap" in metrics
+    assert f"{SELFPLAY_PREFIX}positions" in metrics
+    assert f"{SELFPLAY_PREFIX}seeded_games" in metrics
+    assert f"{SELFPLAY_PREFIX}unseeded_games" in metrics
+    # The handicap histogram is the one non-scalar, and it is not renamed into
+    # the scalar namespace under a misleading name.
+    assert f"{SELFPLAY_PREFIX}handicap_distribution" not in metrics
+    assert set(summary) - {k[len(SELFPLAY_PREFIX):] for k in metrics} == {
+        "handicap_distribution"
+    }
+    json.dumps(metrics)
+
+
+def test_selfplay_metrics_is_a_different_namespace_from_the_validation_ones():
+    """`selfplay/policy_target_entropy` is the training signal and it moves.
+    `val_frozen/data_policy_target_entropy` is a constant. Reading one for the
+    other is the mistake the namespaces exist to prevent, so they must not
+    collide."""
+    assert SELFPLAY_PREFIX not in (VAL_FROZEN_PREFIX, VAL_ROLLING_PREFIX)
+    summary = summarise_generation(
+        [_capture_game(1, plies=30, max_plies=200, handicap=(0, 0), captures_before_last=5)]
+    )
+    keys = set(selfplay_metrics(summary))
+    assert not any(k.startswith((VAL_FROZEN_PREFIX, VAL_ROLLING_PREFIX)) for k in keys)
+    assert f"{SELFPLAY_PREFIX}policy_target_entropy" in keys
 
 
 def test_summary_is_json_serialisable():

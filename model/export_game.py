@@ -16,9 +16,15 @@ line of CLI output, and the names match `model/validate.py` deliberately.
 
 `summarise_generation` is also where the **curriculum control signal** is
 measured: `natural_termination_rate`, the fraction of unseeded games that reach
-six captures before the ply cap, plus the seeded/unseeded split of the decisive
-rate and mean |score| that a human reads to sanity-check it.
-`model/curriculum.py` turns that into a `handicap_rate` (MODEL.md §4).
+six captures before the ply cap, plus the seeded/unseeded split of *every* rate
+it reports, which a human reads to sanity-check it. `model/curriculum.py` turns
+that into a `handicap_rate` (MODEL.md §4).
+
+`selfplay_metrics(summary)` re-emits the whole block under the **`selfplay/`**
+namespace as plain numbers — properties of THIS generation's games, as opposed
+to `val_rolling/` and `val_frozen/` (model quality on held-out positions) and
+`buffer/` (what the training window contains). `summarise_generation` itself
+keeps bare keys because `model/curriculum.py` reads two of them directly.
 
 **Sign conventions — the easiest thing here to get wrong and the hardest to
 notice.** The shard stores `z`, `score_diff` and `q` POV-relative to the side to
@@ -90,12 +96,18 @@ SHARD_COLUMNS: tuple[str, ...] = (
 
 #: Columns the export actually reads. Projecting to these keeps the (large)
 #: capture-map and bitboard columns off the wire entirely.
+#:
+#: `black_losses` / `white_losses` are here for `captures_per_100_plies`: the
+#: capture *differential* in `score_diff` cannot recover the capture *total*,
+#: and the total is the bloodbath indicator.
 REQUIRED_COLUMNS: tuple[str, ...] = (
     "game_id",
     "seed",
     "opening",
     "handicap_black",
     "handicap_white",
+    "black_losses",
+    "white_losses",
     "turn",
     "ply",
     "max_plies",
@@ -375,6 +387,9 @@ def export_game(
             }
         )
 
+    plies = int(rows[-1]["ply"]) + 1
+    captures, captures_in_play = _capture_counts(rows, plies, max_plies)
+
     return {
         "run_id": str(run_id),
         "gen": int(gen),
@@ -386,10 +401,43 @@ def export_game(
         "result": {
             "outcome": outcome_name(next(iter(z_black))),
             "score_diff": next(iter(score_black)),
-            "plies": int(rows[-1]["ply"]) + 1,
+            "plies": plies,
+            # Marbles off the board at the end, and how many of those were
+            # earned rather than handed over by the curriculum. See
+            # `_capture_counts`.
+            "captures": captures,
+            "captures_in_play": captures_in_play,
         },
         "moves": moves,
     }
+
+
+def _capture_counts(
+    rows: Sequence[Mapping[str, Any]], plies: int, max_plies: int
+) -> tuple[int, int]:
+    """`(total captures at the end, captures made during play)`.
+
+    The shard records `black_losses` / `white_losses` **before** each move, so
+    the last row is the position the final move was played from and the final
+    move's own capture is in no row. Two facts close that gap:
+
+    * a move pushes off at most one marble (`Game::apply_with_capture` returns
+      at most one cell), so the miss is 0 or 1;
+    * a game that ended short of its ply cap ended *because* the sixth capture
+      landed, so on those the final move captured exactly one.
+
+    A capped game's final move is genuinely unknowable, and is counted as no
+    capture — an undercount of at most one marble across ~200 plies.
+
+    "During play" excludes the handicap the curriculum granted at seeding: a
+    game that starts at (3, 2) was given five captures, and counting those
+    would make every seeded game look like a bloodbath.
+    """
+    first = int(rows[0]["black_losses"]) + int(rows[0]["white_losses"])
+    last = int(rows[-1]["black_losses"]) + int(rows[-1]["white_losses"])
+    natural = max_plies > 0 and plies < max_plies
+    total = last + (1 if natural else 0)
+    return total, total - first
 
 
 def game_filename(game_id: int) -> str:
@@ -534,30 +582,87 @@ def terminated_naturally(game: Mapping[str, Any]) -> bool:
     return cap > 0 and plies < cap
 
 
+def captures_in_play(game: Mapping[str, Any]) -> float:
+    """Marbles pushed off during play, excluding the seeded head start.
+
+    `nan` for a game exported before `result.captures_in_play` existed, so an
+    old `runs/` directory reads back as "not measured" rather than as zero
+    captures.
+    """
+    try:
+        return float(game["result"]["captures_in_play"])
+    except (KeyError, TypeError, ValueError):
+        return NAN
+
+
 @dataclass
 class _Split:
-    """One half of the seeded / unseeded split of a generation's games."""
+    """One half of the seeded / unseeded split of a generation's games.
+
+    Every rate the summary reports is tracked on both sides. Seeded games start
+    a capture from the end and look nothing like unseeded ones; a pooled rate
+    is a weighted average of two different populations whose weights move with
+    the curriculum, which makes the pooled number move even when neither
+    population does.
+    """
 
     games: int = 0
     decisive: int = 0
+    draws: int = 0
+    black_wins: int = 0
+    white_wins: int = 0
     natural: int = 0
     plies: int = 0
     abs_score: int = 0
+    positions: int = 0
+    policy_rows: int = 0
+    #: Captures and plies over the games whose capture count is known, so a
+    #: mixture of new and pre-`captures_in_play` exports cannot silently
+    #: deflate the rate.
+    captures: int = 0
+    capture_games: int = 0
+    capture_plies: int = 0
 
-    def add(self, *, decisive: bool, natural: bool, plies: int, abs_score: int) -> None:
+    def add(
+        self,
+        *,
+        outcome: str,
+        natural: bool,
+        plies: int,
+        abs_score: int,
+        captures: float,
+        positions: int,
+        policy_rows: int,
+    ) -> None:
         self.games += 1
-        self.decisive += int(decisive)
+        self.decisive += int(outcome in (BLACK_WINS, WHITE_WINS))
+        self.draws += int(outcome == DRAW)
+        self.black_wins += int(outcome == BLACK_WINS)
+        self.white_wins += int(outcome == WHITE_WINS)
         self.natural += int(natural)
         self.plies += plies
         self.abs_score += abs_score
+        self.positions += positions
+        self.policy_rows += policy_rows
+        if not math.isnan(captures):
+            self.captures += int(captures)
+            self.capture_games += 1
+            self.capture_plies += plies
 
     def rates(self) -> dict[str, Any]:
         return {
             "games": self.games,
+            "positions": self.positions,
             "decisive_rate": _ratio(self.decisive, self.games),
+            "draw_rate": _ratio(self.draws, self.games),
+            "black_win_rate": _ratio(self.black_wins, self.games),
+            "white_win_rate": _ratio(self.white_wins, self.games),
             "natural_termination_rate": _ratio(self.natural, self.games),
             "mean_plies": _ratio(self.plies, self.games),
             "mean_abs_score_diff": _ratio(self.abs_score, self.games),
+            "mean_captures": _ratio(self.captures, self.capture_games),
+            "captures_per_100_plies": _ratio(100.0 * self.captures, self.capture_plies),
+            "full_search_rate": _ratio(self.policy_rows, self.positions),
         }
 
 
@@ -582,18 +687,26 @@ def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
 
     `mean_legal_moves` is the mean number of root children in the search result,
     which for a fully-expanded root is the legal-move count.
+
+    **`captures_per_100_plies` is the positional-maturity proxy.** Six captures
+    inside ~30 moves is one every five moves — a bloodbath, and evidence that
+    *both* sides are defending badly rather than that either is attacking well.
+    As skill rises this should FALL while `mean_plies` rises. The two moving
+    together in the wrong direction (short games, high capture rate) is the
+    signature of a network that has learned to end games without learning to
+    play them.
+
+    Every rate is reported three times: pooled, `unseeded_*` and `seeded_*`. The
+    pooled figure is a mixture whose weights are set by the curriculum, so it
+    moves when the handicap rate moves even if neither population changed.
     """
     n_games = 0
-    outcomes: Counter[str] = Counter()
     handicaps: Counter[str] = Counter()
-    plies_total = 0
-    abs_score_total = 0
 
     unseeded = _Split()
     seeded = _Split()
+    overall = _Split()
 
-    positions = 0
-    policy_rows = 0
     entropy_total = 0.0
     entropy_n = 0
     legal_total = 0
@@ -605,24 +718,15 @@ def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         outcome = str(result["outcome"])
         plies = int(result["plies"])
         abs_score = abs(int(result["score_diff"]))
-        outcomes[outcome] += 1
         handicaps[f"{int(game['handicap'][0])}-{int(game['handicap'][1])}"] += 1
-        plies_total += plies
-        abs_score_total += abs_score
 
-        split = unseeded if is_unseeded(game) else seeded
-        split.add(
-            decisive=outcome in (BLACK_WINS, WHITE_WINS),
-            natural=terminated_naturally(game),
-            plies=plies,
-            abs_score=abs_score,
-        )
-
+        game_positions = 0
+        game_policy_rows = 0
         for move in game["moves"]:
-            positions += 1
+            game_positions += 1
             if not move["is_full_search"]:
                 continue
-            policy_rows += 1
+            game_policy_rows += 1
             counts = [int(v) for _, v in move["visits"]]
             entropy = visit_entropy(counts)
             if not math.isnan(entropy):
@@ -630,6 +734,18 @@ def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 entropy_n += 1
             legal_total += len(counts)
             legal_n += 1
+
+        stats = {
+            "outcome": outcome,
+            "natural": terminated_naturally(game),
+            "plies": plies,
+            "abs_score": abs_score,
+            "captures": captures_in_play(game),
+            "positions": game_positions,
+            "policy_rows": game_policy_rows,
+        }
+        overall.add(**stats)
+        (unseeded if is_unseeded(game) else seeded).add(**stats)
 
     mean_legal = _ratio(legal_total, legal_n)
     target_entropy = _ratio(entropy_total, entropy_n)
@@ -639,39 +755,74 @@ def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         if uniform_entropy and uniform_entropy > 0 and not math.isnan(target_entropy)
         else NAN
     )
+    # Reported directly because the success criterion is stated as a gap
+    # (MODEL.md §8.2: "policy-target entropy well below ln(branching)"), and a
+    # reader should not have to subtract two logged numbers to check it.
+    gap = (
+        uniform_entropy - target_entropy
+        if not (math.isnan(uniform_entropy) or math.isnan(target_entropy))
+        else NAN
+    )
 
-    decisive = outcomes[BLACK_WINS] + outcomes[WHITE_WINS]
+    pooled = overall.rates()
     unseeded_rates = unseeded.rates()
     seeded_rates = seeded.rates()
-    return {
+    out: dict[str, Any] = {
         "games": n_games,
-        "positions": positions,
-        "policy_rows": policy_rows,
-        "full_search_rate": _ratio(policy_rows, positions),
-        "decisive_rate": _ratio(decisive, n_games),
-        "draw_rate": _ratio(outcomes[DRAW], n_games),
-        "black_win_rate": _ratio(outcomes[BLACK_WINS], n_games),
-        "white_win_rate": _ratio(outcomes[WHITE_WINS], n_games),
-        "mean_plies": _ratio(plies_total, n_games),
-        "mean_abs_score_diff": _ratio(abs_score_total, n_games),
+        "positions": overall.positions,
+        "policy_rows": overall.policy_rows,
         "handicap_distribution": dict(sorted(handicaps.items())),
         # ---- the curriculum control signal (MODEL.md §4) ----
         "unseeded_games": unseeded.games,
+        "seeded_games": seeded.games,
         "natural_terminations": unseeded.natural,
         "natural_termination_rate": unseeded_rates["natural_termination_rate"],
-        "unseeded_decisive_rate": unseeded_rates["decisive_rate"],
-        "unseeded_mean_plies": unseeded_rates["mean_plies"],
-        "unseeded_mean_abs_score_diff": unseeded_rates["mean_abs_score_diff"],
-        "seeded_games": seeded.games,
-        "seeded_natural_termination_rate": seeded_rates["natural_termination_rate"],
-        "seeded_decisive_rate": seeded_rates["decisive_rate"],
-        "seeded_mean_plies": seeded_rates["mean_plies"],
-        "seeded_mean_abs_score_diff": seeded_rates["mean_abs_score_diff"],
         # ---- the training signal ----
         "policy_target_entropy": target_entropy,
         "policy_uniform_entropy": uniform_entropy,
         "policy_entropy_ratio": ratio,
+        "policy_entropy_gap": gap,
         "mean_legal_moves": mean_legal,
+    }
+    # Pooled rates keep their bare names; the two splits are the same key set
+    # under `unseeded_` / `seeded_`, so nothing is reported on one side only.
+    # `natural_termination_rate` is the exception: bare, it has always meant the
+    # UNSEEDED rate, because that is the curriculum control signal and a pooled
+    # one would be dominated by seeded games that finish trivially.
+    for key, value in pooled.items():
+        if key not in ("games", "positions", "natural_termination_rate"):
+            out[key] = value
+    for prefix, rates in (("unseeded_", unseeded_rates), ("seeded_", seeded_rates)):
+        for key, value in rates.items():
+            if key == "games":
+                continue
+            out[f"{prefix}{key}"] = value
+    return out
+
+
+#: Namespace for `summarise_generation`: properties of THIS generation's
+#: self-play data. Distinct from `val_*` (model quality on held-out positions)
+#: and `buffer/` (what the training window contains).
+SELFPLAY_PREFIX = "selfplay/"
+
+
+def selfplay_metrics(
+    summary: Mapping[str, Any], prefix: str = SELFPLAY_PREFIX
+) -> dict[str, float]:
+    """`summarise_generation` output as a flat, namespaced block of numbers.
+
+    Every value is a plain `int` or `float` and every key carries `prefix`, so a
+    caller can log the whole dict generically. `handicap_distribution` is the
+    only entry dropped — it is a histogram, and it belongs in `metrics.jsonl`
+    rather than in a scalar series.
+
+    `summarise_generation` itself keeps bare keys: `model/curriculum.py` reads
+    `natural_termination_rate` and `unseeded_games` straight off it.
+    """
+    return {
+        f"{prefix}{k}": float(v)
+        for k, v in summary.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
     }
 
 
@@ -713,6 +864,14 @@ def format_generation_report(result: ExportResult, max_skipped: int = 5) -> list
             f"   mean |score| {_fmt(summary['mean_abs_score_diff'])}"
             f"   full-search {_pct(summary['full_search_rate'])}"
         )
+        # Should FALL as plies rise. Both moving the other way is a network
+        # that has learned to end games without learning to play them.
+        lines.append(
+            f"  captures/100 plies {_fmt(summary.get('captures_per_100_plies'), 2)}"
+            f"   (unseeded {_fmt(summary.get('unseeded_captures_per_100_plies'), 2)}"
+            f"   seeded {_fmt(summary.get('seeded_captures_per_100_plies'), 2)})"
+            f"   mean captures in play {_fmt(summary.get('mean_captures'), 2)}"
+        )
         # The split the curriculum controller reads. Seeded games start a capture
         # from the end and look nothing like unseeded ones; averaging the two
         # together is what makes a raw decisive rate unreadable.
@@ -737,6 +896,7 @@ def format_generation_report(result: ExportResult, max_skipped: int = 5) -> list
             f"  policy target entropy {_fmt(summary['policy_target_entropy'], 3)}"
             f"   vs ln(mean legal {_fmt(summary['mean_legal_moves'], 1)})"
             f" = {_fmt(summary['policy_uniform_entropy'], 3)}"
+            f"   gap {_fmt(summary.get('policy_entropy_gap'), 3)}"
             f"   ratio {_fmt(summary['policy_entropy_ratio'], 3)}"
         )
         ratio = summary["policy_entropy_ratio"]

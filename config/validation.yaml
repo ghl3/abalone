@@ -1,20 +1,27 @@
 # Validation run — "is the training signal back?"
 #
 # This is the gate the previous run lacked (roadmap Phase 2, acceptance
-# criteria). Six generations, ~60 games each at 400 full simulations, about an
-# hour. It is not a training run: it exists to answer one question fast and
-# cheaply, and to be stopped on if the answer is no.
+# criteria). Six generations at 400 full simulations, about an hour. It is not
+# a training run: it exists to answer one question fast and cheaply, and to be
+# stopped on if the answer is no.
 #
-# Pass requires all four, read off the per-generation summary line and
-# metrics.jsonl:
+# Pass requires all five, read off `uv run python -m model.report --run latest`:
 #
-#   1. mean_plies              < 180
+#   1. policy entropy gap (Hgap) rising and well clear of zero
 #   2. decisive_rate           > 0.40
-#   3. policy_target_entropy   < policy_uniform_entropy − 0.3
-#                              (equivalently policy_entropy_ratio well under 1)
-#   4. val_value_ce falling, and train_loss_value > 0.05 and moving
+#   3. val CE falling on the ROLLING holdout, and val_rolling loss not pulling
+#      away from the training loss (that gap is memorisation, not learning)
+#   4. natural termination of unseeded games rising off zero
+#   5. the ladder still has resolution — NOT every rung clamped
 #
 # If any fail, stop and diagnose. Do not scale up.
+#
+# The 60-games/generation predecessor to this file measured self-play at ~40 s
+# a generation against a 21–26 minute anchor ladder: self-play was never the
+# bottleneck and was starved anyway (the buffer shrank from 8.8k positions to
+# 4.0k as games shortened, which turned a fixed 1500-step cap into 20 raw
+# epochs over the same data). Games per generation are up 3.3x and the step
+# budget is now expressed in epochs; see the arithmetic under `train`.
 seed: 0
 gens: 6
 runs_root: runs
@@ -27,7 +34,12 @@ net_preset: small
 use_coreml: true
 
 self_play:
-  games_per_gen: 60
+  # 200, not 60. Measured: 60 games took ~40 s of the ~40 s generation that was
+  # not ladder, so ~0.67 s/game; 200 games is ~2.2 min and still an order of
+  # magnitude under the ladder. What 60 games actually cost was the buffer —
+  # 4.0k positions by generation 6, which no step budget can make into enough
+  # distinct data.
+  games_per_gen: 200
   # One game per file: training sees fresh data within a minute or two
   # instead of waiting for an 8-game shard to rotate.
   shard_games_per_file: 1
@@ -52,16 +64,16 @@ self_play:
   handicap_rate: 0.7
   handicap_max: 5
   handicap_anneal:
-    # The controller is configured but will *not* fire in this run, by
-    # arithmetic: 60 games at rate 0.7 leaves ~18 unseeded per generation,
-    # below min_unseeded_games, so every generation logs a hold with
-    # "insufficient sample" as the reason. That is correct — six generations
-    # of a small network have no business retiring the curriculum, and an
-    # 18-game estimate of natural termination is noise. Left on rather than
-    # set to `off` so the log line, and the reason, are exercised here too.
+    # At 200 games and rate 0.7 there are ~60 unseeded games a generation,
+    # comfortably over min_unseeded_games, so unlike the 60-game predecessor
+    # this run's controller does have a sample to act on and will move.
     mode: controller
     target_natural_termination: 0.25
     step: 0.05
+    # The step scales with signal/target, capped at 4x. The predecessor run sat
+    # at natural_termination_rate = 1.00 from generation 4 — four times the
+    # target — and still crawled 0.05 a generation.
+    max_step_multiple: 4.0
     floor: 0.10
     min_unseeded_games: 20
     schedule: {}
@@ -71,8 +83,22 @@ self_play:
   capture_gamma: 0.98
 
 train:
-  steps_per_gen_min: 400
-  steps_per_gen_max: 1500
+  # The arithmetic, because the old numbers were wrong by an order of magnitude.
+  #
+  #   200 games x 70-150 plies      = 14k-30k positions per generation
+  #   replay_buffer_gens: 6         => the window tops out near 75k positions
+  #   1.5 epochs over 20k positions = 1.5 * 20000 / 256 =  117 steps
+  #   1.5 epochs over 75k positions = 1.5 * 75000 / 256 =  440 steps
+  #
+  # So steps_per_gen_min binds early (250 steps over a 20k buffer is ~3.2
+  # epochs, which is fine when there is only one generation of data) and the
+  # epoch target binds once the window fills. For contrast, the predecessor's
+  # 1500-step cap over its 19k generation-3 buffer was
+  # 1500 * 256 / 19000 = 20.2 raw epochs — in a single generation.
+  steps_per_gen_min: 250
+  steps_per_gen_max: 1000
+  target_epochs_per_gen: 1.5
+  epochs_per_gen_warn: 8.0
   batch_size: 256
   learning_rate: 1.0e-3
   # Six generations is too short for a decay to pay; kept explicit so the
@@ -98,22 +124,54 @@ train:
 
 validation:
   enabled: true
+  # The frozen ruler. Comparable across the run, and a drift indicator only:
+  # by generation 6 it is scoring the network on generation-1 positions.
   holdout_gen: 1
   every_gens: 1
   positions: 4096
   batch_size: 512
   seed: 20260727
   entropy_ratio_warn: 0.95
+  overfit_warn_delta: 0.35
+  rolling:
+    # 10% of every generation's own games, withheld from that generation's
+    # training and never sampled again. Costs a tenth of the data and buys the
+    # only clean overfitting signal in the run.
+    enabled: true
+    every_gens: 1
+    fraction: 0.10
+    positions: 4096
 
 anchor_ladder:
-  # Twice in six generations. Enough to see a direction; a ladder is not what
-  # this run is for.
+  # Twice in six generations (gens 3 and 6). Enough to see a direction.
+  #
+  # Cost, from the predecessor run's own timings: a checkpoint rung took 744 s
+  # for 12 games at 400 sims across 9 threads (~372 s per 9-game wave). At 200
+  # sims that halves, and 20 games is 3 waves rather than 2:
+  #
+  #   2 floor rungs x 12 games       ~  230 s
+  #   2 checkpoint rungs x 20 games  ~  2 x 558 s = 1116 s
+  #                                  -------------------------
+  #                                  ~ 22 min per ladder
+  #
+  # About what the old 4-rung 12-game ladder cost — but that one measured
+  # nothing at generation 6, because all four rungs clamped. `eval-match` is
+  # ~7.6x less efficient per NN evaluation than `selfplay-batch` (2.1k vs 16k
+  # evals/s aggregate on the same machine); fixing that in Rust is the real
+  # answer to ladder cost, and `every_gens` is the knob until then.
   every_gens: 3
   run_on_final_gen: true
-  games: 12
-  simulations: 400
-  opponents: [random, heuristic@100, heuristic@800]
+  games: 20
+  floor_games: 12
+  simulations: 200
+  # Floor only. `heuristic@800` is gone: its evaluator saturates `tanh` at one
+  # capture of margin, its weights were tuned under the old 400-ply rules, and
+  # a 1.1M-parameter network beat it at generation 3 after 180 games.
+  opponents: [random, heuristic@100]
   frozen_gens: [1]
+  # gen - 2. At gen 3 it resolves onto gen 1 and deduplicates against
+  # frozen_gens; at gen 6 it is gen 4, which is the rung with resolution left.
+  trailing_gens: [2]
   batch_size: 32
   c_puct: 1.4
   opening: belgian

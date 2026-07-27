@@ -4,9 +4,11 @@
 # config/validation.yaml has passed its four acceptance criteria; scaling up a
 # run whose training signal is empty just buys more empty data.
 #
-# Success looks like: decisive rate > 40%, mean plies < 180, policy target
-# entropy well below ln(branching), value CE falling on the holdout, and a
-# ladder Elo curve that goes up.
+# Success looks like (MODEL.md §8.2): >= +100 Elo per 10 generations against
+# frozen checkpoints with intervals that exclude zero, games *lengthening*
+# toward 120-200 plies while natural termination stays high, and
+# captures_per_100_plies falling. Read it with
+# `uv run python -m model.report --run latest`.
 seed: 0
 gens: 12
 runs_root: runs
@@ -16,7 +18,11 @@ net_preset: base
 use_coreml: true
 
 self_play:
-  games_per_gen: 200
+  # 400. MODEL.md §9 budgets 200 games x ~150 plies x playout-cap-randomised
+  # 200/800 sims at ~10M evaluations, i.e. ~5 min a generation batched, so 400
+  # games is ~10 min — still under half of what one anchor ladder costs, and it
+  # doubles the distinct positions the step budget below is spread over.
+  games_per_gen: 400
   shard_games_per_file: 2
   worker_threads: null   # null = (cores - 1)
   # Playout cap randomisation (MODEL.md §7.2): most moves run the fast budget,
@@ -44,6 +50,9 @@ self_play:
     mode: controller
     target_natural_termination: 0.25
     step: 0.05
+    # Proportional: step x clamp(signal/target, 1, 4). A saturated signal
+    # retires the curriculum in three generations rather than twelve.
+    max_step_multiple: 4.0
     floor: 0.10
     min_unseeded_games: 20
     schedule: {}
@@ -53,11 +62,24 @@ self_play:
   capture_gamma: 0.98
 
 train:
-  steps_per_gen_min: 1000
-  # Self-play is CPU-bound and training is GPU-bound, so the extra steps run on
-  # wall-clock that would otherwise be idle. The cap stops a fixed buffer being
-  # oversampled into overfitting.
+  # The arithmetic:
+  #
+  #   400 games x ~100 plies      = ~40k positions per generation
+  #   replay_buffer_gens: 8       => the window tops out near 320k positions
+  #   1.5 epochs over  40k        = 1.5 *  40000 / 256 =  234 steps
+  #   1.5 epochs over 320k        = 1.5 * 320000 / 256 = 1875 steps
+  #
+  # so steps_per_gen_min binds for the first two or three generations (400
+  # steps over a 40k buffer is 2.6 epochs) and the epoch target binds
+  # thereafter, never approaching steps_per_gen_max. The old 4000-step cap over
+  # an early 40k buffer would have been 25.6 raw epochs in one generation.
+  # Self-play is CPU-bound and training is GPU-bound, so these steps run on
+  # wall-clock that would otherwise be idle — but idle wall-clock is not a
+  # reason to make twenty passes over the same positions.
+  steps_per_gen_min: 400
   steps_per_gen_max: 4000
+  target_epochs_per_gen: 1.5
+  epochs_per_gen_warn: 8.0
   batch_size: 256
   learning_rate: 1.0e-3
   # Step decay keyed to generation milestones (MODEL.md §8).
@@ -83,21 +105,42 @@ train:
 
 validation:
   enabled: true
+  # The frozen ruler: comparable end to end, and a drift indicator only.
   holdout_gen: 1
   every_gens: 1
   positions: 8192
   batch_size: 512
   seed: 20260727
   entropy_ratio_warn: 0.95
+  overfit_warn_delta: 0.35
+  rolling:
+    # The set worth gating on: 10% of every generation's own games, withheld
+    # from that generation's training and never sampled again.
+    enabled: true
+    every_gens: 1
+    fraction: 0.10
+    positions: 8192
 
 anchor_ladder:
-  every_gens: 3
+  # Gens 4, 8, 12. Sparser than the old every-3 because the ladder is the
+  # single most expensive phase of a generation — measured at ~2.1k NN
+  # evaluations/s aggregate against `selfplay-batch`'s ~16k on the same
+  # machine, so a rung costs several times what the same games cost in
+  # self-play. Budget ~25 min per ladder here.
+  every_gens: 4
   run_on_final_gen: true
-  games: 24
-  simulations: 400
-  # `heuristic@800` at equal simulation count is the milestone (MODEL.md §8.2).
-  opponents: [random, heuristic@100, heuristic@800]
+  games: 32
+  floor_games: 16
+  simulations: 200
+  # Floor anchors only — a sanity check, not a milestone. `heuristic@800` is
+  # retired (MODEL.md §8.2): its evaluator cannot tell one capture of margin
+  # from four, and a 1.1M network beat it after 180 games.
+  opponents: [random, heuristic@100]
+  # Fixed reference points; these are what the headline Elo averages.
   frozen_gens: [1, 6]
+  # The moving rung. It improves as the network does, so unlike every fixed
+  # anchor it still has resolution at generation 12.
+  trailing_gens: [4]
   batch_size: 32
   c_puct: 1.4
   opening: belgian

@@ -5,9 +5,12 @@
 # evaluation plus CoreML is what makes that a few minutes rather than an hour,
 # so `use_coreml: true` is not optional here.
 #
-# Expect the first genuinely non-random play around gen 10, and the milestone —
-# beating heuristic@800 at equal simulation count — somewhere past gen 30, if
-# it comes at all.
+# The milestones are in MODEL.md §8.2 and none of them mention the heuristic:
+# sustained >= +100 Elo per 10 generations against frozen checkpoints with
+# intervals excluding zero, and games *lengthening* toward 120-200 plies with
+# captures_per_100_plies falling while natural termination stays high. Expect
+# the first genuinely non-random play around gen 10. Read a run back with
+# `uv run python -m model.report --run latest`.
 seed: 0
 gens: 50
 runs_root: runs
@@ -17,7 +20,11 @@ net_preset: base
 use_coreml: true
 
 self_play:
-  games_per_gen: 200
+  # 400. §9 budgets 200 games at ~10M evaluations, ~5 min a generation batched,
+  # so 400 is ~10 min — under a third of one anchor ladder. Doubling games is
+  # the cheapest way to buy distinct positions, and distinct positions are what
+  # the step budget below is divided by.
+  games_per_gen: 400
   shard_games_per_file: 4
   worker_threads: null   # null = (cores - 1)
   sims_fast: 200
@@ -46,6 +53,11 @@ self_play:
     mode: controller
     target_natural_termination: 0.25
     step: 0.05
+    # The step is proportional to signal/target, capped at 4x. A fixed step
+    # ignores the size of its own error signal: the validation run measured the
+    # signal at 4x target for three consecutive generations and still moved
+    # 0.05 each time.
+    max_step_multiple: 4.0
     # A permanent 10% trickle: 5–4 capture positions are strategically critical
     # and essentially never visited by self-play from a fresh start.
     floor: 0.10
@@ -59,8 +71,23 @@ self_play:
   capture_gamma: 0.98
 
 train:
-  steps_per_gen_min: 1000
+  # The arithmetic:
+  #
+  #   400 games x ~100 plies   = ~40k positions per generation
+  #   replay_buffer_gens: 20   => the window tops out near 800k positions
+  #   1.5 epochs over  40k     = 1.5 *  40000 / 256 =  234 steps
+  #   1.5 epochs over 800k     = 1.5 * 800000 / 256 = 4688 steps
+  #
+  # so steps_per_gen_min binds while the window fills (500 steps over a 40k
+  # buffer is 3.2 epochs) and the epoch target takes over from about
+  # generation 3, arriving just under steps_per_gen_max once the window is
+  # full. Each position is therefore seen ~1.5 times per generation for the 20
+  # generations it lives in the buffer — ~30 times in total, against the
+  # ~120 the old fixed cap implied.
+  steps_per_gen_min: 500
   steps_per_gen_max: 5000
+  target_epochs_per_gen: 1.5
+  epochs_per_gen_warn: 8.0
   batch_size: 256
   learning_rate: 1.0e-3
   # Step decay keyed to generation milestones. A constant LR for fifty
@@ -88,22 +115,58 @@ train:
 
 validation:
   enabled: true
+  # The frozen ruler. Comparable for fifty generations, and by generation 50 a
+  # measure of drift away from generation 1 rather than of generalisation.
   holdout_gen: 1
   every_gens: 1
   positions: 8192
   batch_size: 512
   seed: 20260727
   entropy_ratio_warn: 0.95
+  overfit_warn_delta: 0.35
+  rolling:
+    # The set worth gating on. 10% of each generation's own games, withheld
+    # from that generation's training and never sampled again — same
+    # distribution as the training data, provably never seen, so the gap
+    # between val_rolling loss and training loss is memorisation and nothing
+    # else. Costs a tenth of the data.
+    enabled: true
+    every_gens: 1
+    fraction: 0.10
+    positions: 8192
 
 anchor_ladder:
+  # Ten ladders over the run, plus the final one.
+  #
+  # Cost, measured: `eval-match` sustains ~2.1k NN evaluations/s aggregate on
+  # an M1 Pro against `selfplay-batch`'s ~16k, so a checkpoint rung is ~186 s
+  # per 9-game wave at 200 sims. This ladder is
+  #
+  #   2 floor rungs x 12 games      ~   4 min
+  #   3 checkpoint rungs x 32 games ~  37 min   (4 waves each)
+  #                                 -----------
+  #                                 ~ 41 min per ladder, ~7 h over the run
+  #
+  # against ~8 h of self-play. That ratio is uncomfortable and the honest fix
+  # is `eval-match`'s throughput, not fewer games — a rung with 12 games is a
+  # ±145 Elo interval and measures nothing. Until then, `every_gens: 10` is the
+  # cheapest knob and costs only resolution in time.
   every_gens: 5
   run_on_final_gen: true
-  games: 40
-  simulations: 400
-  opponents: [random, heuristic@100, heuristic@800]
-  # Frozen earlier checkpoints: "am I beating my past self" is the other half
-  # of the ladder, and it is the one that catches a silent regression.
-  frozen_gens: [1, 10, 25]
+  games: 32
+  floor_games: 12
+  simulations: 200
+  # Floor anchors: losing to these is a bug, beating them is not a result.
+  # `heuristic@800` is retired as a milestone and as a rung (MODEL.md §8.2).
+  opponents: [random, heuristic@100]
+  # Fixed reference points, spanning the run: "am I beating my past self" is
+  # what gives a monotone curve, and it is what catches a silent regression.
+  # These are the rungs the headline Elo averages.
+  frozen_gens: [1, 25]
+  # The moving rung: gen - 5 improves as the network does, so it is the one
+  # still resolving anything at generation 45. Excluded from the headline mean
+  # precisely because it moves.
+  trailing_gens: [5]
   batch_size: 32
   c_puct: 1.4
   opening: belgian

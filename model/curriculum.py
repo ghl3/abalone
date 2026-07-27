@@ -39,11 +39,28 @@ row, and `score_diff` is a differential rather than a count. Rather than guess,
 `AnnealStats.from_summary` reports the signal as unmeasurable when the rule is
 on and the controller holds the rate for the whole run.
 
-**The rule is a ratchet.** Monotone non-increasing, one step per generation, and
-it never goes below `floor`. A curriculum does not go backwards: if the network
-regresses, holding is the right response, and re-teaching it endgames it already
-knows is not. Monotone also means the loop cannot oscillate, which is what makes
-a controller this crude safe to leave unattended for 50 generations.
+**The rule is a ratchet.** Monotone non-increasing, one decision per generation,
+and it never goes below `floor`. A curriculum does not go backwards: if the
+network regresses, holding is the right response, and re-teaching it endgames it
+already knows is not. Monotone also means the loop cannot oscillate, which is
+what makes a controller this crude safe to leave unattended for 50 generations.
+
+**The step is proportional to how far above target the signal sits.** The step
+actually taken is
+
+```
+    step × clamp(natural_termination_rate / target, 1, max_step_multiple)
+```
+
+A fixed step ignores the magnitude of its own error signal, and that is not a
+theoretical complaint: the six-generation validation run measured
+`natural_termination_rate = 1.00` from generation 4 — *four times* the 0.25
+target, the signal completely saturated — and still stepped 0.05 a generation,
+going 0.70 → 0.50 in six generations with eight more needed to reach the 0.10
+floor. At `max_step_multiple: 4` the same run reaches the floor in three. The
+clamp is what keeps it a ratchet rather than a controller with gain: the step
+never *shrinks* below the configured one, and never exceeds K of them, so a
+single lucky generation cannot dump the whole curriculum.
 """
 
 from __future__ import annotations
@@ -142,6 +159,25 @@ def scheduled_rate(schedule: Mapping[Any, Any], gen: int) -> float | None:
         if gen >= key:
             best = float(schedule[key])
     return best
+
+
+def step_multiple(signal: float, target: float, max_multiple: float) -> float:
+    """How many configured steps this generation's signal has earned.
+
+    `clamp(signal / target, 1, max_multiple)`. Only called once the signal is
+    known to be at or above the target, so the lower clamp is a formality that
+    also makes the function total: a target of 0 (every generation fires) and a
+    `nan` signal both fall back to exactly one step rather than to a division
+    that would silently retire the entire curriculum in one generation.
+    """
+    ceiling = max(float(max_multiple), 1.0)
+    try:
+        s, t = float(signal), float(target)
+    except (TypeError, ValueError):
+        return 1.0
+    if math.isnan(s) or math.isnan(t) or t <= 0.0:
+        return ceiling if t == 0.0 and not math.isnan(s) else 1.0
+    return min(max(s / t, 1.0), ceiling)
 
 
 def resolve_initial_rate(state_rate: float | None, cfg_rate: float) -> float:
@@ -245,7 +281,9 @@ def decide_handicap_rate(
             f"{target_str}; the floor is permanent endgame coverage, not a bug)",
         )
 
-    new_rate = max(floor, _round(previous - cfg.step))
+    multiple = step_multiple(ntr, cfg.target_natural_termination, cfg.max_step_multiple)
+    taken = _round(cfg.step * multiple)
+    new_rate = max(floor, _round(previous - taken))
     return AnnealDecision(
         rate=new_rate,
         previous=previous,
@@ -253,7 +291,8 @@ def decide_handicap_rate(
         reason=REASON_STEPPED,
         message=(
             f"handicap {previous:.2f} → {new_rate:.2f} ({sample}, at or above "
-            f"{target_str}; step {cfg.step:.2f}, floor {floor:.2f})"
+            f"{target_str}; step {cfg.step:.2f} × {multiple:.2f} = {taken:.3f}, "
+            f"floor {floor:.2f})"
         ),
     )
 
@@ -271,4 +310,5 @@ __all__ = [
     "decide_handicap_rate",
     "resolve_initial_rate",
     "scheduled_rate",
+    "step_multiple",
 ]

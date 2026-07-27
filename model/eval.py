@@ -15,6 +15,15 @@ grow more; `cls(**d)` on a fixed dataclass turns every future field into a
 `TypeError` at the worst possible moment (after the match has been played).
 Known fields are promoted to attributes, everything else stays reachable
 through `raw` / `get()` / `[]`.
+
+**A clamped rung is a bound, not a measurement.** When a match ends 12-0-0 the
+score is 1.0, the Elo estimate is `+inf`, and `eval-match` reports the
+sample-size bound instead with `elo_a_clamped: true`. Every rung of the
+six-generation validation run's generation-6 ladder came back clamped at the
+same +545, and the mean over them was reported as if it were a number. Anything
+that aggregates rungs here also reports `clamped_fraction`, and `ladder_summary`
+emits `ladder/all_clamped` so the loop can say out loud that the ladder has run
+out of resolution.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ import math
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,10 +41,11 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: A player spec: `random`, `heuristic`, `heuristic@800`, `model:p.onnx`,
-#: `model:p.onnx@400`. The `@N` suffix is a per-player simulation override and
-#: is the whole point of the ladder — `heuristic@100` and `heuristic@800` are
-#: different opponents, and "beats heuristic@800 at equal sims" is the
-#: milestone (MODEL.md §8.2).
+#: `model:p.onnx@400`. The `@N` suffix is a per-player simulation override:
+#: `heuristic@100` and `heuristic@800` are different opponents, and a frozen
+#: checkpoint played at the ladder's own simulation budget is a fair rung.
+#: Beating `heuristic@800` is no longer a milestone (MODEL.md §8.2) — a 1.1M
+#: network cleared it after 180 games — but the spec grammar is unchanged.
 _SPEC_RE = re.compile(r"^(?:random|heuristic|model:.+?)(?:@(\d+))?$")
 
 #: A match of more than this many games that produced no more distinct
@@ -42,6 +53,18 @@ _SPEC_RE = re.compile(r"^(?:random|heuristic|model:.+?)(?:@(\d+))?$")
 #: regression signal for the determinism bug of review §3.2, where a 21-game
 #: gate was really 2 games.
 DETERMINISM_GAMES_FLOOR = 2
+
+#: The three kinds of ladder rung (see `AnchorLadderConfig`). Only the kind
+#: decides whether a rung's Elo belongs in the headline mean: `FLOOR` and
+#: `FROZEN` are fixed references, `TRAILING` moves with the network.
+KIND_FLOOR = "floor"
+KIND_FROZEN = "frozen"
+KIND_TRAILING = "trailing"
+LADDER_KINDS = (KIND_FLOOR, KIND_FROZEN, KIND_TRAILING)
+
+#: Kinds whose strength does not change between generations, and which may
+#: therefore be averaged into a curve that is comparable end to end.
+FIXED_REFERENCE_KINDS = frozenset({KIND_FLOOR, KIND_FROZEN})
 
 
 def _bin(name: str) -> Path:
@@ -157,6 +180,40 @@ class MatchResult:
         )
 
 
+def opponent_label(spec: str) -> str:
+    """Short display name for a ladder rung. Frozen checkpoints are passed to
+    `eval-match` as absolute paths, and an absolute path in a log line buries
+    the numbers it is there to show."""
+    if spec.startswith("model:"):
+        head, sep, sims = spec[len("model:") :].partition("@")
+        return f"model:{Path(head).name}" + (sep + sims if sep else "")
+    return spec
+
+
+@dataclass(frozen=True)
+class LadderOpponent:
+    """One rung to play: what, how many games, and what role it plays.
+
+    Games are per-rung rather than per-ladder because the rungs are not the
+    same kind of question. A floor anchor answers "is anything catastrophically
+    broken", which needs a handful of games; a checkpoint rung answers "how much
+    stronger am I than N generations ago", which needs enough games for the
+    confidence interval to exclude zero.
+    """
+
+    spec: str
+    games: int
+    kind: str = KIND_FLOOR
+
+    @property
+    def label(self) -> str:
+        return opponent_label(self.spec)
+
+    @property
+    def is_fixed_reference(self) -> bool:
+        return self.kind in FIXED_REFERENCE_KINDS
+
+
 @dataclass
 class LadderRung:
     """One anchor-ladder match: the opponent spec and what it measured."""
@@ -165,6 +222,9 @@ class LadderRung:
     result: MatchResult
     #: False when the rung was skipped (e.g. a frozen checkpoint not on disk).
     played: bool = True
+    #: One of `LADDER_KINDS`. Defaults to `floor` so a bare
+    #: `LadderRung(opponent, result)` is still meaningful.
+    kind: str = KIND_FLOOR
 
     @property
     def elo(self) -> float:
@@ -173,6 +233,30 @@ class LadderRung:
     @property
     def score(self) -> float:
         return self.result.score_a
+
+    @property
+    def clamped(self) -> bool:
+        """True when the score hit 0 or 1 and the Elo is a sample-size bound
+        rather than an estimate."""
+        return bool(self.result.elo_a_clamped)
+
+    @property
+    def label(self) -> str:
+        return opponent_label(self.opponent)
+
+    @property
+    def is_fixed_reference(self) -> bool:
+        return self.kind in FIXED_REFERENCE_KINDS
+
+    def elo_str(self) -> str:
+        """Elo with its 95% CI, always — an Elo without one is an opinion."""
+        r = self.result
+        if math.isnan(r.elo_a):
+            return "n/a"
+        ci = ""
+        if not math.isnan(r.elo_a_ci95_lo) and not math.isnan(r.elo_a_ci95_hi):
+            ci = f" [{r.elo_a_ci95_lo:+.0f}, {r.elo_a_ci95_hi:+.0f}]"
+        return f"{r.elo_a:+.0f}{ci}" + (" (bound)" if self.clamped else "")
 
 
 # --------------------------------------------------------------------------- #
@@ -346,8 +430,7 @@ def run_eval_match(
 def run_ladder(
     *,
     model_onnx: Path,
-    opponents: list[str],
-    games: int,
+    opponents: Sequence[LadderOpponent],
     simulations: int,
     c_puct: float,
     eval_dir: Path,
@@ -366,23 +449,23 @@ def run_ladder(
 ) -> list[LadderRung]:
     """Play `model_onnx` against each opponent in turn and return the rungs.
 
-    Fixed anchors are the whole point: they give a monotone Elo curve that
-    self-play gating cannot (MODEL.md §8.1). Each match gets its own seed
-    derived from `(seed, rung index)` so rungs are independent but the ladder
-    as a whole is reproducible. `on_rung(rung)` is called after each match so
-    the caller can log progress without waiting for the whole ladder.
+    Each match gets its own seed derived from `(seed, rung index)` so rungs are
+    independent but the ladder as a whole is reproducible. `on_rung(rung)` is
+    called after each match so the caller can log progress — and cost — without
+    waiting for the whole ladder, which is the single most expensive phase of a
+    generation.
     """
     eval_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
     rungs: list[LadderRung] = []
     for i, opponent in enumerate(opponents):
-        tag = _slug(opponent)
+        tag = _slug(opponent.spec)
         log_path = logs_dir / f"gen_{gen:03d}_ladder_{tag}.log"
         with open(log_path, "w") as logf:
             result = run_eval_match(
                 player_a=model_spec(model_onnx),
-                player_b=opponent,
-                games=games,
+                player_b=opponent.spec,
+                games=opponent.games,
                 simulations=simulations,
                 c_puct=c_puct,
                 batch_size=batch_size,
@@ -398,7 +481,7 @@ def run_ladder(
                 stdout=logf,
                 stderr=subprocess.STDOUT,
             )
-        rung = LadderRung(opponent=opponent, result=result)
+        rung = LadderRung(opponent=opponent.spec, result=result, kind=opponent.kind)
         rungs.append(rung)
         if on_rung is not None:
             on_rung(rung)
@@ -414,28 +497,112 @@ def _slug(spec: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", spec).strip("_") or "player"
 
 
-def mean_elo(rungs: list[LadderRung], *, exclude_prefix: str = "model:") -> float:
-    """Mean Elo over the *fixed* rungs — the ones whose strength does not move
-    between generations.
+def _measured(rungs: Sequence[LadderRung]) -> list[LadderRung]:
+    return [r for r in rungs if r.played and not math.isnan(r.elo)]
 
-    Frozen earlier checkpoints are excluded by default: they are useful as a
-    "did we beat our past self" check, but averaging against a moving reference
-    would make the tracked best-checkpoint number meaningless.
+
+def mean_elo(rungs: Sequence[LadderRung]) -> float:
+    """Mean Elo over the rungs with a *fixed* reference strength — the floor
+    anchors and the absolute frozen checkpoints.
+
+    Trailing rungs (`gen − k`) are excluded: they get stronger every time the
+    network does, so averaging them in would flatten by construction the very
+    curve the ladder exists to draw.
+
+    Clamped rungs are *included*, because a clamp is a lower bound on strength
+    and dropping the rungs that were swept would bias the mean downward exactly
+    when the network is doing well. That makes the mean a lower bound too, and
+    is precisely why `ladder_summary` reports `clamped_fraction` beside it and
+    the loop refuses to print one without the other.
     """
-    vals = [
-        r.elo
-        for r in rungs
-        if r.played and not r.opponent.startswith(exclude_prefix) and not math.isnan(r.elo)
-    ]
+    vals = [r.elo for r in _measured(rungs) if r.is_fixed_reference]
     return sum(vals) / len(vals) if vals else float("nan")
+
+
+def clamped_fraction(rungs: Sequence[LadderRung]) -> float:
+    """Fraction of the measured rungs whose Elo is a sample-size bound.
+
+    At 1.0 the ladder measured nothing: every opponent was swept, and the
+    "+545" that comes out is a property of the game count, not of the network.
+    """
+    measured = _measured(rungs)
+    if not measured:
+        return float("nan")
+    return sum(1 for r in measured if r.clamped) / len(measured)
+
+
+def ladder_summary(rungs: Sequence[LadderRung]) -> dict[str, float]:
+    """Flat, already-namespaced `ladder/…` metrics for one ladder.
+
+    Per-rung numbers are always emitted — the headline mean is a convenience,
+    not the result. Every Elo comes with its 95% interval, and every rung with
+    the flag saying whether that interval is real.
+    """
+    measured = _measured(rungs)
+    out: dict[str, float] = {
+        "ladder/rungs": float(len(rungs)),
+        "ladder/rungs_measured": float(len(measured)),
+        "ladder/rungs_clamped": float(sum(1 for r in measured if r.clamped)),
+        "ladder/clamped_fraction": clamped_fraction(rungs),
+        "ladder/all_clamped": float(bool(measured) and all(r.clamped for r in measured)),
+        "ladder/elo_mean": mean_elo(rungs),
+        "ladder/seconds": float(
+            sum(
+                r.result.elapsed_seconds
+                for r in rungs
+                if not math.isnan(r.result.elapsed_seconds)
+            )
+        ),
+    }
+    # The mean's own interval: independent matches, so the standard errors add
+    # in quadrature. Reported so nobody quotes a mean Elo bare.
+    ses = [
+        r.result.elo_a_stderr
+        for r in measured
+        if r.is_fixed_reference and not math.isnan(r.result.elo_a_stderr)
+    ]
+    if ses:
+        se = math.sqrt(sum(s * s for s in ses)) / len(ses)
+        out["ladder/elo_mean_stderr"] = se
+        out["ladder/elo_mean_ci95_lo"] = out["ladder/elo_mean"] - 1.96 * se
+        out["ladder/elo_mean_ci95_hi"] = out["ladder/elo_mean"] + 1.96 * se
+
+    for kind in LADDER_KINDS:
+        vals = [r.elo for r in measured if r.kind == kind]
+        if vals:
+            out[f"ladder/elo_mean_{kind}"] = sum(vals) / len(vals)
+
+    for rung in rungs:
+        tag = _slug(rung.opponent)
+        r = rung.result
+        out[f"ladder/elo/{tag}"] = r.elo_a
+        out[f"ladder/elo_ci95_lo/{tag}"] = r.elo_a_ci95_lo
+        out[f"ladder/elo_ci95_hi/{tag}"] = r.elo_a_ci95_hi
+        out[f"ladder/score/{tag}"] = r.score_a
+        out[f"ladder/score_stderr/{tag}"] = r.score_a_stderr
+        out[f"ladder/clamped/{tag}"] = float(rung.clamped)
+        out[f"ladder/games/{tag}"] = float(r.games)
+        out[f"ladder/mean_plies/{tag}"] = r.mean_plies
+        out[f"ladder/distinct_transcripts/{tag}"] = float(r.distinct_transcripts)
+        out[f"ladder/seconds/{tag}"] = r.elapsed_seconds
+    return out
 
 
 __all__ = [
     "DETERMINISM_GAMES_FLOOR",
+    "FIXED_REFERENCE_KINDS",
+    "KIND_FLOOR",
+    "KIND_FROZEN",
+    "KIND_TRAILING",
+    "LADDER_KINDS",
+    "LadderOpponent",
     "LadderRung",
     "MatchResult",
+    "clamped_fraction",
+    "ladder_summary",
     "mean_elo",
     "model_spec",
+    "opponent_label",
     "run_eval_match",
     "run_ladder",
     "start_self_play",

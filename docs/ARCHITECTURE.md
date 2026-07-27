@@ -206,17 +206,29 @@ One generation, end to end:
 
   3. export           checkpoint .pt  +  ONNX (EMA weights)
 
-  4. validate         held-out policy top-1, value CE, calibration
+  4. validate         two holdouts: the frozen generation (a fixed ruler,
+                      hence a drift indicator) and this generation's own
+                      withheld slice (current distribution, never trained
+                      on — the one to gate on).  MODEL §8.1
                       data health: decisive rate, plies, target entropy
                       curriculum: ratchet handicap_rate on the natural
                       termination rate of unseeded games (MODEL §4.1)
 
-  5. anchor ladder    every 5 gens: vs random / heuristic@100 /
-                      heuristic@800 / frozen earlier checkpoints → Elo
+  5. anchor ladder    every N gens: floor anchors (random, heuristic@100)
+                      plus frozen and trailing checkpoints of this run
+                      → Elo per rung, each with its 95% interval
 
   6. commit           append metrics.jsonl, TensorBoard scalars,
                       apply retention, atomically advance state.json
 ```
+
+**Metrics are namespaced and logged generically.** Each measurement module
+returns a flat dict under its own prefix — `selfplay/` (`model/export_game.py`),
+`buffer/` (`model/replay_buffer.py`), `val_frozen/` and `val_rolling/`
+(`model/validate.py`), and `train/`, `curriculum/`, `ladder/`, `perf/` (the
+loop) — and the loop iterates whatever it is handed. There is no whitelist, so
+a metric added downstream reaches `metrics.jsonl` and TensorBoard without the
+loop being edited. `uv run python -m model.report --run latest` reads it back.
 
 **Self-play and training overlap by design.** Self-play is CPU-bound across all
 cores; training is GPU/MPS-bound. Running them concurrently within a generation

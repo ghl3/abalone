@@ -62,13 +62,31 @@ class GenRecord:
     train_loss_capture_map: float | None = None
     train_grad_norm: float | None = None
     learning_rate: float | None = None
+    #: Raw passes over the replay buffer this generation, D6 augmentation
+    #: ignored. 20 of these in one generation is overfitting by construction.
+    train_epochs_over_buffer: float | None = None
 
     # -- held-out validation (MODEL.md §8.1) --
+    # `val_*` is the FROZEN holdout: a fixed ruler, and therefore a drift
+    # indicator — by generation 30 it scores the network on positions a
+    # thirty-generation-weaker network produced. `val_rolling_*` is this
+    # generation's own withheld games, never trained on: same distribution as
+    # the training data, which is what makes it the one worth gating on.
     val_loss_total: float | None = None
     val_policy_top1: float | None = None
     val_policy_entropy_ratio: float | None = None
     val_value_ce: float | None = None
     val_value_accuracy: float | None = None
+    #: Rows this generation withheld from its own training and never sampled
+    #: again. `None`/0 means no slice was taken — the guard fires when the pool
+    #: outside the generation is below `train.replay_buffer_min_size`. A resume
+    #: re-takes the slice only for generations that recorded one here, so a
+    #: generation that was trained on in full stays that way.
+    rolling_holdout_positions: int | None = None
+    val_rolling_loss_total: float | None = None
+    val_rolling_policy_top1: float | None = None
+    val_rolling_value_ce: float | None = None
+    val_rolling_value_accuracy: float | None = None
 
     # -- data health, from the exported games --
     decisive_rate: float | None = None
@@ -76,6 +94,10 @@ class GenRecord:
     mean_abs_score_diff: float | None = None
     policy_target_entropy: float | None = None
     policy_uniform_entropy: float | None = None
+    policy_entropy_gap: float | None = None
+    #: Captures per 100 plies. Falling while `mean_plies` rises is competent
+    #: defence emerging (MODEL.md §8.2); the reverse is a brawl.
+    captures_per_100_plies: float | None = None
 
     # -- curriculum (MODEL.md §4) --
     #: Seeding rate self-play actually used for this generation.
@@ -87,7 +109,13 @@ class GenRecord:
     natural_termination_rate: float | None = None
 
     # -- strength --
+    #: Mean Elo over the *fixed-reference* rungs (floor anchors and absolute
+    #: frozen checkpoints). Never quoted without its interval and the clamped
+    #: fraction: when every rung is swept the "Elo" is the sample-size bound.
     ladder_elo: float | None = None
+    ladder_elo_ci95_lo: float | None = None
+    ladder_elo_ci95_hi: float | None = None
+    ladder_clamped_fraction: float | None = None
 
     # -- accounting --
     self_play_seconds: float | None = None

@@ -33,6 +33,7 @@ from model.curriculum import (
     decide_handicap_rate,
     resolve_initial_rate,
     scheduled_rate,
+    step_multiple,
 )
 from model.state import GenRecord, RunState
 
@@ -84,10 +85,14 @@ def test_uniformly_random_play_does_not_move_the_rate() -> None:
 
 def test_a_network_that_finishes_games_moves_the_rate() -> None:
     """The other side of the same coin: natural termination is what rises when
-    the network actually learns to close a game out."""
+    the network actually learns to close a game out.
+
+    0.30 against a 0.25 target is a multiple of 1.2, so the step is
+    0.05 x 1.2 = 0.06.
+    """
     d = decide_handicap_rate(0.7, stats(0.30), controller(), gen=8)
     assert d.stepped
-    assert d.rate == pytest.approx(0.65)
+    assert d.rate == pytest.approx(0.64)
     assert d.reason == REASON_STEPPED
 
 
@@ -98,7 +103,8 @@ def test_a_network_that_finishes_games_moves_the_rate() -> None:
 
 def test_the_target_itself_fires() -> None:
     """`>=`, not `>`: a target you can sit exactly on and never trigger is a
-    target that silently means something else."""
+    target that silently means something else. Exactly on target is a multiple
+    of 1, i.e. the configured step and no more."""
     d = decide_handicap_rate(0.7, stats(0.25), controller(), gen=3)
     assert d.stepped and d.rate == pytest.approx(0.65)
 
@@ -153,12 +159,49 @@ def test_the_no_progress_rule_makes_the_signal_unmeasurable() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_one_step_per_generation_at_most() -> None:
-    """A signal at 100% does not buy four steps. The ratchet is deliberately
-    slower than the evidence: each step changes the data distribution the next
-    measurement is made from."""
+def test_the_step_is_proportional_to_how_far_above_target_the_signal_is() -> None:
+    """The fix for the timidity the validation run exposed.
+
+    `natural_termination_rate` hit 1.00 at generation 4 — four times the 0.25
+    target, the signal completely saturated — and a fixed 0.05 step still
+    needed eight more generations to reach the floor. The step now scales with
+    `signal / target`, so a 4x signal buys 4x the step and the crutch comes out
+    in three generations instead of fourteen.
+    """
     d = decide_handicap_rate(0.7, stats(1.0), controller(), gen=3)
-    assert d.rate == pytest.approx(0.65)
+    assert d.stepped
+    assert d.rate == pytest.approx(0.50)  # 0.7 - 0.05 * 4
+
+
+def test_the_multiplier_is_clamped_at_both_ends() -> None:
+    """Below the target the controller holds, so the lower clamp never bites in
+    practice; above `max_step_multiple` it does, and it is what keeps this a
+    ratchet rather than a controller with gain. One lucky generation must not
+    be able to dump the entire curriculum."""
+    assert step_multiple(0.25, 0.25, 4.0) == pytest.approx(1.0)
+    assert step_multiple(0.10, 0.25, 4.0) == pytest.approx(1.0)
+    assert step_multiple(0.50, 0.25, 4.0) == pytest.approx(2.0)
+    assert step_multiple(1.00, 0.25, 4.0) == pytest.approx(4.0)
+    # A target so low that every signal saturates still cannot exceed K.
+    assert step_multiple(1.00, 0.01, 4.0) == pytest.approx(4.0)
+
+
+def test_a_saturated_signal_still_cannot_punch_through_the_floor() -> None:
+    cfg = controller(max_step_multiple=4.0)
+    rate = 0.7
+    for gen in range(1, 20):
+        d = decide_handicap_rate(rate, stats(1.0), cfg, gen=gen)
+        assert d.rate >= cfg.floor
+        rate = d.rate
+    assert rate == pytest.approx(cfg.floor)
+
+
+def test_max_step_multiple_of_one_is_the_old_fixed_step() -> None:
+    """The escape hatch, pinned: whatever the signal, K=1 moves exactly
+    `step`."""
+    for signal in (0.25, 0.5, 1.0):
+        d = decide_handicap_rate(0.7, stats(signal), controller(max_step_multiple=1.0), gen=3)
+        assert d.rate == pytest.approx(0.65)
 
 
 def test_the_rate_never_increases_when_the_signal_collapses() -> None:
@@ -166,13 +209,19 @@ def test_the_rate_never_increases_when_the_signal_collapses() -> None:
     right response: it already knows the endgames, and re-teaching them costs
     the generations that were supposed to be learning openings."""
     rate = 0.7
+    # 0.40 / 0.25 = 1.6, so the step is 0.05 * 1.6 = 0.08.
     rate = decide_handicap_rate(rate, stats(0.40), controller(), gen=3).rate
-    assert rate == pytest.approx(0.65)
+    assert rate == pytest.approx(0.62)
+    stepped = 0
     for gen, signal in enumerate([0.0, 0.05, 0.9999, 0.0], start=4):
         after = decide_handicap_rate(rate, stats(signal), controller(), gen=gen)
         assert after.rate <= rate + 1e-12, "the curriculum must never go backwards"
+        stepped += after.stepped
         rate = after.rate
-    assert rate == pytest.approx(0.60)  # only the 0.9999 generation stepped
+    assert stepped == 1, "only the 0.9999 generation is at or above target"
+    # 0.9999 / 0.25 = 3.9996, just under the clamp, so that generation moved
+    # 0.05 * 3.9996 = 0.19998.
+    assert rate == pytest.approx(0.42002)
 
 
 def test_the_floor_is_reached_exactly_and_never_overshot() -> None:
@@ -197,12 +246,20 @@ def test_at_the_floor_it_holds_and_says_so() -> None:
 
 def test_repeated_stepping_does_not_accumulate_float_noise() -> None:
     """0.7 - 0.05 - 0.05 is 0.5999999999999999 in binary floating point, and
-    that noise ends up in `state.json` and in every log line."""
+    that noise ends up in `state.json` and in every log line. A signal sitting
+    exactly on the target gives a multiple of 1, so this is the plain
+    three-times-0.05 arithmetic."""
     rate = 0.7
     for gen in range(1, 4):
-        rate = decide_handicap_rate(rate, stats(0.9), controller(), gen=gen).rate
+        rate = decide_handicap_rate(rate, stats(0.25), controller(), gen=gen).rate
     assert rate == 0.55
     assert repr(rate) == "0.55"
+
+
+def test_a_proportional_step_is_rounded_too() -> None:
+    """0.7 - 0.05*1.6 is 0.6200000000000001 without the rounding."""
+    d = decide_handicap_rate(0.7, stats(0.40), controller(), gen=3)
+    assert repr(d.rate) == "0.62"
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +362,7 @@ def test_the_annealed_rate_round_trips_through_state_json(tmp_path: Path) -> Non
     path = tmp_path / "state.json"
     state = RunState.fresh("run-x", "hash", "sha", handicap_rate=0.7)
     state.handicap_rate = decide_handicap_rate(
-        state.handicap_rate, stats(0.4), controller(), gen=3
+        state.handicap_rate, stats(0.25), controller(), gen=3
     ).rate
     state.current_gen = 3
     state.append_history(GenRecord(gen=3, handicap_rate=0.7, handicap_rate_next=0.65))
@@ -373,7 +430,7 @@ def test_the_rate_reaches_the_self_play_command_line(monkeypatch, tmp_path: Path
     state = RunState.fresh("run-x", "hash", handicap_rate=0.7)
     for gen in range(1, 4):
         state.handicap_rate = decide_handicap_rate(
-            state.handicap_rate, stats(0.9), controller(), gen=gen
+            state.handicap_rate, stats(0.25), controller(), gen=gen
         ).rate
 
     eval_mod.start_self_play(
