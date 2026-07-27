@@ -206,10 +206,10 @@ One generation, end to end:
 
   3. export           checkpoint .pt  +  ONNX (EMA weights)
 
-  4. validate         two holdouts: the frozen generation (a fixed ruler,
-                      hence a drift indicator) and this generation's own
-                      withheld slice (current distribution, never trained
-                      on — the one to gate on).  MODEL §8.1
+  4. validate         two holdouts: a bounded slice of an early generation
+                      (a fixed ruler, hence a drift indicator) and this
+                      generation's own withheld slice (current distribution,
+                      never trained on — the one to gate on).  MODEL §8.1
                       data health: decisive rate, plies, target entropy
                       curriculum: ratchet handicap_rate on the natural
                       termination rate of unseeded games (MODEL §4.1)

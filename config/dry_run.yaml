@@ -6,9 +6,10 @@
 # small to learn anything; do not read the numbers as evidence about the model.
 #
 # Three generations is the minimum that exercises everything: gen 1 produces the
-# frozen holdout, gen 2 validates against it and plays gen 1 as a frozen ladder
-# rung, gen 3 is the first generation with enough trainable data outside itself
-# to take a rolling holdout and the first with a distinct trailing rung.
+# frozen holdout (bounded — most of gen 1 stays trainable), gen 2 validates
+# against it, takes the first rolling holdout and plays gen 1 as a frozen ladder
+# rung, gen 3 is the first with a distinct trailing rung and the first to evict
+# a generation around its frozen slice.
 # Target wall-clock: a few minutes.
 seed: 0
 gens: 3
@@ -97,6 +98,12 @@ validation:
   holdout_gen: 1
   every_gens: 1
   positions: 512
+  # Deliberately far below a generation's ~300 positions, so the dry run
+  # actually exercises the bound: gen 1 gives up ~3 of its 6 games and keeps
+  # the rest as training data. Left at null (= `positions`) it would swallow
+  # the whole generation at this scale, which is the bug this knob exists to
+  # prevent — and gen 2's rolling holdout would be skipped for want of a pool.
+  holdout_positions: 96
   batch_size: 128
   seed: 20260727
   entropy_ratio_warn: 0.95
@@ -106,8 +113,8 @@ validation:
     every_gens: 1
     # A large fraction because the generation is tiny: 20% of 6 games rounds up
     # to two whole games, which is the smallest slice that is a slice at all.
-    # Gen 2 is skipped automatically (gen 1 is the frozen holdout, so there is
-    # nothing else to train on); gen 3 is where this actually fires.
+    # Fires from gen 2 now that the frozen holdout leaves gen 1's remainder in
+    # the trainable pool.
     fraction: 0.2
     positions: 256
 

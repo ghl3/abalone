@@ -68,7 +68,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -306,6 +306,25 @@ def epochs_over_buffer(steps: int, batch_size: int, buffer_size: int) -> float:
     return steps * batch_size / buffer_size
 
 
+def tb_step_offset(history: Sequence[GenRecord]) -> int:
+    """TensorBoard global-step base for the next generation: the SGD steps every
+    completed generation actually ran.
+
+    This used to be `(gen - 1) * steps_per_gen_min`, which is only correct while
+    every generation runs exactly the minimum. The budget is now *derived* from
+    `train.target_epochs_per_gen`, so a generation exceeds the minimum as soon
+    as the buffer is large enough — and then generation N+1 starts at an offset
+    already inside generation N's range. Curves overlay each other and the
+    x-axis silently stops being a timeline.
+
+    Accumulated from `state.history`, which `state.json` persists, so it
+    survives a resume without a schema change. A generation redone after a crash
+    reuses its own offset and overwrites its aborted attempt, which is what a
+    redo should do.
+    """
+    return sum(int(r.train_steps or 0) for r in history)
+
+
 def epochs_alarm(epochs: float | None, threshold: float) -> bool:
     """True when a single generation made far too many passes over the same
     positions. Overfitting the buffer looks like progress on the training loss
@@ -515,7 +534,12 @@ def _dump_config(cfg: RunConfig, workers_resolved: str) -> None:
     if va.enabled:
         p(
             f"    frozen:              gen {va.holdout_gen}, every {va.every_gens} gen(s), "
-            f"{va.positions} positions, entropy-ratio warn > {va.entropy_ratio_warn}"
+            f"{va.positions} positions/pass, entropy-ratio warn > {va.entropy_ratio_warn}"
+        )
+        p(
+            f"                         ~{va.frozen_holdout_positions()} positions withheld "
+            f"by whole game (drift indicator — never gate on it); the rest of gen "
+            f"{va.holdout_gen} stays trainable"
         )
         if va.rolling.enabled and va.rolling.every_gens > 0:
             p(
@@ -831,6 +855,7 @@ def _train_phase(
     writer: SummaryWriter | None = None,
     phase_start_time: float | None = None,
     hold_rolling: bool = False,
+    step_offset: int = 0,
 ) -> tuple[int, StepMetrics | None, float, float]:
     """Train while self-play runs. The exit rule is dynamic:
 
@@ -888,10 +913,6 @@ def _train_phase(
         )
 
     max_steps = hard_max
-    # TB global step uses the *minimum* as the per-gen budget so plots line up
-    # across generations even when the actual step count varies.
-    step_offset = (new_gen - 1) * min_steps
-
     steps_done = 0
     sums = dict.fromkeys(
         (
@@ -1007,11 +1028,7 @@ def _train_phase(
         if steps_done >= min_steps and not sp_alive_now:
             break
 
-        trainable = buffer.total_size() - (
-            buffer.chunk_size(new_gen) - buffer.rolling_holdout_size(new_gen)
-            if exclude
-            else 0
-        )
+        trainable = buffer.total_size() - (buffer.trainable_size(new_gen) if exclude else 0)
         if trainable < cfg.train.replay_buffer_min_size:
             if sp_alive_now:
                 time.sleep(poll_interval)
@@ -1172,9 +1189,12 @@ def _validation_phase(
         cfg=cfg,
         kind="frozen",
         prefix=VAL_FROZEN_PREFIX,
+        # Against the *frozen slice*, not the whole holdout generation — most
+        # of that generation is trainable data and scoring it as held out would
+        # report training loss under a validation name.
         positions=min(
             cfg.validation.positions,
-            max(buffer.chunk_size(cfg.validation.holdout_gen), 1) * 4,
+            max(buffer.holdout_size(cfg.validation.holdout_gen), 1) * 4,
         ),
         device=device,
         loss_weights=loss_weights,
@@ -1608,9 +1628,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     if restored:
         _log(f"rolling holdout: {restored} position(s) restored across resumed generations")
+    # Re-take the frozen slice for the same reason the rolling ones are re-taken
+    # above: selection is deterministic in `(seed, gen)` and idempotent, so this
+    # reproduces exactly the rows the original run withheld.
     if cfg.validation.enabled and holdout_gen <= state.current_gen:
-        buffer.mark_holdout(holdout_gen)
-        _log(f"holdout: gen {holdout_gen} frozen ({buffer.holdout_size()} positions)")
+        held = buffer.mark_holdout(
+            holdout_gen,
+            count=cfg.validation.frozen_holdout_positions(),
+            seed=cfg.validation.seed,
+        )
+        _log(
+            f"holdout: gen {holdout_gen} frozen ({held} of "
+            f"{buffer.chunk_size(holdout_gen)} positions; the rest is trainable)"
+        )
 
     rng = np.random.default_rng(cfg.seed + state.current_gen)
     sp_state: list[subprocess.Popen | None] = [None]
@@ -1774,6 +1804,7 @@ def _run_outer_loop(
             writer=writer,
             phase_start_time=sp_t,
             hold_rolling=hold_rolling,
+            step_offset=tb_step_offset(state.history),
         )
         sp_state[0] = None
         sp_log_file.close()
@@ -2053,10 +2084,16 @@ def _run_outer_loop(
             and new_gen == cfg.validation.holdout_gen
             and buffer.chunk_size(new_gen) > 0
         ):
-            buffer.mark_holdout(new_gen)
+            held = buffer.mark_holdout(
+                new_gen,
+                count=cfg.validation.frozen_holdout_positions(),
+                seed=cfg.validation.seed,
+            )
             _log(
                 f"holdout: gen {new_gen} frozen as the validation set "
-                f"({buffer.chunk_size(new_gen)} positions); it will not be trained on again",
+                f"({held} of {buffer.chunk_size(new_gen)} positions, by whole game); "
+                f"it will not be trained on again. The remaining "
+                f"{buffer.trainable_size(new_gen)} stay in the training pool",
                 gen=new_gen,
                 total_gens=cfg.gens,
             )

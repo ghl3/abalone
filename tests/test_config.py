@@ -487,6 +487,21 @@ def test_empty_lr_schedule_is_constant() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_frozen_holdout_size_tracks_validation_positions_by_default() -> None:
+    """Evaluating on more rows than a validation pass draws is data thrown away
+    for nothing, so the bound follows `positions` unless it is set explicitly."""
+    assert ValidationConfig().frozen_holdout_positions() == ValidationConfig().positions
+    assert ValidationConfig(positions=2048).frozen_holdout_positions() == 2048
+    assert ValidationConfig(positions=2048, holdout_positions=500).frozen_holdout_positions() == 500
+
+
+def test_a_frozen_holdout_of_zero_is_rejected(tmp_path: Path) -> None:
+    """0 would freeze nothing and leave `val_frozen/` permanently empty — which
+    reads exactly like "validation is disabled" and is not."""
+    with pytest.raises(ValueError, match=r"validation\.holdout_positions must be > 0"):
+        RunConfig(validation=ValidationConfig(holdout_positions=0)).validate()
+
+
 def test_rolling_holdout_never_claims_the_frozen_generation() -> None:
     """Generation 1 is the frozen holdout and is trained on during its own
     generation because there is nothing else. Withholding a slice of it too

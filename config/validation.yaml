@@ -129,6 +129,10 @@ validation:
   holdout_gen: 1
   every_gens: 1
   positions: 4096
+  # Positions withheld from gen 1, by whole game — a bound, not the whole
+  # generation. Matching `positions`: a pass can never score more than that, so
+  # anything above it is training data given up for nothing.
+  holdout_positions: 4096
   batch_size: 512
   seed: 20260727
   entropy_ratio_warn: 0.95

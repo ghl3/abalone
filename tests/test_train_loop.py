@@ -54,6 +54,7 @@ from model.train_loop import (
     retention_victims,
     should_run_ladder,
     should_validate,
+    tb_step_offset,
 )
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +327,67 @@ def test_alarm_matches_the_arithmetic_it_stands_for() -> None:
     assert entropy_ratio_alarm(target_entropy / uniform_entropy, 0.95)
     # A distribution concentrated on ~4 moves is healthy.
     assert not entropy_ratio_alarm(math.log(4) / uniform_entropy, 0.95)
+
+
+# --------------------------------------------------------------------------- #
+# TensorBoard step offsets                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def _hist(*steps: int) -> list[GenRecord]:
+    return [GenRecord(gen=i + 1, train_steps=n) for i, n in enumerate(steps)]
+
+
+def test_step_offset_is_zero_before_any_generation_has_run() -> None:
+    assert tb_step_offset([]) == 0
+
+
+def test_step_offsets_do_not_collide_when_a_generation_exceeds_the_minimum() -> None:
+    """The regression this replaced.
+
+    `(gen - 1) * steps_per_gen_min` only holds while every generation runs
+    exactly the minimum. The budget is derived from `target_epochs_per_gen`, so
+    a generation exceeds it as soon as the buffer is big enough — and then the
+    next generation starts *inside* the previous one's range, every chart
+    overlays itself and the x-axis stops being a timeline.
+    """
+    min_steps = 400
+    runs = [400, 900, 1500]  # gen 2 and 3 outgrew the minimum
+
+    old = [(gen - 1) * min_steps for gen in (1, 2, 3, 4)]
+    assert old[2] < old[1] + runs[1], "the old formula collides, as it must for this test"
+
+    offsets, history = [], []
+    for n in runs:
+        offsets.append(tb_step_offset(history))
+        history.append(GenRecord(gen=len(history) + 1, train_steps=n))
+    offsets.append(tb_step_offset(history))
+
+    # Each generation's range [offset+1, offset+steps] is strictly after the
+    # previous one's, and there are no gaps.
+    assert offsets == [0, 400, 1300, 2800]
+    for i, n in enumerate(runs):
+        assert offsets[i] + n == offsets[i + 1]
+
+
+def test_step_offset_survives_a_resume_from_state_json(tmp_path: Path) -> None:
+    """It is accumulated from `state.history`, which `state.json` persists — so
+    a resumed run picks up where the event file left off instead of overwriting
+    generation 1."""
+    state = RunState(run_id="r", config_hash="h")
+    for gen, n in ((1, 400), (2, 900), (3, 1500)):
+        state.append_history(GenRecord(gen=gen, train_steps=n))
+    path = tmp_path / "state.json"
+    state.save_atomic(path, fsync=False)
+
+    assert tb_step_offset(RunState.load(path).history) == 2800
+
+
+def test_step_offset_ignores_generations_that_took_no_steps() -> None:
+    """`train_steps` is `None` for a generation that never got a batch, and
+    `None` is not zero-ish enough for `sum` on its own."""
+    assert tb_step_offset([GenRecord(gen=1), GenRecord(gen=2, train_steps=7)]) == 7
+    assert tb_step_offset(_hist(0, 0, 5)) == 5
 
 
 # --------------------------------------------------------------------------- #

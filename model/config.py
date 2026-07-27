@@ -346,8 +346,12 @@ class RollingHoldoutConfig:
     generation's mean training loss is memorisation and nothing else.
 
     Skipped automatically whenever the trainable pool outside the generation is
-    below `train.replay_buffer_min_size` (generation 2, where generation 1 is
-    already the frozen holdout, is the case that matters).
+    below `train.replay_buffer_min_size`. That guard used to fire at generation
+    2 for a structural reason rather than a real one: the frozen holdout took
+    *all* of generation 1, leaving a pool of exactly zero, so the one measure
+    worth gating on never ran. `validation.holdout_positions` bounds the frozen
+    set, which leaves generation 1's remainder in the pool and lets this fire
+    from generation 2 onward.
     """
 
     enabled: bool = True
@@ -387,6 +391,22 @@ class ValidationConfig:
     #: Positions per validation pass. Sampled with a fixed seed, so the same
     #: rows come back every generation and the curve is comparable.
     positions: int = 4096
+    #: How much of `holdout_gen` is actually withheld, in positions, satisfied
+    #: by whole games. `null` means `positions`.
+    #:
+    #: **This is a bound, and it needs to be one.** Freezing the whole
+    #: generation — the original behaviour — cost a live run 57,699 training
+    #: positions at generation 2, because games are longest under random play
+    #: and generation 1 is the largest generation of the run. Withholding that
+    #: much to feed a drift indicator nothing may gate on is bad enough; it also
+    #: emptied the pool outside the current generation, which silently skipped
+    #: the *rolling* holdout — the measurement that can be gated on — and the
+    #: missing rolling metrics then produced a false "search is producing no
+    #: information" alarm off the frozen set's constant-by-construction data.
+    #:
+    #: The default is `positions` because a validation pass draws exactly that
+    #: many rows: withholding more is data thrown away for nothing.
+    holdout_positions: int | None = None
     batch_size: int = 512
     seed: int = 20260727
     #: WARN when `policy_target_entropy / policy_uniform_entropy` exceeds this.
@@ -400,6 +420,12 @@ class ValidationConfig:
     #: else. Absolute, in nats, because the total loss is a sum of CEs.
     overfit_warn_delta: float = 0.35
     rolling: RollingHoldoutConfig = field(default_factory=RollingHoldoutConfig)
+
+    def frozen_holdout_positions(self) -> int:
+        """Resolved size of the frozen holdout. `holdout_positions` when set,
+        otherwise `positions` — evaluating on more rows than a validation pass
+        draws is pure waste, so they track by default."""
+        return int(self.positions if self.holdout_positions is None else self.holdout_positions)
 
     def is_rolling_holdout_gen(self, gen: int) -> bool:
         """True when generation `gen`'s own shards are withheld from its own
@@ -576,6 +602,16 @@ class RunConfig:
         _require(
             self.validation.holdout_gen >= 1,
             "validation.holdout_gen must be >= 1 (generations are 1-indexed)",
+        )
+        _require(
+            self.validation.positions > 0, "validation.positions must be > 0"
+        )
+        _require(
+            self.validation.holdout_positions is None
+            or self.validation.holdout_positions > 0,
+            "validation.holdout_positions must be > 0 (null to track "
+            "validation.positions); 0 would freeze nothing and leave val_frozen "
+            "permanently empty",
         )
         _require(
             0.0 <= self.validation.rolling.fraction < 1.0,

@@ -514,13 +514,23 @@ run back with `uv run python -m model.report --run latest`.
 Every generation:
 
 - **Two held-out sets, measuring different things.**
-  - `val_frozen/` — a whole early generation, frozen and never trained on
-    again, scored with a fixed seed so the same rows come back every
-    generation. That fixity is what makes the curve comparable and also what
-    limits it: by generation 30 it is scoring the network on positions a
-    thirty-generation-weaker network produced, so a rising loss there is as
-    likely to be *progress* as regression. **It is a drift indicator. Do not
-    gate on it.**
+  - `val_frozen/` — `validation.holdout_positions` positions (whole games) of
+    an early generation, frozen and never trained on again, scored with a fixed
+    seed so the same rows come back every generation. That fixity is what makes
+    the curve comparable and also what limits it: by generation 30 it is scoring
+    the network on positions a thirty-generation-weaker network produced, so a
+    rising loss there is as likely to be *progress* as regression. **It is a
+    drift indicator. Do not gate on it.**
+
+    Which is why it is a *bounded sample* of that generation and not the whole
+    of it. Freezing the generation wholesale cost a live run 57,699 training
+    positions — generation 1 is the largest of any run, because games are
+    longest under random play — and, by leaving nothing in the pool outside the
+    current generation, it also silently skipped the rolling holdout below. The
+    missing rolling metrics then produced a false "search is producing no
+    information" alarm read off the frozen set's constant-by-construction
+    `data_*` values. The remainder of the generation is ordinary training data
+    and ages out of the replay window normally.
   - `val_rolling/` — 10% of each generation's own games, withheld by whole
     game from that generation's training and never sampled again. Same
     distribution as the training data, provably never seen. `val_rolling`

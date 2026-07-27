@@ -33,29 +33,48 @@ map is *spatial* and must be permuted by the same symmetry as `planes` and
 without any visible error; `tests/test_replay_buffer.py` pins it.
 
 Eviction is by absolute generation: `evict_below(K)` drops every generation
-below `K`. The training loop calls it with `current_gen - replay_buffer_gens`.
+below `K`, except rows in the frozen holdout, which outlive the window by
+design. The training loop calls it with `current_gen - replay_buffer_gens`.
 
 **Two holdouts, and they measure different things.**
 
-*Frozen* — `mark_holdout(gen)` freezes a whole generation as validation-only.
-Held-out generations are never returned by `sample()`, are not counted by
-`total_size()` (so they cannot satisfy the training loop's minimum-buffer
-check), and are exempt from `evict_below` so the set stays fixed for the life
-of the run. Because the self-play distribution moves by design, cross-entropy
-against a generation-1 frozen set increasingly measures **drift away from an
-obsolete distribution**, not generalisation. It is a drift indicator. Do not
-gate on it.
+*Frozen* — `mark_holdout(gen, count=N)` withholds **approximately N positions**
+of `gen` as validation-only. Those rows are never returned by `sample()`, are
+not counted by `total_size()` (so they cannot satisfy the training loop's
+minimum-buffer check), and survive `evict_below` so the set stays fixed for the
+life of the run. Because the self-play distribution moves by design,
+cross-entropy against a generation-1 frozen set increasingly measures **drift
+away from an obsolete distribution**, not generalisation. It is a drift
+indicator. Do not gate on it.
+
+**It is bounded on purpose.** Freezing the whole generation — what this did
+before — threw away the largest generation in the run: games are longest under
+random play, so generation 1 of a live run was 57,699 positions against
+generation 2's 33,717, and every one of them was withheld permanently to feed a
+metric nothing is allowed to gate on. Worse, it emptied the pool outside the
+current generation, which silently disabled the *rolling* holdout (see the
+minimum-buffer guard in `train_loop`) — the one measurement that could have
+caught overfitting. A drift indicator needs enough rows to evaluate on and not
+one more; `validation.holdout_positions` sets that, defaulting to
+`validation.positions` because scoring more rows than a validation pass draws is
+pure waste. The un-held remainder of the generation is ordinary trainable data
+and ages out of the window normally.
 
 *Rolling* — `mark_rolling_holdout(gen, fraction=...)` withholds a slice of the
 *newest* generation. Those rows are excluded from `sample()` permanently, so
 they are never trained on, and they are drawn from the distribution the network
 is actually being trained on right now. That is the set worth gating on.
 
-The rolling slice is taken **by whole game**, not by row. Positions from one
-game share the same `z` and `score_diff` labels and are near-duplicates of each
-other; a row-level split would leave sibling positions on both sides and report
-memorisation as generalisation. `whole_games=False` exists for tests that need
-an exact row count.
+**Both slices are taken by whole game**, never by row — `_select_whole_games` is
+shared so they cannot drift apart. Positions from one game share the same `z`
+and `score_diff` labels and are near-duplicates of each other; a row-level split
+would leave sibling positions on both sides and report memorisation as
+generalisation. `whole_games=False` exists for tests that need an exact row
+count.
+
+Both selections are deterministic in `(seed, gen)` and idempotent, so a resumed
+run reproduces exactly the same rows rather than quietly re-rolling a split
+across data the network has already trained on.
 
 `model/validate.py` scores either set; `iter_holdout_batches(...)` is the
 fixed-seed, augmentation-off iterator that makes the curve comparable across
@@ -265,6 +284,10 @@ class _Columns:
     #: that silently re-enters the training pool at the next eviction would be
     #: worse than no holdout at all.
     hold: np.ndarray  # (N,)   bool
+    #: Frozen-holdout flag, per row. Same argument as `hold`, plus one more:
+    #: `evict_below` keeps these rows while dropping the rest of their
+    #: generation, which is only expressible per row.
+    frozen: np.ndarray  # (N,)   bool
     child_off: np.ndarray  # (N+1,) int64
     child_idx: np.ndarray  # (E,)   uint16
     child_visits: np.ndarray  # (E,)   uint32
@@ -284,6 +307,7 @@ class _Columns:
         "q",
         "meta",
         "hold",
+        "frozen",
     )
     _RAGGED_FIELDS = (
         ("child_off", ("child_idx", "child_visits")),
@@ -336,6 +360,7 @@ class _Columns:
             q=np.zeros(0, np.float32),
             meta=np.zeros(0, META_DTYPE),
             hold=np.zeros(0, np.bool_),
+            frozen=np.zeros(0, np.bool_),
             child_off=np.zeros(1, np.int64),
             child_idx=np.zeros(0, np.uint16),
             child_visits=np.zeros(0, np.uint32),
@@ -479,6 +504,7 @@ def _read_shard(path: Path, gen: int) -> _Columns:
         q=_scalar_column(table, "q", np.float32),
         meta=meta,
         hold=np.zeros(n, np.bool_),
+        frozen=np.zeros(n, np.bool_),
         child_off=child_off,
         child_idx=child_idx,
         child_visits=child_visits,
@@ -575,6 +601,40 @@ def _build_batch(cols: _Columns, syms: np.ndarray | None) -> Batch:
     )
 
 
+# ----- holdout selection -----------------------------------------------------
+
+#: Extra entropy mixed into the frozen holdout's RNG so that, at the same
+#: `(seed, gen)`, it does not walk the identical permutation the rolling holdout
+#: walks. Both stay deterministic; they are merely independent.
+_FROZEN_STREAM = 0x46524F5A  # b"FROZ"
+
+
+def _select_whole_games(
+    rows: np.ndarray, game_ids: np.ndarray, target: int, rng: np.random.Generator
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """Add whole games in `rng` order until at least `target` positions are held.
+
+    Returns `(picked row indices, the chosen game ids sorted)`. Shared by both
+    holdouts so they cannot drift apart: positions inside one game share `z` and
+    `score_diff` exactly, so a row-level split would score the model on
+    near-duplicates of its own training data.
+
+    The count therefore *overshoots* by up to one game's worth of positions —
+    "approximately `target`" is the contract, and it is the right one: a holdout
+    is measured in games, not rows.
+    """
+    uniq, counts = np.unique(game_ids, return_counts=True)
+    chosen: list[int] = []
+    held = 0
+    for i in rng.permutation(uniq.size):
+        chosen.append(int(uniq[i]))
+        held += int(counts[i])
+        if held >= target:
+            break
+    picked = rows[np.isin(game_ids, np.asarray(chosen, dtype=game_ids.dtype))]
+    return picked, tuple(sorted(chosen))
+
+
 # ----- the buffer ------------------------------------------------------------
 
 
@@ -586,13 +646,18 @@ class ReplayBuffer:
         self._store: _Columns = _Columns.empty()
         self._pending: dict[int, list[_Columns]] = {}
         self._counts: dict[int, int] = {}
-        self._holdout: set[int] = set()
         #: gen -> rows currently rolling-held. Mirrors the `hold` column so
         #: `total_size()` stays O(generations) rather than O(buffer).
         self._rolling: dict[int, int] = {}
         #: gen -> the game ids that make up its rolling slice. Also the marker
         #: that makes `mark_rolling_holdout` idempotent.
         self._rolling_games: dict[int, tuple[int, ...]] = {}
+        #: gen -> rows currently frozen-held. Mirrors the `frozen` column, for
+        #: the same reason `_rolling` mirrors `hold`.
+        self._frozen: dict[int, int] = {}
+        #: gen -> the game ids making up its frozen slice; the idempotence
+        #: marker for `mark_holdout`.
+        self._frozen_games: dict[int, tuple[int, ...]] = {}
         self._pool_cache: dict[tuple, np.ndarray] = {}
 
     # -- ingest ---------------------------------------------------------------
@@ -623,22 +688,34 @@ class ReplayBuffer:
 
     # -- accounting -----------------------------------------------------------
 
+    def trainable_size(self, gen: int) -> int:
+        """Rows of `gen` the optimiser may actually sample: everything buffered
+        for it minus both holdouts' slices."""
+        gen = int(gen)
+        return (
+            self._counts.get(gen, 0)
+            - self._frozen.get(gen, 0)
+            - self._rolling.get(gen, 0)
+        )
+
     def total_size(self, *, include_holdout: bool = False) -> int:
         """Sampleable rows. Both holdouts are excluded by default, so the
         training loop's minimum-buffer check cannot be satisfied by data it is
         not allowed to train on — and so `epochs_this_gen` is computed against
-        the data actually being trained on."""
+        the data actually being trained on.
+
+        The holdout generation contributes its *un-held remainder* here: only
+        the frozen slice is withheld, not the generation that carries it.
+        """
         if include_holdout:
             return sum(self._counts.values())
-        return sum(
-            n - self._rolling.get(g, 0)
-            for g, n in self._counts.items()
-            if g not in self._holdout
-        )
+        return sum(self.trainable_size(g) for g in self._counts)
 
-    def holdout_size(self) -> int:
-        """Rows in *frozen* (whole-generation) holdouts."""
-        return sum(n for g, n in self._counts.items() if g in self._holdout)
+    def holdout_size(self, gen: int | None = None) -> int:
+        """Rows in the *frozen* holdout — for `gen`, or across every generation."""
+        if gen is None:
+            return sum(self._frozen.values())
+        return self._frozen.get(int(gen), 0)
 
     def rolling_holdout_size(self, gen: int | None = None) -> int:
         """Rows in the rolling holdout — for `gen`, or across every generation."""
@@ -662,21 +739,80 @@ class ReplayBuffer:
 
     # -- holdout --------------------------------------------------------------
 
-    def mark_holdout(self, gen: int) -> None:
-        """Freeze `gen` as validation-only: excluded from `sample()` and from
-        `total_size()`, and exempt from `evict_below`.
+    def mark_holdout(
+        self,
+        gen: int,
+        *,
+        count: int,
+        seed: int = 0,
+        whole_games: bool = True,
+    ) -> int:
+        """Freeze ~`count` positions of `gen` as validation-only. Returns rows held.
 
-        This is the **frozen** holdout. It is a drift indicator, not a
-        generalisation measure — see the module docstring. Gate on the rolling
-        holdout instead.
+        The held rows are excluded from `sample()` and from `total_size()`, and
+        they survive `evict_below` so the ruler stays fixed for the life of the
+        run. **Everything else in `gen` stays trainable** and ages out of the
+        rolling window like any other generation.
+
+        This is the **frozen** holdout: a drift indicator, not a generalisation
+        measure — see the module docstring. Gate on the rolling holdout instead.
+        Which is exactly why it is bounded: withholding a whole generation to
+        feed a metric nothing may gate on costs tens of thousands of real
+        training positions, and (by emptying the pool outside the current
+        generation) disables the rolling holdout that *can* be gated on.
+
+        `whole_games=True` (the default) rounds up to whole games — positions in
+        a game share `z` and `score_diff`, so a row-level split would score the
+        model on near-duplicates of its training data.
+
+        **Idempotent and deterministic in `(seed, gen)`.** Re-marking a
+        generation that already has a slice returns the existing size and
+        changes nothing, and a run resumed from shards reproduces the same rows.
         """
-        self._holdout.add(gen)
+        gen = int(gen)
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        if gen in self._frozen_games:
+            return self._frozen.get(gen, 0)
+
+        self._flush()
+        # Rows already withheld by the rolling holdout are not candidates: they
+        # are validation-only either way, and letting them count twice would
+        # make `holdout_frozen_size + holdout_rolling_size` exceed the
+        # generation.
+        rows = np.flatnonzero((self._store.gen == gen) & ~self._store.hold)
+        if rows.size == 0:
+            return 0
+        target = max(0, min(int(count), int(rows.size)))
+        if target == 0:
+            self._frozen_games[gen] = ()
+            self._frozen[gen] = 0
+            return 0
+
+        rng = np.random.default_rng([seed, gen, _FROZEN_STREAM])
+        if whole_games:
+            picked, chosen = _select_whole_games(
+                rows, self._store.meta["game_id"][rows], target, rng
+            )
+            self._frozen_games[gen] = chosen
+        else:
+            picked = rows[rng.permutation(rows.size)[:target]]
+            self._frozen_games[gen] = ()
+
+        self._store.frozen[picked] = True
+        self._frozen[gen] = int(picked.size)
         self._pool_cache.clear()
+        return int(picked.size)
 
     @property
     def holdout_gens(self) -> frozenset[int]:
-        """Generations frozen wholesale by `mark_holdout`."""
-        return frozenset(self._holdout)
+        """Generations carrying a frozen slice, including empty ones."""
+        return frozenset(self._frozen_games)
+
+    def holdout_games(self, gen: int) -> tuple[int, ...]:
+        """The `game_id`s making up `gen`'s frozen slice. Empty when the slice
+        was taken row-wise (`whole_games=False`) or does not exist."""
+        return self._frozen_games.get(int(gen), ())
 
     def mark_rolling_holdout(
         self,
@@ -731,17 +867,10 @@ class ReplayBuffer:
 
         rng = np.random.default_rng([seed, gen])
         if whole_games:
-            game_ids = self._store.meta["game_id"][rows]
-            uniq, counts = np.unique(game_ids, return_counts=True)
-            chosen: list[int] = []
-            held = 0
-            for i in rng.permutation(uniq.size):
-                chosen.append(int(uniq[i]))
-                held += int(counts[i])
-                if held >= target:
-                    break
-            picked = rows[np.isin(game_ids, np.asarray(chosen, dtype=game_ids.dtype))]
-            self._rolling_games[gen] = tuple(sorted(chosen))
+            picked, chosen = _select_whole_games(
+                rows, self._store.meta["game_id"][rows], target, rng
+            )
+            self._rolling_games[gen] = chosen
         else:
             picked = rows[rng.permutation(rows.size)[:target]]
             self._rolling_games[gen] = ()
@@ -772,25 +901,46 @@ class ReplayBuffer:
     def evict_below(self, threshold_gen: int, *, include_holdout: bool = False) -> int:
         """Drop generations `< threshold_gen`. Returns rows removed.
 
-        Held-out generations survive unless `include_holdout` — a validation
-        set that silently ages out is worse than no validation set.
+        **Frozen-holdout rows survive** unless `include_holdout` — a validation
+        set that silently ages out is worse than no validation set. Their
+        generation is evicted *around* them: the un-held remainder is ordinary
+        training data and leaves on schedule, and the generation stays in the
+        buffer carrying only its frozen slice.
+
+        Returns 0 without touching the store when nothing is actually
+        removable. That fast path is load-bearing: the frozen generation sits
+        below the threshold for the rest of the run, and this is called on every
+        poll of the training loop.
         """
-        doomed = {
-            g
-            for g in self._counts
-            if g < threshold_gen and (include_holdout or g not in self._holdout)
-        }
-        if not doomed:
+        removable = {}
+        for g, n in self._counts.items():
+            if g >= threshold_gen:
+                continue
+            keep = 0 if include_holdout else self._frozen.get(g, 0)
+            if n - keep > 0:
+                removable[g] = n - keep
+        if not removable:
             return 0
-        removed = sum(self._counts[g] for g in doomed)
-        for g in doomed:
-            del self._counts[g]
-            self._pending.pop(g, None)
+
+        self._flush()  # a partially-evicted generation must be one contiguous set
+        removed = sum(removable.values())
+        for g in removable:
+            keep = 0 if include_holdout else self._frozen.get(g, 0)
             self._rolling.pop(g, None)
             self._rolling_games.pop(g, None)
+            if keep:
+                self._counts[g] = keep
+                continue
+            del self._counts[g]
+            self._frozen.pop(g, None)
+            self._frozen_games.pop(g, None)
         if self._store.size:
-            keep = ~np.isin(self._store.gen, np.fromiter(doomed, np.int32, len(doomed)))
-            self._store = self._store.take(np.flatnonzero(keep))
+            doomed = np.fromiter(removable, np.int32, len(removable))
+            in_doomed = np.isin(self._store.gen, doomed)
+            keep_mask = ~in_doomed
+            if not include_holdout:
+                keep_mask |= in_doomed & self._store.frozen
+            self._store = self._store.take(np.flatnonzero(keep_mask))
         self._pool_cache.clear()
         return removed
 
@@ -801,20 +951,21 @@ class ReplayBuffer:
         include: frozenset[int] | None,
         exclude: frozenset[int],
         rolling: str = "exclude",
+        frozen: str = "exclude",
     ) -> np.ndarray | None:
         """Row indices eligible for sampling, or `None` meaning "every row".
 
-        `rolling` selects how the per-row rolling-holdout flag is applied:
+        `rolling` and `frozen` select how each per-row holdout flag is applied:
         `"exclude"` drops held rows (training), `"only"` keeps just them
-        (rolling validation), `"any"` ignores the flag.
+        (validation on that holdout), `"any"` ignores the flag.
 
         Cached: the filter only changes when the buffer does, and rebuilding it
         per batch would put an O(buffer) pass in front of every SGD step.
         """
-        if include is None and not exclude and rolling == "any":
+        if include is None and not exclude and rolling == "any" and frozen == "any":
             return None
         self._flush()  # the filter is over store rows; pending ones are invisible
-        key = (include, exclude, rolling)
+        key = (include, exclude, rolling, frozen)
         pool = self._pool_cache.get(key)
         if pool is None:
             gen = self._store.gen
@@ -823,10 +974,11 @@ class ReplayBuffer:
                 mask &= np.isin(gen, np.fromiter(include, np.int32, len(include)))
             if exclude:
                 mask &= ~np.isin(gen, np.fromiter(exclude, np.int32, len(exclude)))
-            if rolling == "exclude":
-                mask &= ~self._store.hold
-            elif rolling == "only":
-                mask &= self._store.hold
+            for mode, flag in ((rolling, self._store.hold), (frozen, self._store.frozen)):
+                if mode == "exclude":
+                    mask &= ~flag
+                elif mode == "only":
+                    mask &= flag
             pool = np.flatnonzero(mask)
             self._pool_cache[key] = pool
         return pool
@@ -840,6 +992,7 @@ class ReplayBuffer:
         augment: bool | None,
         force_sym: int | None,
         rolling: str = "exclude",
+        frozen: str = "exclude",
     ) -> Batch:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -849,14 +1002,14 @@ class ReplayBuffer:
         if rng is None:
             rng = np.random.default_rng()
 
-        pool = self._pool(include, exclude, rolling)
+        pool = self._pool(include, exclude, rolling, frozen)
         if pool is None:
             rows = rng.integers(0, self._store.size, size=batch_size)
         else:
             if pool.size == 0:
                 raise ValueError(
                     f"no sampleable rows (include={sorted(include) if include else None}, "
-                    f"exclude={sorted(exclude)}, rolling={rolling})"
+                    f"exclude={sorted(exclude)}, rolling={rolling}, frozen={frozen})"
                 )
             rows = pool[rng.integers(0, pool.size, size=batch_size)]
 
@@ -881,14 +1034,16 @@ class ReplayBuffer:
     ) -> Batch:
         """Uniformly sample `batch_size` positions from the trainable window.
 
-        Frozen holdout generations and rolling-held rows are always excluded;
-        `exclude_gens` removes more. `augment` overrides the instance default.
-        `force_sym` applies one fixed symmetry to every row — for tests and for
-        test-time augmentation in validation, where averaging over syms wants a
-        deterministic sweep.
+        Rows held by *either* holdout are always excluded; `exclude_gens`
+        removes whole generations on top of that. `augment` overrides the
+        instance default. `force_sym` applies one fixed symmetry to every row —
+        for tests and for test-time augmentation in validation, where averaging
+        over syms wants a deterministic sweep.
         """
-        exclude = frozenset(self._holdout) | frozenset(exclude_gens or ())
-        return self._sample(batch_size, rng, None, exclude, augment, force_sym, "exclude")
+        exclude = frozenset(exclude_gens or ())
+        return self._sample(
+            batch_size, rng, None, exclude, augment, force_sym, "exclude", "exclude"
+        )
 
     def sample_from_gens(
         self,
@@ -899,21 +1054,41 @@ class ReplayBuffer:
         augment: bool | None = None,
         force_sym: int | None = None,
     ) -> Batch:
-        """Sample only from `gens`, holdout or not.
+        """Sample only from `gens` — **every** row of them, holdout or not.
 
-        This is the **frozen** validation entry point: `mark_holdout(g)` then
-        `sample_from_gens([g], n, np.random.default_rng(seed), augment=False)`
-        yields the same frozen batch every generation, which is what makes a
-        loss curve across generations comparable.
-
-        The rolling flag is ignored here — an explicit generation request means
-        "every row of these generations". Use `sample_rolling_holdout` for the
-        rolling slice.
+        Both holdout flags are ignored here: an explicit generation request
+        means exactly that. Use `sample_frozen_holdout` / `sample_rolling_holdout`
+        for the withheld slices; scoring validation through this method would
+        report training data as held out.
         """
         include = frozenset(gens)
         if not include:
             raise ValueError("sample_from_gens requires at least one generation")
-        return self._sample(batch_size, rng, include, frozenset(), augment, force_sym, "any")
+        return self._sample(
+            batch_size, rng, include, frozenset(), augment, force_sym, "any", "any"
+        )
+
+    def sample_frozen_holdout(
+        self,
+        batch_size: int,
+        rng: np.random.Generator | None = None,
+        *,
+        gens: Iterable[int] | None = None,
+        augment: bool | None = False,
+        force_sym: int | None = None,
+    ) -> Batch:
+        """Sample only from the frozen holdout — rows never trained on.
+
+        With a fixed `rng` seed this yields the same batch every generation,
+        which is what makes the `val_frozen/` curve comparable end to end. It is
+        a drift indicator; do not gate on it.
+        """
+        include = frozenset(gens) if gens is not None else frozenset(self._frozen_games)
+        if not include:
+            raise ValueError("no frozen holdout has been marked")
+        return self._sample(
+            batch_size, rng, include, frozenset(), augment, force_sym, "any", "only"
+        )
 
     def sample_rolling_holdout(
         self,
@@ -935,7 +1110,7 @@ class ReplayBuffer:
         if target is None:
             raise ValueError("no rolling holdout has been marked")
         return self._sample(
-            batch_size, rng, frozenset({target}), frozenset(), augment, force_sym, "only"
+            batch_size, rng, frozenset({target}), frozenset(), augment, force_sym, "only", "any"
         )
 
     def iter_holdout_batches(
@@ -949,20 +1124,22 @@ class ReplayBuffer:
     ) -> Iterator[Batch]:
         """Fixed-seed, augmentation-off draws from one of the two holdouts.
 
-        `kind` is `"frozen"` (whole held-out generations, `gens` defaults to
+        `kind` is `"frozen"` (the frozen slices, `gens` defaults to
         `holdout_gens`) or `"rolling"` (the newest rolling slice, or `gens`'
-        single generation). Sampling is with replacement, so this is a
-        bootstrap rather than an enumeration — but with a fixed seed it is the
-        *same* bootstrap every generation, which is what makes the curve
-        comparable. Yields nothing when the requested set is empty, so the
-        caller can treat "no holdout yet" as "no metrics" instead of an error.
+        single generation). Either way only the *withheld* rows are drawn —
+        never the un-held remainder of a holdout generation, which is training
+        data. Sampling is with replacement, so this is a bootstrap rather than
+        an enumeration — but with a fixed seed it is the *same* bootstrap every
+        generation, which is what makes the curve comparable. Yields nothing
+        when the requested set is empty, so the caller can treat "no holdout
+        yet" as "no metrics" instead of an error.
         """
         if kind not in ("frozen", "rolling"):
             raise ValueError(f"kind must be 'frozen' or 'rolling', got {kind!r}")
         chosen = frozenset(gens) if gens is not None else None
         if kind == "frozen":
-            chosen = chosen if chosen is not None else frozenset(self._holdout)
-            if not chosen or not any(self._counts.get(g, 0) for g in chosen):
+            chosen = chosen if chosen is not None else frozenset(self._frozen_games)
+            if not chosen or not any(self._frozen.get(g, 0) for g in chosen):
                 return
         else:
             target = self.rolling_holdout_gen if chosen is None else max(chosen)
@@ -975,7 +1152,7 @@ class ReplayBuffer:
         while remaining > 0:
             n = min(int(batch_size), remaining)
             if kind == "frozen":
-                yield self.sample_from_gens(sorted(chosen), n, rng, augment=False)
+                yield self.sample_frozen_holdout(n, rng, gens=chosen, augment=False)
             else:
                 yield self.sample_rolling_holdout(
                     n, rng, gen=next(iter(chosen)), augment=False
@@ -991,7 +1168,7 @@ class ReplayBuffer:
         `nan` with nothing trainable in the buffer — a rate with no denominator
         is undefined, not zero.
         """
-        pool = self._pool(None, frozenset(self._holdout), "exclude")
+        pool = self._pool(None, frozenset(), "exclude", "exclude")
         if pool is None:
             meta = self._store.meta
         else:
@@ -1019,13 +1196,16 @@ class ReplayBuffer:
         the fact is exactly the ambiguity this measurement layer is meant to
         remove. It is `nan` unless both `steps` and `batch_size` are supplied.
 
-        `size` is the *trainable* row count: frozen holdout generations and
-        rolling-held rows are excluded, so the epoch count is against the data
-        the optimiser actually saw.
+        `size` is the *trainable* row count: rows held by either holdout are
+        excluded, so the epoch count is against the data the optimiser actually
+        saw. The holdout generation's un-held remainder **is** in there — it is
+        trained on like any other data, and leaving it out inflated
+        `epochs_this_gen` by the ratio of the whole generation to the part of it
+        that was really withheld.
         """
         nan = float("nan")
         size = self.total_size()
-        gens = [g for g in self._counts if g not in self._holdout]
+        gens = [g for g in self._counts if self.trainable_size(g) > 0]
         epochs = (
             float(steps) * float(batch_size) / float(size)
             if steps is not None and batch_size is not None and size > 0

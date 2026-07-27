@@ -633,38 +633,237 @@ def test_find_shards_for_gen(tmp_path, rows):
 # ----- holdout ---------------------------------------------------------------
 
 
-def test_holdout_generation_is_never_sampled_or_counted(shard, shard_b, rows):
+def test_frozen_holdout_rows_are_never_sampled_and_are_a_fixed_ruler(shard, shard_b, rows):
     n = len(rows)
     rb = ReplayBuffer(augment=False)
     rb.ingest_shard(shard, gen=0)  # q < 1
     rb.ingest_shard(shard_b, gen=1)  # q > 10
-    rb.mark_holdout(1)
+    held = rb.mark_holdout(1, count=n)  # the whole generation, on purpose
 
+    assert held == n
     assert rb.holdout_gens == frozenset({1})
     assert rb.total_size() == n
     assert rb.total_size(include_holdout=True) == 2 * n
     assert rb.holdout_size() == n
     assert rb.chunk_size(1) == n  # still buffered
 
-    # Training never sees the held-out generation: every sampled q comes from
-    # the gen-0 shard.
+    # Training never sees the held-out rows: every sampled q comes from gen 0.
     train = rb.sample(512, np.random.default_rng(0))
     assert np.all(train.q < 1.0)
 
-    held = rb.sample_from_gens([1], 32, np.random.default_rng(0))
-    held.validate()
-    assert np.all(held.q > 9.0)
+    frozen = rb.sample_frozen_holdout(32, np.random.default_rng(0))
+    frozen.validate()
+    assert np.all(frozen.q > 9.0)
 
     # Frozen: same seed, same batch, generation after generation.
-    again = rb.sample_from_gens([1], 32, np.random.default_rng(0))
-    np.testing.assert_array_equal(held.planes, again.planes)
-    np.testing.assert_array_equal(held.value, again.value)
+    again = rb.sample_frozen_holdout(32, np.random.default_rng(0))
+    np.testing.assert_array_equal(frozen.planes, again.planes)
+    np.testing.assert_array_equal(frozen.value, again.value)
 
     # And exempt from the rolling window.
-    assert rb.evict_below(10) == n
+    assert rb.evict_below(10) == n  # gen 0 only; gen 1 is entirely frozen
     assert rb.generations() == [1]
     assert rb.evict_below(10, include_holdout=True) == n
     assert rb.generations() == []
+
+
+def test_frozen_holdout_is_bounded_and_leaves_the_rest_trainable(tmp_path):
+    """The bug this bound exists to fix.
+
+    A live run froze all 57,699 positions of generation 1 — the largest
+    generation of the run, because games are longest under random play — to feed
+    a metric `docs/ARCHITECTURE.md` forbids gating on. The holdout needs a few
+    thousand rows to evaluate on; everything else belongs in training.
+    """
+    rows = random_rows(96, np.random.default_rng(201), n_children=4)  # 12 games x 8
+    rb = ReplayBuffer(augment=False)
+    rb.ingest_shard(write_shard(tmp_path / "s.parquet", rows), gen=1)
+
+    held = rb.mark_holdout(1, count=16, seed=99)
+
+    # Bounded to ~the target: whole games, so it overshoots by at most one game.
+    assert 16 <= held <= 16 + 8
+    assert held < len(rows)
+    assert rb.holdout_size() == held
+    assert rb.holdout_size(1) == held
+    assert rb.chunk_size(1) == 96  # the generation is all still buffered
+
+    # THE point: the remainder is trainable and really is trained on.
+    assert rb.total_size() == 96 - held
+    assert rb.trainable_size(1) == 96 - held
+
+    train_q = set(np.round(rb.sample(8192, np.random.default_rng(0)).q, 6))
+    frozen_q = set(np.round(rb.sample_frozen_holdout(8192, np.random.default_rng(1)).q, 6))
+    assert len(frozen_q) == held
+    assert len(train_q) == 96 - held
+    assert train_q & frozen_q == set()  # never both
+    assert len(train_q | frozen_q) == 96  # and never neither
+
+
+def test_frozen_holdout_takes_whole_games(tmp_path):
+    """A row-level split would score the model on near-duplicates of its own
+    training data: positions inside a game share `z` and `score_diff` exactly."""
+    rows = random_rows(96, np.random.default_rng(202), n_children=4)  # game_id = i // 8
+    rb = ReplayBuffer(augment=False)
+    rb.ingest_shard(write_shard(tmp_path / "s.parquet", rows), gen=1)
+    rb.mark_holdout(1, count=20)
+
+    held_games = set(rb.holdout_games(1))
+    assert held_games
+    frozen = rb.sample_frozen_holdout(4096, np.random.default_rng(0))
+    train = rb.sample(4096, np.random.default_rng(1))
+    frozen_ids = {int(rows[i]["game_id"]) for i in source_index(frozen, rows)}
+    train_ids = {int(rows[i]["game_id"]) for i in source_index(train, rows)}
+
+    assert frozen_ids == held_games
+    assert frozen_ids & train_ids == set()  # no game split across the boundary
+    assert frozen_ids | train_ids == {int(r["game_id"]) for r in rows}
+
+
+def test_frozen_holdout_is_deterministic_and_idempotent(tmp_path):
+    """Deterministic in `(seed, gen)` and idempotent, so a resumed run withholds
+    exactly the same games. Re-rolling the split would move rows the model has
+    already trained on into the validation set."""
+    rows = random_rows(96, np.random.default_rng(203), n_children=4)
+    path = write_shard(tmp_path / "s.parquet", rows)
+
+    def held_games(seed, gen=1):
+        rb = ReplayBuffer(augment=False)
+        rb.ingest_shard(path, gen=gen)
+        rb.mark_holdout(gen, count=20, seed=seed)
+        return rb.holdout_games(gen)
+
+    assert held_games(5) == held_games(5)
+    assert held_games(5) != held_games(6)
+    assert held_games(5, gen=1) != held_games(5, gen=2)
+
+    # Idempotent: re-marking with different arguments changes nothing.
+    rb = ReplayBuffer(augment=False)
+    rb.ingest_shard(path, gen=1)
+    first = rb.mark_holdout(1, count=20, seed=5)
+    assert rb.mark_holdout(1, count=90, seed=999) == first
+    assert rb.holdout_games(1) == held_games(5)
+
+
+def test_frozen_holdout_survives_a_simulated_resume(tmp_path):
+    """A resume rebuilds the buffer from shards and re-marks. The same rows must
+    come back — otherwise "never trained on" quietly becomes "never trained on
+    unless the run was ever restarted"."""
+    rows = random_rows(96, np.random.default_rng(204), n_children=4)
+    path = write_shard(tmp_path / "s.parquet", rows)
+
+    def run() -> tuple[tuple[int, ...], set[float], set[float]]:
+        rb = ReplayBuffer(augment=False)
+        rb.ingest_shard(path, gen=1)
+        rb.mark_holdout(1, count=20, seed=20260727)
+        return (
+            rb.holdout_games(1),
+            set(np.round(rb.sample_frozen_holdout(4096, np.random.default_rng(0)).q, 6)),
+            set(np.round(rb.sample(4096, np.random.default_rng(1)).q, 6)),
+        )
+
+    before = run()
+    after = run()  # the process died; everything is rebuilt from the shards
+    assert before == after
+    assert before[1] & before[2] == set()
+
+
+def test_frozen_holdout_outlives_eviction_but_its_generation_does_not(tmp_path):
+    """The slice is a ruler for the life of the run. The rest of its generation
+    is ordinary training data and must age out of the window on schedule —
+    otherwise the buffer grows without bound."""
+    rows = random_rows(96, np.random.default_rng(205), n_children=4)
+    rb = ReplayBuffer(augment=False)
+    rb.ingest_shard(write_shard(tmp_path / "a.parquet", rows), gen=1)
+    later = random_rows(32, np.random.default_rng(206), n_children=4, q_offset=10.0)
+    rb.ingest_shard(write_shard(tmp_path / "b.parquet", later), gen=9)
+    held = rb.mark_holdout(1, count=20)
+    frozen_before = set(np.round(rb.sample_frozen_holdout(4096, np.random.default_rng(0)).q, 6))
+
+    assert rb.evict_below(9) == 96 - held  # the remainder, not the slice
+    assert rb.generations() == [1, 9]
+    assert rb.chunk_size(1) == held
+    assert rb.trainable_size(1) == 0
+    assert rb.total_size() == 32  # gen 9 only
+
+    frozen_after = set(np.round(rb.sample_frozen_holdout(4096, np.random.default_rng(0)).q, 6))
+    assert frozen_after == frozen_before
+    assert np.all(rb.sample(2048, np.random.default_rng(1)).q > 9.0)
+
+    # Idempotent and cheap: with nothing left to remove it must not rebuild the
+    # store on every poll of the training loop.
+    assert rb.evict_below(9) == 0
+    # Only `include_holdout` takes the ruler away.
+    assert rb.evict_below(9, include_holdout=True) == held
+    assert rb.generations() == [9]
+
+
+def test_mark_holdout_argument_errors(tmp_path):
+    rb = ReplayBuffer()
+    rows = random_rows(8, np.random.default_rng(207))
+    rb.ingest_shard(write_shard(tmp_path / "s.parquet", rows), gen=0)
+    with pytest.raises(ValueError, match="count must be"):
+        rb.mark_holdout(0, count=-1)
+    assert rb.mark_holdout(99, count=4) == 0  # generation absent
+    with pytest.raises(ValueError, match="no frozen holdout"):
+        rb.sample_frozen_holdout(4)
+
+
+def test_the_two_holdouts_do_not_overlap(tmp_path):
+    """Both can land on one generation. Neither may claim the other's rows, or
+    `holdout_frozen_size + holdout_rolling_size` overstates what was withheld."""
+    rows = random_rows(96, np.random.default_rng(208), n_children=4)
+    rb = ReplayBuffer(augment=False)
+    rb.ingest_shard(write_shard(tmp_path / "s.parquet", rows), gen=1)
+
+    rolling = rb.mark_rolling_holdout(1, fraction=0.25, seed=3)
+    frozen = rb.mark_holdout(1, count=24, seed=3)
+
+    assert set(rb.holdout_games(1)) & set(rb.rolling_holdout_games(1)) == set()
+    assert frozen + rolling <= 96
+    assert rb.total_size() == 96 - frozen - rolling
+
+    frozen_q = set(np.round(rb.sample_frozen_holdout(8192, np.random.default_rng(0)).q, 6))
+    rolling_q = set(np.round(rb.sample_rolling_holdout(8192, np.random.default_rng(1)).q, 6))
+    train_q = set(np.round(rb.sample(8192, np.random.default_rng(2)).q, 6))
+    assert len(frozen_q) == frozen
+    assert len(rolling_q) == rolling
+    assert frozen_q & rolling_q == set()
+    assert train_q & (frozen_q | rolling_q) == set()
+    assert len(train_q | frozen_q | rolling_q) == 96
+
+
+def test_bounded_frozen_holdout_leaves_a_pool_for_the_rolling_holdout(tmp_path):
+    """The causal chain that produced the false alarm, end to end.
+
+    Generation 1 was frozen wholesale, so at generation 2 the pool outside the
+    current generation was zero, so the training loop's minimum-buffer guard
+    skipped the rolling holdout, so the entropy check fell back to the frozen
+    set — whose `data_*` metrics are constant by construction — and warned that
+    "search is producing (near) no information" at a generation where the real
+    figure had just improved from 0.960 to 0.804.
+
+    The guard is `pool outside gen 2 >= replay_buffer_min_size`. Bounding the
+    frozen holdout is what puts anything in that pool.
+    """
+    min_size = 40  # stands in for train.replay_buffer_min_size
+    gen1 = random_rows(96, np.random.default_rng(209), n_children=4)
+    gen2 = random_rows(64, np.random.default_rng(210), n_children=4, q_offset=10.0)
+    rb = ReplayBuffer(augment=False)
+    rb.ingest_shard(write_shard(tmp_path / "g1.parquet", gen1), gen=1)
+    rb.mark_holdout(1, count=16, seed=1)
+
+    # The decision the loop makes before gen 2's first shard lands.
+    pool_outside_gen2 = rb.total_size()
+    assert pool_outside_gen2 >= min_size, "the rolling holdout would be skipped"
+
+    rb.ingest_shard(write_shard(tmp_path / "g2.parquet", gen2), gen=2)
+    assert rb.mark_rolling_holdout(2, fraction=0.25, seed=1) > 0
+    assert rb.rolling_holdout_gen == 2
+
+    # And it really is the newest generation's data, which is what makes its
+    # entropy meaningful where the frozen set's is frozen.
+    assert np.all(rb.sample_rolling_holdout(512, np.random.default_rng(0)).q > 9.0)
 
 
 # ----- rolling holdout -------------------------------------------------------
@@ -844,7 +1043,7 @@ def test_iter_holdout_batches_is_fixed_seed_and_unaugmented(tmp_path):
     rb.ingest_shard(write_shard(tmp_path / "a.parquet", rows), gen=0)
     later = random_rows(64, np.random.default_rng(112), n_children=4, q_offset=10.0)
     rb.ingest_shard(write_shard(tmp_path / "b.parquet", later), gen=1)
-    rb.mark_holdout(0)
+    rb.mark_holdout(0, count=24)
     rb.mark_rolling_holdout(1, fraction=0.25)
 
     def drain(kind):
@@ -937,24 +1136,48 @@ def test_buffer_metrics_on_an_empty_buffer_is_nan_not_zero():
 
 
 def test_buffer_metrics_spans_generations_and_excludes_both_holdouts(tmp_path):
-    rows = random_rows(40, np.random.default_rng(117), n_children=4)
+    rows = random_rows(40, np.random.default_rng(117), n_children=4)  # 5 games x 8
     rb = ReplayBuffer()
     for gen in (4, 5, 6):
         rb.ingest_shard(write_shard(tmp_path / f"s{gen}.parquet", rows), gen=gen)
-    rb.mark_holdout(4)
+    frozen = rb.mark_holdout(4, count=8)
     held = rb.mark_rolling_holdout(6, count=10, whole_games=False)
 
+    assert frozen == 8  # one whole game, not the whole generation
     m = rb.buffer_metrics(gen=6, steps=10, batch_size=32)
-    assert m["buffer/generations"] == 2
-    assert m["buffer/gen_min"] == 5
+    # Generation 4 still counts: only 8 of its 40 rows are withheld and the
+    # other 32 are trained on.
+    assert m["buffer/generations"] == 3
+    assert m["buffer/gen_min"] == 4
     assert m["buffer/gen_max"] == 6
-    assert m["buffer/size"] == 80 - held
+    assert m["buffer/size"] == 120 - frozen - held
     assert m["buffer/size_with_holdout"] == 120
-    assert m["buffer/holdout_frozen_size"] == 40
+    assert m["buffer/holdout_frozen_size"] == frozen
     assert m["buffer/holdout_rolling_size"] == held
     assert m["buffer/positions_this_gen"] == 40
     assert all(k.startswith("buffer/") for k in m)
     json.dumps(m)
+
+
+def test_epochs_this_gen_denominator_includes_the_holdout_remainder(tmp_path):
+    """`epochs_this_gen = steps x batch / trainable`. Freezing a whole
+    generation shrank that denominator and inflated the number: the live run
+    reported 3.04 epochs (400 x 256 / 33717) while really making 400 x 256 /
+    91416 = 1.12 passes over the data it could actually train on."""
+    gen1 = random_rows(96, np.random.default_rng(211), n_children=4)
+    gen2 = random_rows(64, np.random.default_rng(212), n_children=4, q_offset=10.0)
+    rb = ReplayBuffer()
+    rb.ingest_shard(write_shard(tmp_path / "g1.parquet", gen1), gen=1)
+    rb.ingest_shard(write_shard(tmp_path / "g2.parquet", gen2), gen=2)
+    frozen = rb.mark_holdout(1, count=16)
+    rolling = rb.mark_rolling_holdout(2, count=8, whole_games=False)
+
+    trainable = 160 - frozen - rolling
+    m = rb.buffer_metrics(gen=2, steps=100, batch_size=32)
+    assert m["buffer/size"] == trainable
+    assert m["buffer/epochs_this_gen"] == pytest.approx(100 * 32 / trainable)
+    # Not the whole-generation-holdout arithmetic that inflated it.
+    assert m["buffer/epochs_this_gen"] != pytest.approx(100 * 32 / (64 - rolling))
 
 
 def test_exclude_gens_argument(shard, shard_b):
