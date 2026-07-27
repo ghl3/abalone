@@ -1,0 +1,456 @@
+# MODEL — target design
+
+> **Status:** aspirational design doc. Describes what we are building toward, not
+> what exists today. For the current state and the path from here to there, see
+> [2026-07-27-architecture-review.md](2026-07-27-architecture-review.md).
+
+---
+
+## 1. Design principles
+
+1. **No hand-written positional knowledge.** No centrality term, no cohesion
+   term, no tuned weights. Everything the network knows about *how to play*
+   Abalone must come from self-play outcomes.
+2. **The game's own score is not a heuristic.** Abalone's win condition is a
+   counter: push off six. Using that counter to resolve a truncated game is
+   reading the rulebook, not injecting strategy. (§3.1 defends this line.)
+3. **Auxiliary supervision must be derivable from the trajectory.** Extra
+   training targets are allowed if they are computed *from the game record
+   itself*. They densify the gradient without encoding anyone's opinion.
+4. **Solve cold-start with the curriculum, not with a teacher.** Where AlphaGo
+   used human games and the current code uses a hand-written evaluator, we
+   instead move the *starting position* closer to a decision.
+5. **Scale down before scaling up.** Every design choice must have a small,
+   fast configuration for iteration and a large one for the real run.
+
+The hand-written evaluator (`crates/mcts/src/eval.rs`) is **retired from the
+training loop entirely**. It survives in exactly one role: a fixed benchmark
+opponent on the Elo ladder. A frozen yardstick is not a teacher.
+
+---
+
+## 2. The cold-start problem, stated precisely
+
+This is the problem the whole design turns on.
+
+A randomly initialised network gives MCTS a uniform prior and a meaningless
+value. Under such a policy, Abalone games from the standard opening essentially
+never reach six captures — measured at **98% draws over 200 games**, even with
+search driving move choice. So `z = 0` everywhere, the value head learns the
+constant zero, and there is nothing for the policy to distil.
+
+### 2.1 Does deeper MCTS fix this on its own?
+
+Partly — and it is worth being precise about which half.
+
+**Deeper search does fix the policy signal.** With branching ~60 and 100
+simulations, every root child gets one or two visits and the visit histogram is
+noise. Search needs roughly **10× the branching factor** before visit counts
+concentrate into a usable target. That alone is a decisive argument for 800+
+simulations and it costs nothing conceptually.
+
+**Deeper search does not fix the value signal from the opening.** MCTS can only
+discover what lies inside its horizon. At 800 simulations with branching 60, the
+tree is a few ply wide-deep plus maybe 10–15 ply along the principal variation.
+Under near-random play a capture occurs roughly once per 100+ plies and six are
+needed to terminate. Terminal states are simply not in the horizon, so there is
+nothing for search to find and back up. Multiplying simulations by 10 moves the
+horizon by a couple of ply against a gap of hundreds.
+
+**The conclusion that shapes this design:** deep search converts *reachable*
+outcomes into learning signal extremely well. Our job is therefore not to search
+harder from a hopeless position — it is to **make outcomes reachable**, then
+search deeply. Two mechanisms do that, and neither is a heuristic:
+
+- **§3** — treat Abalone as a scored game, so truncation yields an outcome.
+- **§4** — seed self-play near the capture threshold, so terminals are inside
+  the search horizon from generation one.
+
+---
+
+## 3. Game termination and the outcome signal
+
+### 3.1 Abalone is a scored game
+
+Current rule: first to six captures wins; at the ply cap, **draw**. That draw is
+our invention — it is not in the rules, it is what we do when we run out of
+patience. It discards the one quantity the game actually tracks.
+
+Target rule:
+
+| Condition | Result |
+| --- | --- |
+| `captures[side] ≥ 6` | `side` wins, score difference `d = +6` |
+| ply cap reached, `d ≠ 0` | winner is `sign(d)`, score difference `d` |
+| ply cap reached, `d = 0` | genuine draw |
+| no capture in `K` plies | adjudicate as above (optional; see §3.3) |
+
+where `d = captures[side] − captures[other]`.
+
+**Why this is not a heuristic.** The distinction that matters is *objective*
+versus *strategy*. Capture count is the game's own scoring quantity — the thing
+the win condition counts. Resolving a truncated game by score is precisely what
+Go does with area scoring and what every scored game does. It says nothing about
+*how* to get captures: nothing about the centre, nothing about group cohesion,
+nothing about edge danger. Contrast the evaluator we are deleting, whose
+`Weights { w_capture, w_center, w_cohesion }` encodes three hand-picked beliefs
+about what makes a position good. That is the line, and score-based adjudication
+sits firmly on the safe side of it.
+
+**It also self-anneals.** As play improves, more games end naturally at six
+captures and adjudication fires less often. Its influence decays to zero on its
+own, with no unlearning phase and no schedule to tune.
+
+### 3.2 Shorter games
+
+Cap at **200 plies**, not 400. Real Abalone runs 60–100 moves. The current cap
+spends half of every game's compute on a tail that under weak play is pure noise.
+Halving it roughly doubles throughput and makes the capture differential a
+tighter, less-diluted signal.
+
+### 3.3 No-progress rule
+
+Optionally adjudicate after `K` plies without a capture (K ≈ 80). Same class of
+rule as the ply cap — a horizon device, not strategy. With a 200-ply cap it is
+close to redundant; keep it configurable and off by default.
+
+### 3.4 Graded value targets
+
+Do not throw away the magnitude. A 4–1 game is more informative than a 1–0 game,
+and the network should see the difference. See the value and score heads in §6.
+
+---
+
+## 4. Curriculum: capture-handicap seeding
+
+**The mechanism that replaces the heuristic bootstrap.**
+
+The win condition is a counter, which means we can start a game *near* the
+threshold without knowing anything about good play. For a fraction of self-play
+games, sample a starting handicap:
+
+```
+a, b  ~  chosen from 0..=5              (independently, per game)
+set   captures[Black] = a, captures[White] = b
+remove b marbles from Black at random, a from White at random
+```
+
+The position stays perfectly consistent — a side that has conceded 5 has 9
+marbles on the board — and **which** marbles are removed is uniformly random, so
+no positional judgment enters. At `(5, 5)` the very next capture ends the game.
+
+Why this works where a heuristic teacher does not:
+
+- **Terminals land inside the search horizon immediately.** At a 1-capture
+  distance, an 800-simulation search genuinely finds forced wins. That is real
+  signal in generation one, from search rather than from an author's opinion.
+- **It teaches the endgame first, then propagates backward.** Classic AlphaZero
+  value bootstrapping — the tail is learned, and each generation extends
+  competence a horizon further toward the opening. Handicap seeding just gives
+  that process a place to start.
+- **It is a pure data-distribution intervention.** No term in the loss, no term
+  in the evaluator, nothing to unlearn. It changes which positions we visit, not
+  what we believe about them.
+- **It fixes an exploration gap that never closes on its own.** Positions at 5–4
+  captures are strategically critical and, under self-play from the standard
+  start, essentially never visited.
+
+**Schedule.** Start with ~70% of games seeded, uniformly over handicap levels.
+Anneal toward 0–20% as the natural decisive rate rises. Retaining a small
+permanent fraction is worthwhile purely as endgame coverage.
+
+**Opening diversity.** Independently of handicap: play from Belgian Daisy
+(clusters start in contact, far livelier than the standard layout) and randomise
+the first 1–2 plies. Both are knowledge-free and both decorrelate the 200 games
+per generation that currently explore one narrow corridor.
+
+---
+
+## 5. Input representation
+
+`(B, 14, 9, 9)` float32. The 9×9 axial grid holds 61 valid cells; 20 slots are
+off-board.
+
+| Plane | Contents |
+| --- | --- |
+| 0 | own marbles (binary) |
+| 1 | opponent marbles (binary) |
+| 2–6 | own losses, thermometer: `own_losses ≥ 1 … ≥ 5` |
+| 7–11 | opponent losses, thermometer: `opp_losses ≥ 1 … ≥ 5` |
+| 12 | `ply / max_plies` |
+| 13 | valid-cell mask |
+
+**Side-to-move relative.** Planes 0/1 are own/opponent, never black/white, so one
+network plays both colours with no side-to-move embedding.
+
+**Thermometer, not scalar, for the counters.** Losses are an *ordinal* quantity
+with a hard threshold at 6. `≥1, ≥2, …` lets a single linear layer read off both
+the magnitude and "one away from losing", which a `count/6` scalar makes the
+network work for. Five planes each is cheap at 9×9.
+
+**No history planes.** Abalone is Markov given board, capture counters and ply —
+there is no repetition rule and no castling/en-passant analogue. This is a real
+simplification over chess and Go and we should take it. (Two previous frames as
+tactical context is a legitimate experiment, but it must earn its place.)
+
+**Hex geometry is already handled.** In axial coordinates all six hex neighbours
+fall inside a standard 3×3 kernel: `(0,±1)` = E/W, `(±1,±1)` = NE/SW, `(±1,0)` =
+NW/SE. The two extra kernel corners are distance-2 non-neighbours the network
+learns to ignore. Plain `Conv2d` is correct here — this should be commented in
+the code so nobody "fixes" it.
+
+**Off-board cells are masked after every block**, not merely flagged on input, so
+activations cannot bleed through the 20 dead slots.
+
+---
+
+## 6. Network
+
+```
+                    (B, 14, 9, 9)
+                          |
+                     stem 3×3 conv -> C channels, BN, ReLU
+                          |
+                    N × ResidualBlock(C)      [+ optional squeeze-excite]
+                          |
+        +-----------+-----+------+-------------+
+        |           |            |             |
+   policy head  value head  score head   capture-map head
+   (42,9,9)      3-way        13-way       (2,9,9)
+        |
+   gather -> 2562 logits
+```
+
+### 6.1 Trunk
+
+`N` blocks × `C` channels, pre-activation residual blocks, stride 1 throughout.
+
+| Configuration | N × C | ~params | Use |
+| --- | --- | --- | --- |
+| `small` | 6 × 96 | ~1.0 M | fast iteration, CI, smoke runs |
+| `base` | 10 × 128 | ~3.0 M | default training runs |
+| `large` | 14 × 192 | ~9.3 M | final run, if throughput allows |
+
+**Squeeze-and-excitation is a natural fit here** and worth evaluating early.
+Abalone's most important state is partly *global* — the capture counters, overall
+material, whether either side is one push from losing. SE blocks let global
+pooled context modulate channels directly rather than forcing that information to
+propagate spatially through the trunk.
+
+### 6.2 Policy head — convolutional, not dense
+
+The current dense head holds **92% of all parameters** in a single
+`16·81 → 2562` layer. That is backwards. The move encoding already has the shape
+to fix it, because both halves of the index space are anchor-major:
+
+```
+inline     idx = anchor_compact · 18 + dir · 3            + (size − 1)
+broadside  idx = anchor_compact · 24 + gi · 8 + mi · 2    + (size − 2)  + 1098
+```
+
+So the entire 2562-move space **is** a `(42, 9, 9)` tensor — 18 inline planes
+(6 directions × 3 sizes) plus 24 broadside planes (3 group directions × 4 move
+directions × 2 sizes) — read out through a fixed index table
+`plane · 81 + COMPACT_TO_CELL[anchor]`. And `42 × 61 = 2562` exactly.
+
+| | dense (current) | convolutional (target) |
+| --- | --- | --- |
+| params | 3,321,282 | ~48 k (3×3) / ~2.7 k (1×1) |
+| equivariance | none | translational |
+
+Use a **3×3** conv so each anchor sees local context. This is the same
+construction AlphaZero-chess uses for its 73×8×8 head, it composes correctly with
+D6 augmentation, and it frees the entire parameter budget for the trunk — which
+is where representation quality actually comes from.
+
+Illegal moves are masked before the softmax at both training and inference time.
+
+### 6.3 Value head — 3-way, not tanh
+
+Output `softmax` over **(win, draw, loss)** rather than a `tanh` scalar.
+
+Abalone under our termination rules is genuinely drawish, and a scalar collapses
+"50/50 sharp" and "certainly drawn" onto the same number. A three-way
+distribution keeps them distinct, is better calibrated, trains against a clean
+cross-entropy, and gives the review UI an honest draw probability to display.
+`E[value] = P(win) − P(loss)` recovers the scalar for MCTS backup.
+
+### 6.4 Score head — auxiliary, from the trajectory
+
+Predict the **final capture differential** `d ∈ [−6, +6]` as a 13-way
+distribution.
+
+This is the densest legitimate signal available. It is computed directly from the
+game record, it is knowledge-free, and it carries far more gradient than a 3-way
+outcome — the difference between winning 6–0 and 6–5 is real information the
+outcome head throws away. It also gives the UI something genuinely useful:
+"expected +1.4 marbles" is more legible to a human than "+0.31".
+
+### 6.5 Capture-map head — auxiliary, from the trajectory
+
+A `(2, 9, 9)` sigmoid map: for each cell, the time-discounted probability that a
+marble is pushed off **from that cell** during the remainder of the game — one
+channel for own losses, one for opponent losses.
+
+Computed purely by replaying the trajectory and recording where captures
+originated. This is the Abalone analogue of KataGo's ownership head and it
+targets the central skill of the game — recognising which marbles are vulnerable
+— **without ever telling the network that edges are dangerous**. It has to
+discover that from where captures actually happen. Dozens of labels per position
+instead of one.
+
+### 6.6 Loss
+
+```
+L = L_policy
+  + w_v · L_value          (3-way cross-entropy)
+  + w_s · L_score          (13-way cross-entropy)
+  + w_c · L_capture_map    (masked BCE)
+  + weight decay (AdamW)
+```
+
+Start at `w_v = 1.0`, `w_s = 0.15`, `w_c = 0.15`. Auxiliary weights should be
+small — their job is to shape the representation, not to dominate it. Ablate both
+against a no-auxiliary baseline on the Elo ladder; if they do not pay, drop them.
+
+---
+
+## 7. Search
+
+MCTS with PUCT. Design targets:
+
+| Parameter | Target | Rationale |
+| --- | --- | --- |
+| simulations (full) | 800–1600 | ≥ 10× branching (~60) for a usable policy target |
+| simulations (fast) | 100–200 | playout cap randomisation, §7.2 |
+| batch size per NN call | 16–64 | virtual loss; the dominant throughput lever |
+| `c_puct` | 1.25–2.0, tuned | |
+| root Dirichlet | `α ≈ 10/branching ≈ 0.15–0.3`, `ε = 0.25` | explicit `SearchConfig` field, not an `eval_fn` side effect |
+| FPU | parent-Q minus reduction | `Q = 0` for unvisited is optimistic when losing, pessimistic when winning |
+| tree reuse | re-root on the played move | recovers a meaningful share of visits for free |
+
+### 7.1 Batched evaluation is the enabling change
+
+One `session.run` per simulation at batch size 1 is the single largest
+inefficiency in the system. Collecting 16–64 leaves per call with virtual loss is
+worth **5–15× on CPU** and considerably more on GPU/ANE. Everything in this
+document that depends on 800+ simulations depends on this landing first.
+
+It also likely inverts the recorded CoreML benchmark, which currently loses
+purely on per-call overhead — exactly what batching amortises.
+
+### 7.2 Playout cap randomisation
+
+Most self-play moves run at the *fast* simulation count; a randomly chosen ~25%
+run at the *full* count, and **only those positions produce policy targets**.
+Roughly 2–3× more games per unit compute at equal target quality. Purely an
+efficiency device — no domain knowledge, no bias.
+
+---
+
+## 8. Training loop
+
+```
+  ┌─ self-play (N games, deep MCTS, handicap-seeded fraction)
+  │        ↓ parquet shards
+  │   replay buffer (rolling W generations, D6 augmentation)
+  │        ↓ uniform sample
+  │   SGD (AdamW, LR schedule, EMA weights)
+  │        ↓ export ONNX
+  └────────┘
+        every 5 gens ─→ anchor ladder ─→ Elo
+```
+
+**Self-play always uses the latest network.** No gating, no promotion, no
+`best.onnx` in the loop — AlphaZero-2017 behaviour. Gating on 21 games is a
+noisy, expensive measurement of something a fixed anchor ladder measures better.
+
+**Value target.** Blend the game outcome with the MCTS root value, ramping toward
+pure outcome as generations progress. Q is denser and less noisy early; z is
+unbiased and should win out.
+
+**Augmentation.** Full D6 (12 elements) via precomputed cell and move-index
+permutations. Free 12× data multiplier — this is the one place the hex symmetry
+of the board pays real dividends.
+
+**EMA.** Maintain an exponential moving average of the weights and export *that*
+for self-play. Cheap variance reduction; standard practice.
+
+**Optimizer.** AdamW with decoupled weight decay, plus a step LR schedule keyed
+to generation milestones. Constant LR for a whole run leaves strength on the
+table.
+
+### 8.1 Measurement — the part that was missing
+
+Every generation:
+
+- **Held-out validation set** (~5k positions from a withheld generation): policy
+  top-1 agreement with the MCTS choice, value cross-entropy, value calibration.
+  This is the fast feedback loop. It would have surfaced the previous run's
+  collapse in minutes rather than after three 24-minute generations.
+- **Data health:** decisive rate, mean plies, mean `|d|` at termination, mean
+  policy-target entropy. If target entropy sits at `ln(branching)`, search is not
+  producing information and nothing downstream matters.
+
+Every 5 generations:
+
+- **Anchor ladder → Elo.** Fixed opponents: `random`, `heuristic@100`,
+  `heuristic@800`, and frozen checkpoints from earlier generations. Fixed
+  opponents give a monotone curve that self-play gating cannot.
+- Eval matches must **randomise openings and temperature-sample the early plies**
+  — with a deterministic evaluator and a fixed start, N games is otherwise 1
+  game replayed N times.
+
+### 8.2 Success criteria, in order
+
+1. Decisive rate > 40%, mean plies < 180.
+2. Policy-target entropy well below `ln(branching)`.
+3. Value cross-entropy falling on held-out data; calibration curve near diagonal.
+4. Monotone Elo against fixed anchors.
+5. **Beats `heuristic@800` at equal simulation count.** ← the milestone
+6. Plays recognisably purposeful Abalone: coherent groups, sumito threats, edge
+   avoidance — all learned, none of it told.
+
+---
+
+## 9. Compute budget
+
+Measured today: **~5,490 NN evaluations/second** aggregate on an M1 Pro
+(9 self-play threads, batch size 1).
+
+| Configuration | evals/gen | @ 5.5k/s | @ 35k/s (batched) |
+| --- | --- | --- | --- |
+| current (200 games × 399 ply × 100 sims) | 8.0 M | 24 min | — |
+| target (200 × ~150 ply × 800 sims) | 24 M | 73 min | 11 min |
+| target + playout cap randomisation | ~10 M | 30 min | **5 min** |
+| validation scale (60 games) | ~3 M | 9 min | 1.5 min |
+
+A 50-generation run at 5 min/generation is roughly 4 hours. That is the loop we
+are building toward, and §7.1 plus §7.2 are what make it reachable.
+
+---
+
+## 10. Explicit non-goals
+
+- **No hand-written positional evaluation** anywhere in the training loop.
+- **No supervised pre-training** on human games or engine games.
+- **No opening book** beyond uniform randomisation of the first plies.
+- **No AlphaZero-scale ambitions.** Single-machine training. The target is a
+  network that clearly beats the hand-written heuristic at equal search and plays
+  purposefully — not a superhuman engine.
+- **No premature distributed training.** Single-node until throughput is a proven
+  wall.
+
+---
+
+## 11. Open questions
+
+| # | Question | How to settle it |
+| --- | --- | --- |
+| Q1 | Does handicap seeding actually produce learnable endgame value in gen 1? | Seed at `(5,5)`, train 1 gen, check value CE on held-out near-terminal positions |
+| Q2 | Are the auxiliary heads worth their weight? | Ablate score and capture-map heads against the Elo ladder |
+| Q3 | Does squeeze-excite pay on a 9×9 board? | A/B at `small` scale |
+| Q4 | 3-way value vs. scalar tanh under our draw rate? | A/B on validation calibration |
+| Q5 | Belgian Daisy only, or mixed with standard? | Compare decisive rate and Elo; standard stays playable in the UI regardless |
+| Q6 | Optimal handicap anneal schedule? | Tune once Q1 is answered |
+| Q7 | Do 2 history frames help despite the position being Markov? | A/B at `small` scale; default off |
