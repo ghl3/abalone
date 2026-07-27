@@ -4,9 +4,22 @@
 //! Game-level state (whose turn, terminal check, ply count) lives in
 //! [`crate::game::Game`]; `Board` is a pure position.
 
-use crate::bitboard::{bit, BB, VALID_MASK};
-use crate::cell::{cell_at, parse, Cell, Side};
+use arrayvec::ArrayVec;
+use rand::Rng;
+
+use crate::bitboard::{bit, BitIter, BB, VALID_MASK};
+use crate::cell::{cell_at, parse, Cell, Side, N_VALID};
+use crate::game::WIN_THRESHOLD;
 use std::fmt;
+
+/// A knowledge-free choice of starting layout. Both are standard tournament
+/// setups; neither encodes any opinion about good play.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Opening {
+    #[default]
+    Standard,
+    BelgianDaisy,
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Board {
@@ -80,6 +93,56 @@ impl Board {
             b.set(parse(n).unwrap(), Some(s));
         }
         b
+    }
+
+    /// Starting position for `opening`.
+    pub fn from_opening(opening: Opening) -> Self {
+        match opening {
+            Opening::Standard => Self::standard(),
+            Opening::BelgianDaisy => Self::belgian_daisy(),
+        }
+    }
+
+    /// Remove `n` marbles of `side` chosen uniformly at random and credit them
+    /// to the opponent's capture counter, as if they had been pushed off.
+    ///
+    /// Curriculum seeding: WHICH marbles are removed is uniformly random, so no
+    /// positional judgment enters. The resulting position is exactly as
+    /// consistent as one reached by play — `side` has `14 - n` marbles on the
+    /// board and the opponent's counter reads `n`.
+    ///
+    /// # Panics
+    /// If `n` exceeds the marbles `side` has left, or if crediting `n` would
+    /// take the opponent's counter to [`WIN_THRESHOLD`] (i.e. hand out a win
+    /// before the first move). Callers keep handicaps in `0..=5`.
+    pub fn concede<R: Rng>(&mut self, side: Side, n: u8, rng: &mut R) {
+        if n == 0 {
+            return;
+        }
+        let available = self.count(side);
+        assert!(
+            u32::from(n) <= available,
+            "concede: asked to remove {n} {side} marble(s) but only {available} are on the board",
+        );
+        let already = self.pushed_off[side.other().idx()];
+        assert!(
+            u32::from(already) + u32::from(n) < u32::from(WIN_THRESHOLD),
+            "concede: crediting {n} to {} would take its counter to {} >= WIN_THRESHOLD ({}); \
+             handicaps must stay in 0..=5",
+            side.other(),
+            u32::from(already) + u32::from(n),
+            WIN_THRESHOLD,
+        );
+
+        // Partial Fisher-Yates over the occupied cells: picks `n` distinct
+        // cells, each subset equally likely.
+        let mut cells: ArrayVec<Cell, N_VALID> = BitIter(self.bb(side)).collect();
+        for i in 0..n as usize {
+            let j = rng.gen_range(i..cells.len());
+            cells.swap(i, j);
+            self.set(cells[i], None);
+        }
+        self.pushed_off[side.other().idx()] += n;
     }
 
     pub const fn bb(&self, side: Side) -> BB {
@@ -159,6 +222,8 @@ impl fmt::Display for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
 
     #[test]
     fn empty_starts_empty() {
@@ -214,4 +279,150 @@ mod tests {
         assert_eq!(b.at(c), None);
     }
 
+    #[test]
+    fn from_opening_matches_named_constructors() {
+        assert_eq!(Board::from_opening(Opening::Standard), Board::standard());
+        assert_eq!(
+            Board::from_opening(Opening::BelgianDaisy),
+            Board::belgian_daisy()
+        );
+        assert_eq!(Opening::default(), Opening::Standard);
+    }
+
+    /// Board invariants that must hold after any mutation.
+    fn assert_consistent(b: &Board) {
+        assert_eq!(b.marbles[0] & b.marbles[1], 0, "bitboards overlap");
+        assert_eq!(b.occupied() & !VALID_MASK, 0, "marble outside VALID_MASK");
+    }
+
+    #[test]
+    fn concede_removes_that_many_and_credits_the_opponent() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        for n in 0..=5u8 {
+            for &opening in &[Opening::Standard, Opening::BelgianDaisy] {
+                let mut b = Board::from_opening(opening);
+                b.concede(Side::Black, n, &mut rng);
+                assert_eq!(b.count(Side::Black), 14 - u32::from(n));
+                assert_eq!(b.count(Side::White), 14, "only the named side loses marbles");
+                assert_eq!(b.pushed_off[Side::White.idx()], n);
+                assert_eq!(b.pushed_off[Side::Black.idx()], 0);
+                assert_consistent(&b);
+            }
+        }
+    }
+
+    #[test]
+    fn concede_is_symmetric_for_white() {
+        let mut rng = SmallRng::seed_from_u64(43);
+        let mut b = Board::standard();
+        b.concede(Side::White, 3, &mut rng);
+        assert_eq!(b.count(Side::White), 11);
+        assert_eq!(b.count(Side::Black), 14);
+        assert_eq!(b.pushed_off[Side::Black.idx()], 3);
+        assert_eq!(b.pushed_off[Side::White.idx()], 0);
+        assert_consistent(&b);
+    }
+
+    #[test]
+    fn concede_zero_is_a_no_op() {
+        let mut rng = SmallRng::seed_from_u64(44);
+        let mut b = Board::standard();
+        b.concede(Side::Black, 0, &mut rng);
+        assert_eq!(b, Board::standard());
+    }
+
+    #[test]
+    fn concede_both_sides_stays_consistent() {
+        let mut rng = SmallRng::seed_from_u64(45);
+        let mut b = Board::belgian_daisy();
+        b.concede(Side::Black, 5, &mut rng);
+        b.concede(Side::White, 5, &mut rng);
+        assert_eq!(b.count(Side::Black), 9);
+        assert_eq!(b.count(Side::White), 9);
+        assert_eq!(b.pushed_off, [5, 5]);
+        assert_eq!(b.lost(Side::Black), 5);
+        assert_eq!(b.lost(Side::White), 5);
+        assert_consistent(&b);
+    }
+
+    #[test]
+    fn concede_picks_uniformly() {
+        // Over many single-marble concessions every starting black cell must be
+        // chosen at least once, and no cell may dominate.
+        let mut rng = SmallRng::seed_from_u64(46);
+        let start = Board::standard();
+        let mut hits: std::collections::HashMap<Cell, u32> = std::collections::HashMap::new();
+        const TRIALS: u32 = 4000;
+        for _ in 0..TRIALS {
+            let mut b = start;
+            b.concede(Side::Black, 1, &mut rng);
+            let removed = start.bb(Side::Black) & !b.bb(Side::Black);
+            assert_eq!(removed.count_ones(), 1);
+            *hits.entry(removed.trailing_zeros() as Cell).or_default() += 1;
+        }
+        assert_eq!(hits.len(), 14, "every black marble must be removable");
+        // Expected 4000/14 ~= 286 each; a 2x band is far outside sampling noise
+        // for a uniform draw but robust against a fixed seed.
+        for (&cell, &count) in &hits {
+            assert!(
+                (143..=572).contains(&count),
+                "cell {} chosen {} times out of {}, not uniform",
+                crate::cell::name(cell),
+                count,
+                TRIALS
+            );
+        }
+    }
+
+    #[test]
+    fn concede_picks_distinct_cells() {
+        // n distinct cells => the count always drops by exactly n.
+        let mut rng = SmallRng::seed_from_u64(47);
+        for _ in 0..500 {
+            let mut b = Board::belgian_daisy();
+            b.concede(Side::White, 5, &mut rng);
+            assert_eq!(b.count(Side::White), 9);
+            assert_consistent(&b);
+        }
+    }
+
+    #[test]
+    fn concede_multiset_over_trials_covers_every_cell() {
+        // With n = 5 every marble should still show up as removable.
+        let mut rng = SmallRng::seed_from_u64(48);
+        let start = Board::belgian_daisy();
+        let mut seen: BB = 0;
+        for _ in 0..500 {
+            let mut b = start;
+            b.concede(Side::Black, 5, &mut rng);
+            seen |= start.bb(Side::Black) & !b.bb(Side::Black);
+        }
+        assert_eq!(seen, start.bb(Side::Black), "some marbles were never picked");
+    }
+
+    #[test]
+    #[should_panic(expected = "only")]
+    fn concede_more_than_available_panics() {
+        let mut rng = SmallRng::seed_from_u64(49);
+        let mut b = Board::empty();
+        b.set(parse("E5").unwrap(), Some(Side::Black));
+        b.concede(Side::Black, 2, &mut rng);
+    }
+
+    #[test]
+    #[should_panic(expected = "WIN_THRESHOLD")]
+    fn concede_to_win_threshold_panics() {
+        let mut rng = SmallRng::seed_from_u64(50);
+        let mut b = Board::standard();
+        b.concede(Side::Black, 6, &mut rng);
+    }
+
+    #[test]
+    #[should_panic(expected = "WIN_THRESHOLD")]
+    fn cumulative_concede_to_win_threshold_panics() {
+        let mut rng = SmallRng::seed_from_u64(51);
+        let mut b = Board::standard();
+        b.concede(Side::Black, 3, &mut rng);
+        b.concede(Side::Black, 3, &mut rng);
+    }
 }

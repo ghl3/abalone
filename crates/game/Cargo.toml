@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 arrayvec = "0.7"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [[bin]]
 name = "movegen-bench"

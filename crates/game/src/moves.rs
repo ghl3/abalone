@@ -1,9 +1,20 @@
 //! Move type, legal-move generation, and `Board::apply`.
 //!
-//! Moves are anchored at the "low" end of a group (the cell with the
-//! smallest bit index when the group is along a positive-shift direction),
-//! which canonicalises away the (start, end) / (end, start) ambiguity
-//! that broadside notation usually has.
+//! Every move carries an `anchor` cell that names the moving group without
+//! ambiguity, but the two move kinds anchor differently:
+//!
+//! - **Inline**: the anchor is the group's *rear* relative to the direction of
+//!   travel. With `d = dir.shift()` the group occupies
+//!   `anchor, anchor + d, ..., anchor + (size - 1) * d`, so `anchor + (size-1)*d`
+//!   is the leading marble doing the pushing and `anchor` is the cell that ends
+//!   up vacated. (For `size == 1` the anchor is simply the marble itself.)
+//!   Because a group and its reverse travel in opposite directions, the
+//!   (anchor, dir) pair is already unique — no extra canonicalisation needed.
+//! - **Broadside**: the group lies along `group_dir`, which is always drawn
+//!   from [`POSITIVE_DIRS`], and the anchor is the group's low-bit-index end.
+//!   Fixing `group_dir` to the positive-shift half of the six directions is
+//!   what canonicalises away the (start, end) / (end, start) ambiguity that
+//!   broadside notation usually has.
 //!
 //! Inline moves: column of `size` ∈ {1, 2, 3} own marbles slides one cell
 //! along `dir`. May push 0, 1, or 2 opponent marbles (1-vs-1 not allowed,
@@ -231,9 +242,28 @@ impl Board {
     /// Apply `mv` for `side`. `mv` MUST be legal for `side` in this position
     /// (use [`legal_moves`] first). Updates `pushed_off` if marbles fall off.
     pub fn apply(&mut self, mv: Move, side: Side) {
+        self.apply_with_capture(mv, side);
+    }
+
+    /// Apply `mv` for `side` and report **which cell** the pushed-off marble
+    /// occupied at the moment it left the board, if any.
+    ///
+    /// At most one marble can leave per move in Abalone — only the outermost
+    /// opponent marble in the pushed column can be over the edge — so `Option`
+    /// is the right shape and the implementation asserts it.
+    ///
+    /// # Why this cannot be recovered by diffing bitboards
+    ///
+    /// For a 2-marble push the *front* opponent drops and the *rear* one slides
+    /// into the cell the front just vacated. `before & !after` therefore names
+    /// the REAR marble's cell — the one that is still on the board — not the
+    /// cell the captured marble fell from. The capture-map training target
+    /// (`docs/ARCHITECTURE.md` §5.4) needs the latter, so the information has to
+    /// come out of `apply` itself rather than be reconstructed afterwards.
+    pub fn apply_with_capture(&mut self, mv: Move, side: Side) -> Option<Cell> {
         match mv {
             Move::Inline { anchor, dir, size } => {
-                self.apply_inline(anchor, dir, size, side);
+                self.apply_inline(anchor, dir, size, side)
             }
             Move::Broadside {
                 anchor,
@@ -241,12 +271,21 @@ impl Board {
                 move_dir,
                 size,
             } => {
+                // A broadside slide moves into empty cells only — it can never
+                // push, so it can never capture.
                 self.apply_broadside(anchor, group_dir, move_dir, size, side);
+                None
             }
         }
     }
 
-    fn apply_inline(&mut self, anchor: Cell, dir: Dir, size: u8, side: Side) {
+    fn apply_inline(
+        &mut self,
+        anchor: Cell,
+        dir: Dir,
+        size: u8,
+        side: Side,
+    ) -> Option<Cell> {
         let d = dir.shift();
         let mut own_clear: BB = 0;
         let mut own_set: BB = 0;
@@ -263,7 +302,7 @@ impl Board {
 
         let mut opp_clear: BB = 0;
         let mut opp_set: BB = 0;
-        let mut drops: u8 = 0;
+        let mut captured: Option<Cell> = None;
 
         if cell_in_board(ahead1) && opp_bb & bit(ahead1 as Cell) != 0 {
             opp_clear |= bit(ahead1 as Cell);
@@ -271,20 +310,23 @@ impl Board {
             if cell_in_board(ahead2) {
                 let ahead2_bb = bit(ahead2 as Cell);
                 if opp_bb & ahead2_bb != 0 {
-                    // 2 opps in line: front opp leaves first.
+                    // 2 opps in line: front opp leaves first. The marble that
+                    // can fall off is the one at `ahead2`, NOT the one at
+                    // `ahead1` (which merely slides forward into `ahead2`).
                     opp_clear |= ahead2_bb;
                     let ahead3 = ahead2 + d;
                     if cell_in_board(ahead3) {
                         opp_set |= bit(ahead3 as Cell);
                     } else {
-                        drops += 1;
+                        captured = Some(ahead2 as Cell);
                     }
                     opp_set |= ahead2_bb; // rear opp moves into ahead2
                 } else {
                     opp_set |= ahead2_bb;
                 }
             } else {
-                drops += 1;
+                // Single opponent, pushed straight over the edge.
+                captured = Some(ahead1 as Cell);
             }
         }
 
@@ -292,7 +334,10 @@ impl Board {
         let o = side.other().idx();
         self.marbles[s] = (self.marbles[s] & !own_clear) | own_set;
         self.marbles[o] = (self.marbles[o] & !opp_clear) | opp_set;
-        self.pushed_off[s] += drops;
+        if captured.is_some() {
+            self.pushed_off[s] += 1;
+        }
+        captured
     }
 
     fn apply_broadside(
@@ -515,6 +560,198 @@ mod tests {
             )
         });
         assert!(bs.is_none(), "broadside blocked by own marble");
+    }
+
+    // ---------- capture-event reporting ----------
+
+    /// Find the unique inline move with the given anchor/dir/size.
+    fn find_inline(board: &Board, side: Side, anchor: &str, dir: Dir, size: u8) -> Move {
+        let a = parse(anchor).unwrap();
+        *legal_moves(board, side)
+            .iter()
+            .find(|m| {
+                matches!(m, Move::Inline { anchor, dir: dd, size: ss }
+                    if *anchor == a && *dd == dir && *ss == size)
+            })
+            .unwrap_or_else(|| {
+                panic!("expected a legal {size}-marble {dir:?} inline move at {anchor}")
+            })
+    }
+
+    #[test]
+    fn capture_none_for_quiet_moves() {
+        let b = Board::standard();
+        for m in legal_moves(&b, Side::White) {
+            let mut t = b;
+            assert_eq!(
+                t.apply_with_capture(m, Side::White),
+                None,
+                "nothing can be captured from the standard opening"
+            );
+            assert_eq!(t.pushed_off, [0, 0]);
+        }
+    }
+
+    #[test]
+    fn capture_none_for_a_non_dropping_push() {
+        // White A1 A2 push the lone black at A3 east into the empty A4.
+        let mut b = Board::empty();
+        b.set(parse("A1").unwrap(), Some(Side::White));
+        b.set(parse("A2").unwrap(), Some(Side::White));
+        b.set(parse("A3").unwrap(), Some(Side::Black));
+        let mv = find_inline(&b, Side::White, "A1", Dir::E, 2);
+        let mut t = b;
+        assert_eq!(t.apply_with_capture(mv, Side::White), None);
+        assert_eq!(t.at(parse("A4").unwrap()), Some(Side::Black));
+    }
+
+    #[test]
+    fn capture_one_opponent_reports_its_own_cell() {
+        // 2-vs-1 west push: black at A1 (west edge) goes off from A1.
+        let mut b = Board::empty();
+        b.set(parse("A1").unwrap(), Some(Side::Black));
+        b.set(parse("A2").unwrap(), Some(Side::White));
+        b.set(parse("A3").unwrap(), Some(Side::White));
+        let mv = find_inline(&b, Side::White, "A3", Dir::W, 2);
+        let mut t = b;
+        let cap = t.apply_with_capture(mv, Side::White);
+        assert_eq!(cap, Some(parse("A1").unwrap()));
+        assert_eq!(t.pushed_off[Side::White.idx()], 1);
+        assert_eq!(t.count(Side::Black), 0);
+    }
+
+    /// The case a naive bitboard diff gets wrong: with two opponents in the
+    /// pushed column the FRONT one drops and the rear one slides into its cell,
+    /// so `before & !after` names the rear marble.
+    #[test]
+    fn capture_two_opponents_reports_the_front_cell_not_the_rear() {
+        // White A1 A2 A3, black A4 A5; A5 is the east edge of row A.
+        let mut b = Board::empty();
+        b.set(parse("A1").unwrap(), Some(Side::White));
+        b.set(parse("A2").unwrap(), Some(Side::White));
+        b.set(parse("A3").unwrap(), Some(Side::White));
+        b.set(parse("A4").unwrap(), Some(Side::Black));
+        b.set(parse("A5").unwrap(), Some(Side::Black));
+        let mv = find_inline(&b, Side::White, "A1", Dir::E, 3);
+
+        let mut t = b;
+        let cap = t.apply_with_capture(mv, Side::White);
+        assert_eq!(
+            cap,
+            Some(parse("A5").unwrap()),
+            "the marble that left the board was the one on A5"
+        );
+        assert_eq!(t.pushed_off[Side::White.idx()], 1);
+
+        // And the diff really does disagree — this is the bug being avoided.
+        let diff = b.bb(Side::Black) & !t.bb(Side::Black);
+        assert_eq!(diff.count_ones(), 1);
+        assert_eq!(
+            diff.trailing_zeros() as Cell,
+            parse("A4").unwrap(),
+            "bitboard diff names the REAR marble; apply_with_capture must not"
+        );
+        assert_ne!(diff.trailing_zeros() as Cell, cap.unwrap());
+    }
+
+    #[test]
+    fn capture_three_vs_two_off_the_north_east_edge() {
+        // Same 3-vs-2 shape on a different axis, to make sure the cell arithmetic
+        // is not accidentally row-A specific. Column of white marbles pushing NE.
+        let mut b = Board::empty();
+        b.set(parse("F5").unwrap(), Some(Side::White));
+        b.set(parse("G6").unwrap(), Some(Side::White));
+        b.set(parse("H7").unwrap(), Some(Side::White));
+        b.set(parse("I8").unwrap(), Some(Side::Black));
+        // I8's NE neighbour is off-board (row I is the north edge), so this is a
+        // 3-vs-1 drop from I8.
+        let mv = find_inline(&b, Side::White, "F5", Dir::NE, 3);
+        let mut t = b;
+        assert_eq!(t.apply_with_capture(mv, Side::White), Some(parse("I8").unwrap()));
+        assert_eq!(t.pushed_off[Side::White.idx()], 1);
+        assert_eq!(t.count(Side::Black), 0);
+    }
+
+    #[test]
+    fn capture_two_vs_one_reports_the_only_opponent() {
+        // 2-vs-1 east push off the A5 edge.
+        let mut b = Board::empty();
+        b.set(parse("A3").unwrap(), Some(Side::White));
+        b.set(parse("A4").unwrap(), Some(Side::White));
+        b.set(parse("A5").unwrap(), Some(Side::Black));
+        let mv = find_inline(&b, Side::White, "A3", Dir::E, 2);
+        let mut t = b;
+        assert_eq!(t.apply_with_capture(mv, Side::White), Some(parse("A5").unwrap()));
+        assert_eq!(t.count(Side::Black), 0);
+        assert_eq!(t.pushed_off[Side::White.idx()], 1);
+    }
+
+    #[test]
+    fn capture_three_vs_two_that_does_not_drop_reports_none() {
+        // 3-vs-2 with a landing square: nothing leaves the board.
+        let mut b = Board::empty();
+        b.set(parse("A1").unwrap(), Some(Side::White));
+        b.set(parse("A2").unwrap(), Some(Side::White));
+        b.set(parse("A3").unwrap(), Some(Side::White));
+        b.set(parse("A4").unwrap(), Some(Side::Black));
+        // Push NE instead so there is room behind the defenders.
+        let mut b2 = Board::empty();
+        b2.set(parse("C3").unwrap(), Some(Side::White));
+        b2.set(parse("D4").unwrap(), Some(Side::White));
+        b2.set(parse("E5").unwrap(), Some(Side::White));
+        b2.set(parse("F6").unwrap(), Some(Side::Black));
+        b2.set(parse("G7").unwrap(), Some(Side::Black));
+        let mv = find_inline(&b2, Side::White, "C3", Dir::NE, 3);
+        let mut t = b2;
+        assert_eq!(t.apply_with_capture(mv, Side::White), None);
+        assert_eq!(t.count(Side::Black), 2, "both defenders stay on the board");
+        assert_eq!(t.at(parse("H8").unwrap()), Some(Side::Black));
+        assert_eq!(t.at(parse("G7").unwrap()), Some(Side::Black));
+        assert_eq!(t.pushed_off, [0, 0]);
+        let _ = b;
+    }
+
+    #[test]
+    fn capture_matches_pushed_off_over_random_play() {
+        use crate::game::{Game, DEFAULT_MAX_PLIES, NO_PROGRESS_DISABLED};
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = SmallRng::seed_from_u64(0xca97u64);
+        for _ in 0..40 {
+            let mut g = Game::new(
+                crate::board::Opening::BelgianDaisy,
+                DEFAULT_MAX_PLIES,
+                NO_PROGRESS_DISABLED,
+            );
+            let mut events = 0u32;
+            while !g.is_terminal() {
+                let moves = g.legal_moves();
+                let pick = rng.gen_range(0..moves.len());
+                let mover = g.turn;
+                let before = g.board.pushed_off;
+                let victim = g.turn.other();
+                let occupied_before = g.board.bb(victim);
+                let cap = g.apply_with_capture(moves[pick]);
+                let delta = u32::from(g.board.pushed_off[mover.idx()])
+                    - u32::from(before[mover.idx()]);
+                match cap {
+                    Some(c) => {
+                        events += 1;
+                        assert_eq!(delta, 1, "a reported capture must bump the counter");
+                        assert_ne!(
+                            occupied_before & bit(c),
+                            0,
+                            "the reported cell must have held an opponent marble"
+                        );
+                    }
+                    None => assert_eq!(delta, 0, "no capture reported => counter unchanged"),
+                }
+                assert!(delta <= 1, "at most one marble can leave per move");
+            }
+            let total: u32 = u32::from(g.board.pushed_off[0]) + u32::from(g.board.pushed_off[1]);
+            assert_eq!(events, total, "every counter increment had an event");
+        }
     }
 
     #[test]

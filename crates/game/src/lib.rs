@@ -15,8 +15,8 @@ pub mod move_index;
 pub mod moves;
 pub mod notation;
 
-pub use board::Board;
+pub use board::{Board, Opening};
 pub use cell::{Cell, Dir, Side, ALL_DIRS, POSITIVE_DIRS};
-pub use game::{Game, GameState};
+pub use game::{Game, GameState, DEFAULT_MAX_PLIES, NO_PROGRESS_DISABLED, WIN_THRESHOLD};
 pub use move_index::{decode, encode, MOVE_SPACE};
 pub use moves::Move;

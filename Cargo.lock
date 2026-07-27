@@ -7,6 +7,7 @@ name = "abalone-game"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "rand",
 ]
 
 [[package]]
@@ -15,6 +16,7 @@ version = "0.1.0"
 dependencies = [
  "abalone-game",
  "rand",
+ "rand_distr",
 ]
 
 [[package]]
@@ -28,7 +30,6 @@ dependencies = [
  "ort",
  "parquet",
  "rand",
- "rand_distr",
  "serde",
  "serde_json",
  "thiserror",
