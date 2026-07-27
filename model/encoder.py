@@ -1,15 +1,32 @@
 """Position encoding and D6 symmetry augmentation.
 
-Plane layout (matches `abalone_net.py`'s `INPUT_CHANNELS = 6`):
-    0: own marbles    9×9 binary  (current side-to-move's marbles)
-    1: opp marbles    9×9 binary
-    2: own captures   9×9 constant — `pushed_off[opp_side] / 6`
-    3: opp captures   9×9 constant — `pushed_off[own_side] / 6`
-    4: ply            9×9 constant — `ply / 400`
-    5: valid mask     9×9 binary   — 1 for the 61 on-board cells
+Plane layout — `(14, 9, 9)`, matching `abalone_net.py`'s
+`INPUT_CHANNELS = 14`, `selfplay/src/encoder.rs`, and MODEL.md §5:
+
+    0     own marbles     9×9 binary   — the side-to-move's marbles
+    1     opp marbles     9×9 binary
+    2–6   own losses      9×9 constant — thermometer, `own_losses >= k+1`
+    7–11  opp losses      9×9 constant — thermometer, `opp_losses >= k+1`
+    12    ply             9×9 constant — `ply / max_plies`, clamped to [0, 1]
+    13    valid mask      9×9 binary   — 1 for the 61 on-board cells
 
 Channels 0/1 are oriented to side-to-move (NOT to a fixed colour), so
 the same network drives both sides without a side-to-move embedding.
+
+**Thermometer, not a `count / 6` scalar.** Losses are an ordinal quantity
+with a hard threshold at 6; `>=1, >=2, ...` lets a single linear layer
+read off both the magnitude and "one away from losing".
+
+**Constant planes are filled across all 81 cells**, off-board slots
+included. The network masks off-board activations internally, so the
+encoder must not pre-mask — and the Rust encoder does exactly the same.
+
+**This layout is a cross-language contract.** `tests/test_conformance.py`
+replays golden fixtures emitted by the Rust `dump-golden` binary through
+`encode_position` and asserts bitwise float equality. A swapped
+capture-plane divergence between the two encoders was live for three
+generations before that guard existed; do not change this file without
+regenerating and re-running the conformance fixtures.
 
 Symmetry: 12 elements of D6. We pre-compute two permutation tables at
 module import:
@@ -33,6 +50,27 @@ NUM_VALID = 61
 NUM_DIRS = 6
 MOVE_SPACE = 2562  # matches abalone_game::move_index::MOVE_SPACE
 NUM_SYMS = 12
+
+# ----- plane layout (mirror of selfplay/src/encoder.rs) ----------------------
+
+NUM_INPUT_CHANNELS = 14
+BOARD_H = 9
+BOARD_W = 9
+PLANE_SIZE = NUM_INPUT_CHANNELS * BOARD_H * BOARD_W  # 1134
+
+OWN_MARBLES_PLANE = 0
+OPP_MARBLES_PLANE = 1
+OWN_LOSSES_PLANE = 2
+OPP_LOSSES_PLANE = 7
+# Thresholds per thermometer: `>=1 .. >=5`. Six losses is terminal, so a
+# `>=6` plane would only ever be set in a position that is already over.
+LOSS_THERMOMETER_PLANES = 5
+PLY_PLANE = 12
+VALID_MASK_PLANE = 13
+
+assert OPP_LOSSES_PLANE == OWN_LOSSES_PLANE + LOSS_THERMOMETER_PLANES
+assert PLY_PLANE == OPP_LOSSES_PLANE + LOSS_THERMOMETER_PLANES
+assert NUM_INPUT_CHANNELS == VALID_MASK_PLANE + 1
 
 # Direction shifts in cell-index space, in the engine's canonical order.
 # E=0, NE=1, NW=2, W=3, SW=4, SE=5
@@ -249,13 +287,23 @@ MOVE_PERM = _build_move_perm()
 
 @dataclass
 class PositionRecord:
-    """Mirror of one parquet row, parsed into native types."""
+    """Mirror of one parquet row, parsed into native types.
+
+    The loss counters are named for *whose marbles were lost*, not for who
+    did the pushing. The Rust `Board::pushed_off[s]` field counts the
+    OPPONENT marbles side `s` has pushed off — it reads naturally as the
+    opposite of what it holds, and reading it as "s's losses" is precisely
+    the bug that swapped the capture planes for three generations. Here
+    `own_losses` unambiguously means *marbles of the side to move that
+    have been pushed off the board* (Rust: `board.lost(game.turn)`).
+    """
 
     own_bb: int  # u128, the side-to-move's bitboard
     opp_bb: int
-    own_pushed_off: int  # number of OWN marbles already pushed off
-    opp_pushed_off: int
+    own_losses: int  # marbles the SIDE TO MOVE has lost (had pushed off)
+    opp_losses: int  # marbles the opponent has lost
     ply: int
+    max_plies: int  # the game's own ply cap; normalises plane 12
     turn: int  # 0 = Black, 1 = White; informational only
 
 
@@ -269,42 +317,93 @@ def bb_to_plane(bb: int) -> np.ndarray:
     return out
 
 
+def ply_fraction(ply: int, max_plies: int) -> float:
+    """`ply / max_plies` clamped to [0, 1]. A zero cap is degenerate
+    configuration; it yields 0 rather than a ZeroDivisionError, and
+    `selfplay/src/encoder.rs::ply_fraction` agrees."""
+    if max_plies == 0:
+        return 0.0
+    return min(max(ply / max_plies, 0.0), 1.0)
+
+
 def encode_position(rec: PositionRecord) -> np.ndarray:
-    """Build the 6-plane (6, 9, 9) tensor for one position."""
-    planes = np.zeros((6, 9, 9), dtype=np.float32)
-    planes[0] = bb_to_plane(rec.own_bb)
-    planes[1] = bb_to_plane(rec.opp_bb)
-    planes[2].fill(rec.own_pushed_off / 6.0)
-    planes[3].fill(rec.opp_pushed_off / 6.0)
-    planes[4].fill(min(rec.ply, 400) / 400.0)
-    planes[5] = VALID_CELL_MASK
+    """Build the `(14, 9, 9)` input tensor for one position.
+
+    Byte-for-byte identical to `selfplay/src/encoder.rs::encode_planes`;
+    `tests/test_conformance.py` enforces that against golden fixtures.
+    """
+    planes = np.zeros((NUM_INPUT_CHANNELS, BOARD_H, BOARD_W), dtype=np.float32)
+
+    # 0/1 — marbles, side-to-move relative.
+    planes[OWN_MARBLES_PLANE] = bb_to_plane(rec.own_bb)
+    planes[OPP_MARBLES_PLANE] = bb_to_plane(rec.opp_bb)
+
+    # 2–11 — loss thermometers. Plane `base + k` is 1.0 iff `losses >= k+1`.
+    # NOTE the direction: 2–6 are the losses of the side TO MOVE.
+    for k in range(LOSS_THERMOMETER_PLANES):
+        threshold = k + 1
+        if rec.own_losses >= threshold:
+            planes[OWN_LOSSES_PLANE + k].fill(1.0)
+        if rec.opp_losses >= threshold:
+            planes[OPP_LOSSES_PLANE + k].fill(1.0)
+
+    # 12 — normalised ply, against the game's own cap (not a hardcoded
+    # constant), so changing the cap moves both implementations together.
+    planes[PLY_PLANE].fill(ply_fraction(rec.ply, rec.max_plies))
+
+    # 13 — valid-cell mask. The one plane that is NOT filled across all 81
+    # cells; everything above deliberately covers the off-board slots too.
+    planes[VALID_MASK_PLANE] = VALID_CELL_MASK
     return planes
 
 
 # ----- symmetry application -------------------------------------------------
 
 
-def apply_sym_to_planes(planes: np.ndarray, sym: int) -> np.ndarray:
-    """Permute the spatial dimensions of `planes` (..., 9, 9) by sym
-    `s`. Channels are unchanged. Constant-broadcast channels are
-    invariant under permutation; we still apply the index gather to
-    keep the code uniform.
+def _build_cell_perm_inv() -> np.ndarray:
+    """`CELL_PERM_INV[s, c']` = the cell that maps *to* `c'` under sym `s`.
 
-    Convention: a marble at cell `c` ends up at cell `CELL_PERM[s, c]`.
-    Implementation: for each output cell c', pull from input cell
-    such that `c -> c'`, i.e., from `CELL_PERM_INV[s, c']`. We compute
-    the inverse on the fly via `argsort` for small fixed `s`."""
-    perm = CELL_PERM[sym]  # (81,)
-    # Inverse permutation (over valid cells; off-board entries are 255).
-    inv = np.full(NUM_CELLS, 255, dtype=np.int16)
-    for c in range(NUM_CELLS):
-        p = perm[c]
-        if p != 255:
-            inv[p] = c
-    # Apply: out[r', q'] = in[inv[r'*9+q']]
+    Precomputed once at import. This used to be rebuilt with an 81-iteration
+    Python loop on every call — which the replay buffer made a per-*example*
+    cost inside the sampling loop."""
+    out = np.full((NUM_SYMS, NUM_CELLS), 255, dtype=np.int16)
+    for s in range(NUM_SYMS):
+        for c in range(NUM_CELLS):
+            p = CELL_PERM[s, c]
+            if p != 255:
+                out[s, p] = c
+    return out
+
+
+CELL_PERM_INV = _build_cell_perm_inv()
+
+# Off-board slots, as a flat 81-length boolean mask. These are fixed points of
+# every board symmetry — see `apply_sym_to_planes`.
+_OFF_BOARD_FLAT = CELL_PERM_INV[0] == 255
+
+
+def apply_sym_to_planes(planes: np.ndarray, sym: int) -> np.ndarray:
+    """Permute the spatial dimensions of `planes` (..., 9, 9) by sym `s`.
+    Channels are unchanged.
+
+    Convention: a value at cell `c` ends up at cell `CELL_PERM[s, c]`.
+    Implementation: for each output cell `c'`, pull from `CELL_PERM_INV[s, c']`.
+
+    Off-board cells are carried through UNCHANGED rather than zeroed. The 20
+    off-board slots have no image under the board symmetry, so they are fixed
+    points of it; zeroing them would make this function do two things at once
+    (permute *and* mask) and, at identity, not be a no-op.
+
+    That distinction is not academic. `encode_position` fills the constant
+    planes (losses, ply) across all 81 cells, so a zeroing implementation made
+    augmented training examples differ from inference-time encodings in exactly
+    those 20 slots — a silent train/inference divergence. Masking off-board
+    cells is the *network's* job (it does so on input and after every block),
+    not the augmentation's."""
+    inv = CELL_PERM_INV[sym]
     flat_in = planes.reshape(*planes.shape[:-2], 81)
-    out_flat = np.zeros_like(flat_in)
-    valid = inv != 255
+    out_flat = flat_in.copy()
+    valid = ~_OFF_BOARD_FLAT
     out_flat[..., valid] = flat_in[..., inv[valid]]
     return out_flat.reshape(planes.shape)
 
@@ -356,7 +455,23 @@ def _sanity_checks() -> None:
     for idx in range(MOVE_SPACE):
         assert MOVE_PERM[6, MOVE_PERM[6, idx]] == idx
 
+    # Plane layout: shape, thermometer direction, and the deliberate lack of
+    # masking on the constant planes.
+    probe = encode_position(
+        PositionRecord(
+            own_bb=0, opp_bb=0, own_losses=3, opp_losses=1,
+            ply=50, max_plies=200, turn=0,
+        )
+    )
+    assert probe.shape == (NUM_INPUT_CHANNELS, BOARD_H, BOARD_W)
+    assert probe.dtype == np.float32
+    assert [probe[OWN_LOSSES_PLANE + k][0, 0] for k in range(5)] == [1, 1, 1, 0, 0]
+    assert [probe[OPP_LOSSES_PLANE + k][0, 0] for k in range(5)] == [1, 0, 0, 0, 0]
+    assert probe[PLY_PLANE].sum() == 81 * 0.25, "constant planes must not be masked"
+    assert probe[VALID_MASK_PLANE].sum() == NUM_VALID
+
     print("encoder sanity checks passed")
+    print(f"  input planes    {NUM_INPUT_CHANNELS} x {BOARD_H} x {BOARD_W} = {PLANE_SIZE}")
     print(f"  CELL_PERM       shape={CELL_PERM.shape}")
     print(f"  MOVE_PERM       shape={MOVE_PERM.shape}")
     print(f"  VALID_CELL_MASK on-board cells = {int(VALID_CELL_MASK.sum())}")
