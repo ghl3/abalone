@@ -791,3 +791,30 @@ def test_namespacing_does_not_enumerate_metric_names() -> None:
 )
 def test_fmt_secs(secs: float, expected: str) -> None:
     assert _fmt_secs(secs) == expected
+
+
+def test_entropy_alarm_never_reads_the_frozen_holdout():
+    """The frozen holdout's `data_*` metrics describe generation 1's dataset —
+    made by a random network — and are constant for the life of the run.
+
+    A fallback to them fired a "search is producing no information" alarm at
+    generation 2 of a run whose current data had just improved from 0.960 to
+    0.804. Alarming on a constant is a false positive every generation forever,
+    which is how people learn to ignore warnings.
+    """
+    import inspect
+
+    from model import train_loop
+
+    src = inspect.getsource(train_loop)
+    # Locate the holdout alarm and assert the frozen prefix is not one of its inputs.
+    marker = "search is producing (near) no information"
+    assert marker in src, "the holdout entropy alarm has moved; update this test"
+    start = src.index("ratio = out.get(")
+    end = src.index(marker)
+    selector = src[start:end]
+    assert "VAL_ROLLING_PREFIX" in selector
+    assert "VAL_FROZEN_PREFIX" not in selector, (
+        "the entropy alarm must not read the frozen holdout — it is constant by "
+        "construction and produces a false alarm every generation"
+    )

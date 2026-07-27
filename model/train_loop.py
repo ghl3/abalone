@@ -1232,14 +1232,23 @@ def _validation_phase(
             total_gens=cfg.gens,
         )
 
-    ratio = out.get(f"{VAL_ROLLING_PREFIX}data_policy_entropy_ratio") or out.get(
-        f"{VAL_FROZEN_PREFIX}data_policy_entropy_ratio"
-    )
+    # ONLY the rolling holdout. Never fall back to the frozen one: its
+    # `data_*` metrics describe generation 1's dataset — produced by a random
+    # network — and are constant for the life of the run by construction. That
+    # fallback fired a "search is producing no information" alarm at generation
+    # 2 of a run whose *current* data had just improved from 0.960 to 0.804,
+    # which is the precise failure the `data_` prefix exists to prevent.
+    #
+    # The rolling holdout is a slice of the newest generation, so its target
+    # entropy tracks current data and alarming on it is meaningful. When it is
+    # unavailable there is no holdout-based alarm — the equivalent check on
+    # full self-play data runs separately and is always available.
+    ratio = out.get(f"{VAL_ROLLING_PREFIX}data_policy_entropy_ratio")
     if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn):
         _warn(
-            f"held-out policy target entropy is {_fmt(ratio)} of ln(mean legal moves) — "
-            f"search is producing (near) no information, and no downstream metric means "
-            f"anything until that is fixed",
+            f"rolling held-out policy target entropy is {_fmt(ratio)} of ln(mean legal "
+            f"moves) — search is producing (near) no information, and no downstream "
+            f"metric means anything until that is fixed",
             gen=new_gen,
             total_gens=cfg.gens,
         )
