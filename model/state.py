@@ -77,6 +77,15 @@ class GenRecord:
     policy_target_entropy: float | None = None
     policy_uniform_entropy: float | None = None
 
+    # -- curriculum (MODEL.md §4) --
+    #: Seeding rate self-play actually used for this generation.
+    handicap_rate: float | None = None
+    #: Rate after this generation's ratchet — what gen+1 will use.
+    handicap_rate_next: float | None = None
+    #: The control signal and its sample size, for this generation.
+    unseeded_games: int | None = None
+    natural_termination_rate: float | None = None
+
     # -- strength --
     ladder_elo: float | None = None
 
@@ -111,11 +120,29 @@ class RunState:
     best_elo: float | None = None
     best_onnx: str = ""  # path relative to runs/<run-id>/
     current_onnx: str = ""
+    #: Live capture-handicap seeding rate (MODEL.md §4). Initialised from
+    #: `self_play.handicap_rate` and ratcheted down by `model.curriculum`; it
+    #: lives here rather than in the config precisely *because* it changes —
+    #: `config_hash` covers the YAML, so an annealed rate written back into the
+    #: config would make every resume refuse. `None` means "never set": a state
+    #: file written before the annealer existed, which falls back to the config.
+    handicap_rate: float | None = None
     history: list[GenRecord] = field(default_factory=list)
 
     @classmethod
-    def fresh(cls, run_id: str, config_hash: str, git_sha: str = "") -> RunState:
-        return cls(run_id=run_id, config_hash=config_hash, git_sha=git_sha)
+    def fresh(
+        cls,
+        run_id: str,
+        config_hash: str,
+        git_sha: str = "",
+        handicap_rate: float | None = None,
+    ) -> RunState:
+        return cls(
+            run_id=run_id,
+            config_hash=config_hash,
+            git_sha=git_sha,
+            handicap_rate=handicap_rate,
+        )
 
     @classmethod
     def load(cls, path: Path) -> RunState:

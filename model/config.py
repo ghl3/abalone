@@ -7,9 +7,11 @@ hardcoded where they are used; if we want to A/B those we edit code, not YAML.
 Three groups mirror something outside Python and must not drift from it:
 
 * `self_play` mirrors `SelfPlayConfig::default()` in
-  [`crates/selfplay/src/lib.rs`]. Every field here becomes a
+  [`crates/selfplay/src/lib.rs`]. Every scalar here becomes a
   `selfplay-batch` flag. `tests/test_config.py` pins the defaults against the
-  Rust source so a change on either side fails loudly.
+  Rust source so a change on either side fails loudly. The one exception is
+  `self_play.handicap_anneal`, which has no Rust counterpart: Rust is told a
+  rate per invocation and knows nothing about how that rate is chosen.
 * `train.loss_weights` mirrors `model.train_step.LossWeights`
   (MODEL.md §6.6: `w_v = 1.0`, `w_s = 0.15`, `w_c = 0.15`).
 * `anchor_ladder.opponents` are `eval-match` player specs.
@@ -54,6 +56,78 @@ NET_PRESETS = ("small", "base", "large")
 #: `NO_PROGRESS_DISABLED = u32::MAX`; `selfplay-batch` does the translation.
 NO_PROGRESS_OFF = 0
 
+#: How `handicap_rate` moves during a run (MODEL.md §4). `controller` is the
+#: closed loop on natural termination; `schedule` is a hand-written `{gen: rate}`
+#: ladder; `off` pins the rate at its configured value for the whole run.
+ANNEAL_MODES = ("controller", "schedule", "off")
+
+
+@dataclass
+class HandicapAnnealConfig:
+    """How the capture-handicap curriculum retires itself (MODEL.md §4).
+
+    The seeded fraction is a crutch: it puts terminal states inside the search
+    horizon before the network can reach them on its own. Left static it is a
+    distortion — at generation 40 a `handicap_rate` of 0.7 still spends 70% of
+    the compute on artificially-seeded positions instead of the ones real play
+    produces. This group is what takes the crutch away.
+
+    **The control signal is the natural termination rate of *unseeded* games**:
+    the fraction of `handicap == (0, 0)` games that reach six captures before
+    the ply cap. It is 0.0 under random play and only rises when the network can
+    actually close a game out — which is exactly the condition under which the
+    endgame curriculum has done its job.
+
+    **Decisive rate is not the signal and must not be substituted for it.**
+    Belgian Daisy with adjudication and no handicap measures 63% decisive under
+    *uniformly random* play (mean margin 0.89 — one lucky push at the ply cap).
+    Any threshold on decisive rate fires in generation one against a random
+    network and pulls the crutch before it has done anything.
+    """
+
+    mode: str = "controller"
+    #: Step down once this fraction of unseeded games ends on captures.
+    target_natural_termination: float = 0.25
+    #: Absolute decrement per firing. One step per generation, at most.
+    step: float = 0.05
+    #: The rate never goes below this, in any mode. Deliberately non-zero:
+    #: positions at 5–4 captures are strategically critical and essentially
+    #: never visited by self-play from a fresh start (MODEL.md §4), so a
+    #: permanent trickle of seeded games is worth keeping purely as coverage.
+    floor: float = 0.10
+    #: Below this many unseeded games the termination estimate is noise and the
+    #: controller holds rather than acting on it.
+    min_unseeded_games: int = 20
+    #: `{gen: rate}` — "from this generation onward, use this rate". Used only
+    #: when `mode == "schedule"`. Empty is a no-op.
+    schedule: dict = field(default_factory=dict)
+
+    def validate(self) -> None:
+        _require(
+            self.mode in ANNEAL_MODES,
+            f"self_play.handicap_anneal.mode must be one of {list(ANNEAL_MODES)}, "
+            f"got {self.mode!r}",
+        )
+        _require(
+            0.0 <= self.target_natural_termination <= 1.0,
+            "self_play.handicap_anneal.target_natural_termination must be in [0, 1]",
+        )
+        _require(self.step > 0.0, "self_play.handicap_anneal.step must be > 0")
+        _require(0.0 <= self.floor <= 1.0, "self_play.handicap_anneal.floor must be in [0, 1]")
+        _require(
+            self.min_unseeded_games >= 0,
+            "self_play.handicap_anneal.min_unseeded_games must be >= 0",
+        )
+        for k, v in self.schedule.items():
+            _require(
+                isinstance(k, int) and not isinstance(k, bool),
+                f"self_play.handicap_anneal.schedule keys must be generation ints, got {k!r}",
+            )
+            _require(
+                0.0 <= float(v) <= 1.0,
+                f"self_play.handicap_anneal.schedule[{k}] must be in [0, 1]",
+            )
+
 
 @dataclass
 class SelfPlayConfig:
@@ -90,8 +164,15 @@ class SelfPlayConfig:
     opening: str = "standard"
     #: Fraction of games seeded with a capture handicap. This is what makes
     #: terminals reachable in generation one; it replaced the heuristic teacher.
+    #:
+    #: **Initial value only.** The live rate is annealed down during a run and
+    #: lives in `state.json` (`RunState.handicap_rate`). Nothing may write the
+    #: annealed value back here: this field is inside `config_hash`, so a run
+    #: that mutated it would refuse to resume itself the moment the curriculum
+    #: moved.
     handicap_rate: float = 0.7
     handicap_max: int = 5
+    handicap_anneal: HandicapAnnealConfig = field(default_factory=HandicapAnnealConfig)
     #: Uniformly-random plies before search takes over. Decorrelates a
     #: generation's games; not searched and not recorded.
     random_opening_plies: int = 2
@@ -118,6 +199,13 @@ class SelfPlayConfig:
         _require(
             0 <= self.handicap_max <= 5,
             "self_play.handicap_max must be in [0, 5]; 6 would seed a finished game",
+        )
+        self.handicap_anneal.validate()
+        _require(
+            self.handicap_anneal.floor <= self.handicap_rate,
+            f"self_play.handicap_anneal.floor ({self.handicap_anneal.floor}) is above the "
+            f"initial self_play.handicap_rate ({self.handicap_rate}); the curriculum could "
+            f"never move",
         )
         _require(self.temperature > 0.0, "self_play.temperature must be > 0")
         _require(self.max_plies > 0, "self_play.max_plies must be > 0")
@@ -450,6 +538,7 @@ def _resolve(annotation: Any, owner: type) -> Any:
 
 
 __all__ = [
+    "ANNEAL_MODES",
     "HASH_EXCLUDED",
     "NET_PRESETS",
     "NO_PROGRESS_OFF",
@@ -457,6 +546,7 @@ __all__ = [
     "AnchorLadderConfig",
     "EmaConfig",
     "ExportConfig",
+    "HandicapAnnealConfig",
     "LossWeightsConfig",
     "RetentionConfig",
     "RunConfig",

@@ -208,6 +208,8 @@ One generation, end to end:
 
   4. validate         held-out policy top-1, value CE, calibration
                       data health: decisive rate, plies, target entropy
+                      curriculum: ratchet handicap_rate on the natural
+                      termination rate of unseeded games (MODEL §4.1)
 
   5. anchor ladder    every 5 gens: vs random / heuristic@100 /
                       heuristic@800 / frozen earlier checkpoints → Elo
@@ -377,7 +379,8 @@ silently invalidates every shard in the buffer with no detection today.
 ```
 runs/<run-id>/
 ├── config.yaml              frozen resolved config
-├── state.json               atomic; phase, generation, git SHA, history
+├── state.json               atomic; phase, generation, git SHA, annealed
+│                            handicap_rate, history
 ├── metrics.jsonl            one line per generation
 ├── tb/                      TensorBoard events
 ├── checkpoints/

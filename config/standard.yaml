@@ -32,11 +32,27 @@ self_play:
   temperature_plies: 30
   temperature: 1.0
   opening: belgian
-  # MODEL.md §4: start at ~70% seeded and anneal toward 0–20% as the natural
-  # decisive rate rises. There is no schedule for this yet — retune by hand
-  # between runs once the decisive rate from unseeded games is worth reading.
+  # MODEL.md §4. The initial value only — the live rate is annealed down and
+  # persisted in state.json, so this stays inside config_hash and a resume is
+  # still refused if somebody edits it.
   handicap_rate: 0.7
   handicap_max: 5
+  handicap_anneal:
+    # Closed loop on the *natural termination rate of unseeded games* — the
+    # fraction of handicap-(0,0) games that reach six captures before the ply
+    # cap. Not the decisive rate: with adjudication, uniformly random play is
+    # already 63% decisive and 0% naturally terminating, so a decisive-rate
+    # threshold pulls the curriculum in generation one.
+    mode: controller
+    target_natural_termination: 0.25
+    step: 0.05
+    # A permanent 10% trickle: 5–4 capture positions are strategically critical
+    # and essentially never visited by self-play from a fresh start.
+    floor: 0.10
+    # 200 games/gen at rate 0.7 leaves ~60 unseeded — comfortably above this,
+    # and the margin only grows as the rate falls.
+    min_unseeded_games: 20
+    schedule: {}
   random_opening_plies: 2
   max_plies: 200
   no_progress_plies: 0

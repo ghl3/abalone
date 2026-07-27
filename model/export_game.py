@@ -14,6 +14,12 @@ generations. `summarise_generation` reports `policy_target_entropy` beside
 `policy_uniform_entropy` (= `ln(mean legal moves)`) so that comparison is one
 line of CLI output, and the names match `model/validate.py` deliberately.
 
+`summarise_generation` is also where the **curriculum control signal** is
+measured: `natural_termination_rate`, the fraction of unseeded games that reach
+six captures before the ply cap, plus the seeded/unseeded split of the decisive
+rate and mean |score| that a human reads to sanity-check it.
+`model/curriculum.py` turns that into a `handicap_rate` (MODEL.md §4).
+
 **Sign conventions — the easiest thing here to get wrong and the hardest to
 notice.** The shard stores `z`, `score_diff` and `q` POV-relative to the side to
 move *at that position*, so raw values alternate sign down a trajectory. This
@@ -138,13 +144,22 @@ class Skipped:
 
 @dataclass
 class ExportResult:
-    """What one generation's export produced."""
+    """What one generation's export produced.
+
+    `games` holds the games actually written to disk, which `export.games_per_gen`
+    caps. `summary` is computed over **every** game in the generation's shards,
+    capped or not: it feeds the curriculum controller (MODEL.md §4), and a
+    controller reading a 20-of-200 subsample would be measuring the export
+    limit as much as the network.
+    """
 
     gen: int
     games: list[dict[str, Any]] = field(default_factory=list)
     paths: list[Path] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
     shards_read: int = 0
+    #: `summarise_generation` over all games; `None` only if it never ran.
+    summary: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -393,6 +408,12 @@ def export_generation(
     A shard or a game that cannot be read is recorded in `ExportResult.skipped`
     and the batch continues — one truncated file (a self-play worker killed
     mid-write is the common case) must not cost a generation's export.
+
+    `limit` caps what is *written*, not what is *measured*: every game is built
+    and folded into `result.summary`, and only the first `limit` are kept and
+    written out. The generator below is what keeps that from doubling peak
+    memory on a 200-game generation — a game that is not being written is
+    summarised and dropped in the same step.
     """
     shards_dir = Path(shards_dir)
     out_dir = Path(out_dir)
@@ -401,29 +422,32 @@ def export_generation(
     result = ExportResult(gen=int(gen), shards_read=len(paths))
     if not paths:
         result.skipped.append(Skipped(str(shards_dir), "no shard files found"))
+        result.summary = summarise_generation(())
         return result
 
     games, skipped = collect_games(paths)
     result.skipped.extend(skipped)
 
-    for game_id, rows in games.items():
-        if limit is not None and len(result.games) >= limit:
-            break
-        try:
-            game = export_game(rows, run_id, gen)
-        except ShardError as exc:
-            result.skipped.append(Skipped(f"game {game_id}", str(exc)))
-            continue
-        path = out_dir / game_filename(game_id)
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(game), encoding="utf-8")
-        except OSError as exc:
-            result.skipped.append(Skipped(str(path), f"write failed ({exc})"))
-            continue
-        result.games.append(game)
-        result.paths.append(path)
+    def build_and_write() -> Iterable[dict[str, Any]]:
+        for game_id, rows in games.items():
+            try:
+                game = export_game(rows, run_id, gen)
+            except ShardError as exc:
+                result.skipped.append(Skipped(f"game {game_id}", str(exc)))
+                continue
+            if limit is None or len(result.games) < limit:
+                path = out_dir / game_filename(game_id)
+                try:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(game), encoding="utf-8")
+                    result.games.append(game)
+                    result.paths.append(path)
+                except OSError as exc:
+                    # A failed write costs the file, not the statistics.
+                    result.skipped.append(Skipped(str(path), f"write failed ({exc})"))
+            yield game
 
+    result.summary = summarise_generation(build_and_write())
     return result
 
 
@@ -465,35 +489,135 @@ def visit_entropy(visits: Iterable[int]) -> float:
     return entropy
 
 
-def _mean(values: Sequence[float]) -> float:
-    return sum(values) / len(values) if values else NAN
+def _ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else NAN
+
+
+def is_unseeded(game: Mapping[str, Any]) -> bool:
+    """True when the game was played from the plain opening.
+
+    By the *recorded* handicap, not by whether self-play chose the game for
+    seeding: the two handicaps are drawn independently per side, so a game
+    selected for seeding legitimately comes out at `(0, 0)` and is, in every way
+    that matters to the measurement, an unseeded game.
+    """
+    try:
+        black, white = game["handicap"][0], game["handicap"][1]
+    except (KeyError, IndexError, TypeError):
+        return False
+    return int(black) == 0 and int(white) == 0
+
+
+def terminated_naturally(game: Mapping[str, Any]) -> bool:
+    """True when the game ended on six captures rather than at the ply cap.
+
+    With the no-progress rule off (the default), `Game::state()` has exactly two
+    exits: a side reaching `WIN_THRESHOLD` captures, or `ply >= max_plies`, which
+    is adjudicated on capture differential. A recorded ply count short of the
+    game's own cap therefore means the six captures happened — no separate flag
+    needed, and none exists in the shard schema.
+
+    The reading is conservative in one corner: a game whose sixth capture lands
+    on the very move that reaches the cap counts as capped. That errs toward
+    holding the curriculum, which is the safe direction.
+
+    **This is only sound while `no_progress_plies` is 0.** With the rule on, a
+    third exit stops the game early without six captures and this returns a false
+    positive; `model.curriculum.AnnealStats.from_summary` refuses to use the
+    statistic in that case.
+    """
+    try:
+        plies = int(game["result"]["plies"])
+        cap = int(game["max_plies"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return cap > 0 and plies < cap
+
+
+@dataclass
+class _Split:
+    """One half of the seeded / unseeded split of a generation's games."""
+
+    games: int = 0
+    decisive: int = 0
+    natural: int = 0
+    plies: int = 0
+    abs_score: int = 0
+
+    def add(self, *, decisive: bool, natural: bool, plies: int, abs_score: int) -> None:
+        self.games += 1
+        self.decisive += int(decisive)
+        self.natural += int(natural)
+        self.plies += plies
+        self.abs_score += abs_score
+
+    def rates(self) -> dict[str, Any]:
+        return {
+            "games": self.games,
+            "decisive_rate": _ratio(self.decisive, self.games),
+            "natural_termination_rate": _ratio(self.natural, self.games),
+            "mean_plies": _ratio(self.plies, self.games),
+            "mean_abs_score_diff": _ratio(self.abs_score, self.games),
+        }
 
 
 def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """Aggregate health stats over exported games.
+    """Aggregate health stats over a generation's games, in one streaming pass.
 
-    The pair that matters is `policy_target_entropy` against
-    `policy_uniform_entropy` (= `ln(mean_legal_moves)`). Their ratio at 1.0 means
-    search returned roughly uniform visits over legal moves: the policy target
-    carries zero information and no downstream metric means anything. That is
-    precisely the failure that ran unnoticed for three generations.
+    The pair that matters for the *training signal* is `policy_target_entropy`
+    against `policy_uniform_entropy` (= `ln(mean_legal_moves)`). Their ratio at
+    1.0 means search returned roughly uniform visits over legal moves: the policy
+    target carries zero information and no downstream metric means anything. That
+    is precisely the failure that ran unnoticed for three generations.
+
+    The number that drives the *curriculum* is `natural_termination_rate`: the
+    fraction of **unseeded** games (`handicap == (0, 0)`) that reached six
+    captures before the ply cap. See `model.curriculum` for why that, and not
+    the decisive rate, is the signal — under uniformly random play the decisive
+    rate is already 63% while natural termination is 0%.
+
+    The seeded/unseeded split of `decisive_rate` and `mean_abs_score_diff` is
+    reported beside it as the human sanity check: seeded games start one capture
+    from the end and should look nothing like unseeded ones.
 
     `mean_legal_moves` is the mean number of root children in the search result,
     which for a fully-expanded root is the legal-move count.
     """
-    games = list(games)
-    n_games = len(games)
+    n_games = 0
+    outcomes: Counter[str] = Counter()
+    handicaps: Counter[str] = Counter()
+    plies_total = 0
+    abs_score_total = 0
 
-    outcomes = Counter(str(g["result"]["outcome"]) for g in games)
-    plies = [int(g["result"]["plies"]) for g in games]
-    abs_score = [abs(int(g["result"]["score_diff"])) for g in games]
-    handicaps = Counter(f"{int(g['handicap'][0])}-{int(g['handicap'][1])}" for g in games)
+    unseeded = _Split()
+    seeded = _Split()
 
     positions = 0
     policy_rows = 0
-    entropies: list[float] = []
-    legal_counts: list[int] = []
+    entropy_total = 0.0
+    entropy_n = 0
+    legal_total = 0
+    legal_n = 0
+
     for game in games:
+        n_games += 1
+        result = game["result"]
+        outcome = str(result["outcome"])
+        plies = int(result["plies"])
+        abs_score = abs(int(result["score_diff"]))
+        outcomes[outcome] += 1
+        handicaps[f"{int(game['handicap'][0])}-{int(game['handicap'][1])}"] += 1
+        plies_total += plies
+        abs_score_total += abs_score
+
+        split = unseeded if is_unseeded(game) else seeded
+        split.add(
+            decisive=outcome in (BLACK_WINS, WHITE_WINS),
+            natural=terminated_naturally(game),
+            plies=plies,
+            abs_score=abs_score,
+        )
+
         for move in game["moves"]:
             positions += 1
             if not move["is_full_search"]:
@@ -502,11 +626,13 @@ def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             counts = [int(v) for _, v in move["visits"]]
             entropy = visit_entropy(counts)
             if not math.isnan(entropy):
-                entropies.append(entropy)
-            legal_counts.append(len(counts))
+                entropy_total += entropy
+                entropy_n += 1
+            legal_total += len(counts)
+            legal_n += 1
 
-    mean_legal = _mean(legal_counts)
-    target_entropy = _mean(entropies)
+    mean_legal = _ratio(legal_total, legal_n)
+    target_entropy = _ratio(entropy_total, entropy_n)
     uniform_entropy = math.log(mean_legal) if mean_legal and mean_legal > 0 else NAN
     ratio = (
         target_entropy / uniform_entropy
@@ -515,18 +641,33 @@ def summarise_generation(games: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     )
 
     decisive = outcomes[BLACK_WINS] + outcomes[WHITE_WINS]
+    unseeded_rates = unseeded.rates()
+    seeded_rates = seeded.rates()
     return {
         "games": n_games,
         "positions": positions,
         "policy_rows": policy_rows,
-        "full_search_rate": policy_rows / positions if positions else NAN,
-        "decisive_rate": decisive / n_games if n_games else NAN,
-        "draw_rate": outcomes[DRAW] / n_games if n_games else NAN,
-        "black_win_rate": outcomes[BLACK_WINS] / n_games if n_games else NAN,
-        "white_win_rate": outcomes[WHITE_WINS] / n_games if n_games else NAN,
-        "mean_plies": _mean(plies),
-        "mean_abs_score_diff": _mean(abs_score),
+        "full_search_rate": _ratio(policy_rows, positions),
+        "decisive_rate": _ratio(decisive, n_games),
+        "draw_rate": _ratio(outcomes[DRAW], n_games),
+        "black_win_rate": _ratio(outcomes[BLACK_WINS], n_games),
+        "white_win_rate": _ratio(outcomes[WHITE_WINS], n_games),
+        "mean_plies": _ratio(plies_total, n_games),
+        "mean_abs_score_diff": _ratio(abs_score_total, n_games),
         "handicap_distribution": dict(sorted(handicaps.items())),
+        # ---- the curriculum control signal (MODEL.md §4) ----
+        "unseeded_games": unseeded.games,
+        "natural_terminations": unseeded.natural,
+        "natural_termination_rate": unseeded_rates["natural_termination_rate"],
+        "unseeded_decisive_rate": unseeded_rates["decisive_rate"],
+        "unseeded_mean_plies": unseeded_rates["mean_plies"],
+        "unseeded_mean_abs_score_diff": unseeded_rates["mean_abs_score_diff"],
+        "seeded_games": seeded.games,
+        "seeded_natural_termination_rate": seeded_rates["natural_termination_rate"],
+        "seeded_decisive_rate": seeded_rates["decisive_rate"],
+        "seeded_mean_plies": seeded_rates["mean_plies"],
+        "seeded_mean_abs_score_diff": seeded_rates["mean_abs_score_diff"],
+        # ---- the training signal ----
         "policy_target_entropy": target_entropy,
         "policy_uniform_entropy": uniform_entropy,
         "policy_entropy_ratio": ratio,
@@ -552,8 +693,14 @@ UNIFORM_ENTROPY_WARN_RATIO = 0.98
 
 
 def format_generation_report(result: ExportResult, max_skipped: int = 5) -> list[str]:
-    """Human-readable lines for one generation's export."""
-    summary = summarise_generation(result.games)
+    """Human-readable lines for one generation's export.
+
+    Reports `result.summary` — every game in the generation — falling back to the
+    written subset for an `ExportResult` built by hand.
+    """
+    summary = result.summary
+    if summary is None:
+        summary = summarise_generation(result.games)
     lines = [
         f"gen {result.gen:03d}  {summary['games']} games / {summary['positions']} positions"
         f"  from {result.shards_read} shard(s)"
@@ -565,6 +712,21 @@ def format_generation_report(result: ExportResult, max_skipped: int = 5) -> list
             f"   mean plies {_fmt(summary['mean_plies'], 1)}"
             f"   mean |score| {_fmt(summary['mean_abs_score_diff'])}"
             f"   full-search {_pct(summary['full_search_rate'])}"
+        )
+        # The split the curriculum controller reads. Seeded games start a capture
+        # from the end and look nothing like unseeded ones; averaging the two
+        # together is what makes a raw decisive rate unreadable.
+        lines.append(
+            f"  unseeded {summary['unseeded_games']:>3} games"
+            f"  ·  natural termination {_pct(summary['natural_termination_rate'])}"
+            f"   decisive {_pct(summary['unseeded_decisive_rate'])}"
+            f"   mean |score| {_fmt(summary['unseeded_mean_abs_score_diff'])}"
+        )
+        lines.append(
+            f"  seeded   {summary['seeded_games']:>3} games"
+            f"  ·  natural termination {_pct(summary['seeded_natural_termination_rate'])}"
+            f"   decisive {_pct(summary['seeded_decisive_rate'])}"
+            f"   mean |score| {_fmt(summary['seeded_mean_abs_score_diff'])}"
         )
         handicaps = summary["handicap_distribution"]
         if handicaps:

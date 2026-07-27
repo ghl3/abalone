@@ -44,11 +44,13 @@ from model.export_game import (
     export_generation,
     find_generations,
     format_generation_report,
+    is_unseeded,
     load_exported_games,
     main,
     read_shard,
     split_games,
     summarise_generation,
+    terminated_naturally,
     visit_entropy,
 )
 
@@ -612,6 +614,131 @@ def test_summary_aggregates_outcomes_plies_and_handicaps():
     assert summary["handicap_distribution"] == {"0-0": 1, "2-1": 2}
 
 
+# --------------------------------------------------------------------------- #
+# The curriculum control signal (MODEL.md §4)                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _game(game_id, *, handicap, plies, max_plies=200, z_black=1, score_black=3):
+    """One game with the two properties the curriculum measures: whether it was
+    seeded, and whether it ended before the ply cap."""
+    return export_game(
+        make_game(
+            game_id=game_id,
+            n_plies=plies,
+            max_plies=max_plies,
+            handicap=handicap,
+            z_black=z_black,
+            score_black=score_black,
+        ),
+        "r",
+        0,
+    )
+
+
+def test_natural_termination_is_measured_over_unseeded_games_only():
+    """Three unseeded games, one of which ran to the cap; the seeded games are
+    not in the denominator however they ended."""
+    games = [
+        _game(1, handicap=(0, 0), plies=40),  # natural
+        _game(2, handicap=(0, 0), plies=90),  # natural
+        _game(3, handicap=(0, 0), plies=200),  # hit the cap
+        _game(4, handicap=(5, 5), plies=6),  # seeded, natural, not counted
+        _game(5, handicap=(0, 3), plies=200),  # seeded, capped, not counted
+    ]
+
+    summary = summarise_generation(games)
+
+    assert summary["unseeded_games"] == 3
+    assert summary["seeded_games"] == 2
+    assert summary["natural_terminations"] == 2
+    assert summary["natural_termination_rate"] == pytest.approx(2 / 3)
+    assert summary["seeded_natural_termination_rate"] == pytest.approx(0.5)
+
+
+def test_a_seeded_game_that_drew_zero_zero_is_an_unseeded_game():
+    """Handicaps are drawn independently per side, so a game selected for
+    seeding legitimately comes out at (0, 0). "Unseeded" is defined by the
+    recorded handicap — which is what the position actually was — and not by
+    whether self-play intended to seed it. There is nothing in the shard that
+    records the intent, and nothing that should."""
+    summary = summarise_generation([_game(1, handicap=(0, 0), plies=30)])
+    assert summary["unseeded_games"] == 1
+    assert summary["natural_termination_rate"] == pytest.approx(1.0)
+
+
+def test_a_game_that_reaches_the_cap_did_not_terminate_naturally():
+    """The whole detection rule: with the no-progress rule off, a game either
+    reaches six captures or hits `max_plies`, so `plies < max_plies` *is*
+    natural termination. The boundary is what matters — `plies == max_plies` is
+    the adjudicated case."""
+    assert terminated_naturally(_game(1, handicap=(0, 0), plies=199, max_plies=200))
+    assert not terminated_naturally(_game(2, handicap=(0, 0), plies=200, max_plies=200))
+    assert is_unseeded(_game(3, handicap=(0, 0), plies=10))
+    assert not is_unseeded(_game(4, handicap=(0, 1), plies=10))
+
+
+def test_the_seeded_split_of_the_diagnostics_is_reported_separately():
+    """Seeded games start a capture from the end: short, decisive, wide margins.
+    Averaged together with unseeded ones the headline decisive rate is
+    uninterpretable, which is the reason the split exists."""
+    games = [
+        _game(1, handicap=(5, 5), plies=8, z_black=1, score_black=6),
+        _game(2, handicap=(5, 4), plies=12, z_black=1, score_black=6),
+        _game(3, handicap=(0, 0), plies=200, z_black=0, score_black=0),
+        _game(4, handicap=(0, 0), plies=200, z_black=1, score_black=1),
+    ]
+
+    summary = summarise_generation(games)
+
+    assert summary["seeded_decisive_rate"] == pytest.approx(1.0)
+    assert summary["seeded_mean_abs_score_diff"] == pytest.approx(6.0)
+    assert summary["seeded_mean_plies"] == pytest.approx(10.0)
+    assert summary["unseeded_decisive_rate"] == pytest.approx(0.5)
+    assert summary["unseeded_mean_abs_score_diff"] == pytest.approx(0.5)
+    assert summary["unseeded_mean_plies"] == pytest.approx(200.0)
+    # The headline numbers still cover the whole generation.
+    assert summary["decisive_rate"] == pytest.approx(0.75)
+
+
+def test_no_unseeded_games_gives_nan_not_zero():
+    """A generation with every game seeded has no estimate at all. Zero would
+    read as "the network never finishes a game" and hold the curriculum for the
+    right-looking wrong reason."""
+    summary = summarise_generation([_game(1, handicap=(1, 2), plies=10)])
+    assert summary["unseeded_games"] == 0
+    assert math.isnan(summary["natural_termination_rate"])
+
+
+def test_the_measurement_covers_every_game_not_just_the_exported_ones(tmp_path):
+    """`export.games_per_gen` caps what is *written*. A controller reading only
+    the written subset would be measuring the export limit: at 20-of-200 with a
+    0.7 seeding rate it would see ~6 unseeded games a generation and hold
+    forever."""
+    rows = []
+    for gid in range(10):
+        rows += make_game(
+            game_id=gid,
+            n_plies=4 if gid < 3 else 60,
+            max_plies=60,
+            handicap=(0, 0) if gid < 6 else (3, 2),
+        )
+    shards = tmp_path / "shards"
+    write_shard(shards / "shard_t00_0000.parquet", rows)
+
+    result = export_generation(shards, tmp_path / "out", "run-x", 5, limit=2)
+
+    assert len(result.games) == 2, "the export limit still caps what is written"
+    assert result.summary["games"] == 10
+    assert result.summary["unseeded_games"] == 6
+    assert result.summary["natural_terminations"] == 3
+    assert result.summary["natural_termination_rate"] == pytest.approx(0.5)
+    # And the report a human reads is the full-generation one.
+    report = "\n".join(format_generation_report(result))
+    assert "10 games" in report
+    assert "natural termination 50.0%" in report
+
+
 def test_summary_of_nothing_is_nan_not_a_misleading_zero():
     summary = summarise_generation([])
     assert summary["games"] == 0
@@ -620,6 +747,9 @@ def test_summary_of_nothing_is_nan_not_a_misleading_zero():
         "decisive_rate",
         "mean_plies",
         "mean_abs_score_diff",
+        "natural_termination_rate",
+        "unseeded_decisive_rate",
+        "seeded_decisive_rate",
         "policy_target_entropy",
         "policy_uniform_entropy",
         "policy_entropy_ratio",

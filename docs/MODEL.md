@@ -155,14 +155,100 @@ Why this works where a heuristic teacher does not:
   captures are strategically critical and, under self-play from the standard
   start, essentially never visited.
 
-**Schedule.** Start with ~70% of games seeded, uniformly over handicap levels.
-Anneal toward 0–20% as the natural decisive rate rises. Retaining a small
-permanent fraction is worthwhile purely as endgame coverage.
-
 **Opening diversity.** Independently of handicap: play from Belgian Daisy
 (clusters start in contact, far livelier than the standard layout) and randomise
 the first 1–2 plies. Both are knowledge-free and both decorrelate the 200 games
 per generation that currently explore one narrow corridor.
+
+### 4.1 Annealing — retiring the crutch
+
+Start with ~70% of games seeded, uniformly over handicap levels, and ratchet
+that down toward a permanent floor as the network learns to finish games on its
+own. Left static, a 0.7 rate would still be spending 70% of generation 40's
+compute on artificially-seeded positions instead of the ones real play produces.
+
+**The control signal is the natural termination rate of unseeded games**: of the
+games recorded with `handicap == (0, 0)`, the fraction that reach six captures
+**before** the ply cap.
+
+**Decisive rate was considered and rejected.** It is the intuitive choice and it
+is wrong. Measured over 200 uniformly-random playouts, Belgian Daisy with
+adjudication and no handicap is already **63% decisive**, with a mean margin of
+0.89 captures — because adjudication at the ply cap resolves nearly any game on
+one lucky push. Any defensible threshold on decisive rate therefore fires in
+generation one, against a *random* network, and pulls the crutch before it has
+done anything. Over those same playouts the natural termination rate was
+**0.0%** — mean plies came out at exactly the cap (400.0 / 200.0 / 200.0), so not
+one game in 200 ended on its own. That number rises only when the network can
+genuinely close a game out, which is precisely the condition under which the
+endgame curriculum has stopped earning its keep.
+
+**Detecting it.** With the no-progress rule off (the default),
+`Game::state()` has exactly two exits: six captures, or `ply >= max_plies`
+adjudicated on capture differential. So a game whose recorded ply count is short
+of its own `max_plies` ended on captures — no flag needed, and none exists in
+the shard schema. With the no-progress rule *on*, a third exit stops the game
+early without six captures and the shards cannot tell the two apart after the
+fact (`black_losses`/`white_losses` are recorded before each move, so the
+capture that ends the game is in no row). In that case the controller reports
+the signal as unmeasurable and holds the rate for the whole run.
+
+**The rule** (`model/curriculum.py`, evaluated once per generation after
+self-play, applying from the next generation on):
+
+```
+mode: off          rate unchanged
+mode: schedule     rate = most recent {gen: rate} entry with key <= gen
+mode: controller   unseeded_games < min_unseeded_games  → hold (too noisy)
+                   natural_termination_rate >= target   → rate = max(floor, rate − step)
+                   otherwise                            → hold
+```
+
+Two invariants hold in every mode: the rate never increases, and it never lands
+below `floor`. A curriculum does not go backwards — if the network regresses,
+holding is right and re-teaching endgames it already knows is not — and a
+monotone rule cannot oscillate, which is what makes a controller this crude safe
+to leave running for 50 generations. At most one step per generation: each step
+changes the distribution the next measurement is taken from.
+
+`floor: 0.10` is deliberately non-zero. Positions at 5–4 captures are
+strategically critical and essentially never reached by self-play from a fresh
+start, so a permanent trickle of seeded games is worth keeping purely as endgame
+coverage.
+
+```yaml
+self_play:
+  handicap_rate: 0.7          # initial value only; also the fixed value when mode is off
+  handicap_max: 5
+  handicap_anneal:
+    mode: controller          # controller | schedule | off
+    target_natural_termination: 0.25
+    step: 0.05
+    floor: 0.10
+    min_unseeded_games: 20
+    schedule: {}              # {gen: rate}, used only when mode == schedule
+```
+
+**Where the live rate lives.** In `state.json`, not in the config. The config's
+`handicap_rate` is an initial condition and is inside `config_hash`; the
+annealed value is persisted per-run in `RunState.handicap_rate` and restored on
+resume, so a resumed run continues the curriculum instead of silently
+restarting it at 0.7. Nothing writes the annealed value back into the config —
+that would make every resume after the first step refuse on a hash mismatch.
+
+**Sample size, and why a short run never anneals.** `min_unseeded_games: 20` is
+what stops the controller acting on noise. `config/validation.yaml` is 6
+generations of 60 games: at rate 0.7 only ~18 games a generation are unseeded,
+so the controller holds every generation and logs *insufficient sample* as the
+reason. That is the intended behaviour — six generations of a small network have
+no business retiring the curriculum — not a failure to fire.
+
+**What a run logs.** Every generation, one line naming the current rate, the
+unseeded game count, the natural termination rate, the target, and whether the
+controller stepped or why it held. `handicap_rate` (and the next rate, the
+sample size and the signal) go to `metrics.jsonl` and TensorBoard; the
+seeded-vs-unseeded split of decisive rate and mean |score| is on the data-health
+lines beside it.
 
 ---
 

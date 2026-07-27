@@ -51,6 +51,20 @@ self_play:
   # threshold, so terminals are inside the search horizon from generation one.
   handicap_rate: 0.7
   handicap_max: 5
+  handicap_anneal:
+    # The controller is configured but will *not* fire in this run, by
+    # arithmetic: 60 games at rate 0.7 leaves ~18 unseeded per generation,
+    # below min_unseeded_games, so every generation logs a hold with
+    # "insufficient sample" as the reason. That is correct — six generations
+    # of a small network have no business retiring the curriculum, and an
+    # 18-game estimate of natural termination is noise. Left on rather than
+    # set to `off` so the log line, and the reason, are exercised here too.
+    mode: controller
+    target_natural_termination: 0.25
+    step: 0.05
+    floor: 0.10
+    min_unseeded_games: 20
+    schedule: {}
   random_opening_plies: 2
   max_plies: 200
   no_progress_plies: 0

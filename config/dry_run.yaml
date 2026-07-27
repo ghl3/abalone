@@ -40,6 +40,17 @@ self_play:
   opening: belgian
   handicap_rate: 0.9
   handicap_max: 5
+  handicap_anneal:
+    # Six games a generation: the controller can never reach
+    # min_unseeded_games and will hold every generation. That is what the dry
+    # run is checking — that the measurement, the decision and the log line all
+    # happen, not that the rate moves.
+    mode: controller
+    target_natural_termination: 0.25
+    step: 0.05
+    floor: 0.10
+    min_unseeded_games: 20
+    schedule: {}
   random_opening_plies: 2
   # 60, not the real 200. Note what this does to the health line: most games
   # reach the cap and are adjudicated on capture differential, so `mean_plies`

@@ -8,10 +8,18 @@ One generation, end to end ([ARCHITECTURE §4](../docs/ARCHITECTURE.md)):
   3. export         checkpoint .pt + ONNX from the EMA weights
   4. validate       held-out policy/value/score/capture metrics
      games          export reviewable JSON + the data-health line
+     curriculum     ratchet `handicap_rate` down (MODEL.md §4)
   5. anchor ladder  every N gens: random / heuristic@100 / heuristic@800 /
                     frozen earlier checkpoints → Elo
   6. commit         metrics.jsonl, TensorBoard, retention, atomic state.json
 ```
+
+**The handicap rate lives in `state.json`, not in the config.** The config's
+`handicap_rate` is the initial condition; the live value is annealed down once
+per generation by `model.curriculum` and read back from state on resume. It is
+deliberately not written back into the config, which is inside `config_hash` —
+a run that mutated it would refuse to resume itself the moment the curriculum
+moved.
 
 **No gating, no promotion.** Self-play always uses the latest network
 (MODEL.md §8). The old 21-game gate was really a 2-game experiment, scored
@@ -67,6 +75,7 @@ from model.abalone_net import (
 )
 from model.batch import Batch
 from model.config import RunConfig
+from model.curriculum import AnnealStats, decide_handicap_rate, resolve_initial_rate
 from model.encoder import (
     OPP_LOSSES_PLANE,
     OWN_LOSSES_PLANE,
@@ -305,7 +314,30 @@ def _dump_config(cfg: RunConfig, workers_resolved: str) -> None:
     )
     p(
         f"    handicap:            {sp.handicap_rate:.0%} of games over 0..={sp.handicap_max}"
+        "  (initial; annealed in state.json)"
     )
+    an = sp.handicap_anneal
+    if an.mode == "controller":
+        p(
+            f"    handicap_anneal:     controller — step {an.step:.2f} down to floor "
+            f"{an.floor:.2f} once natural termination of unseeded games reaches "
+            f"{an.target_natural_termination:.0%}"
+        )
+        p(
+            f"                         (needs >= {an.min_unseeded_games} unseeded games/gen "
+            f"to act; ~{(1 - sp.handicap_rate) * sp.games_per_gen:.0f} expected at the "
+            f"initial rate)"
+        )
+        if sp.no_progress_plies:
+            p(
+                "                         INERT: no_progress_plies is on, so natural "
+                "termination is not identifiable from the shards"
+            )
+    elif an.mode == "schedule":
+        entries = ", ".join(f"gen>={k}→{an.schedule[k]}" for k in sorted(an.schedule))
+        p(f"    handicap_anneal:     schedule — {entries or '(empty: no-op)'}")
+    else:
+        p(f"    handicap_anneal:     off — fixed at {sp.handicap_rate:.0%} for the run")
     p(
         f"    termination:         max_plies {sp.max_plies}, no_progress "
         f"{sp.no_progress_plies or 'off'}"
@@ -1151,7 +1183,12 @@ def main(argv: list[str] | None = None) -> int:
         _save_ckpt(model, optimizer, ema, cfg.net_preset, ckpt_dir / "gen_000.pt")
         export_onnx(model, ckpt_dir / "gen_000.onnx")
         _link_or_copy(ckpt_dir / "gen_000.onnx", ckpt_dir / "best.onnx")
-        state = RunState.fresh(run_id=run_id, config_hash=cfg.hash(), git_sha=git_sha)
+        state = RunState.fresh(
+            run_id=run_id,
+            config_hash=cfg.hash(),
+            git_sha=git_sha,
+            handicap_rate=resolve_initial_rate(None, cfg.self_play.handicap_rate),
+        )
         state.current_onnx = "checkpoints/gen_000.onnx"
         state.best_onnx = "checkpoints/gen_000.onnx"
         state.save_atomic(run_dir / "state.json")
@@ -1159,6 +1196,15 @@ def main(argv: list[str] | None = None) -> int:
         state = prev_state
         plan = plan_resume(state.current_gen, state.current_phase)
         _log(f"resuming from gen {state.current_gen} (phase={state.current_phase})")
+        if state.handicap_rate is None:
+            _log(
+                "state.json predates the curriculum annealer; seeding handicap_rate from "
+                f"config ({cfg.self_play.handicap_rate:.2f})"
+            )
+        state.handicap_rate = resolve_initial_rate(
+            state.handicap_rate, cfg.self_play.handicap_rate
+        )
+        _log(f"curriculum: resuming at handicap_rate {state.handicap_rate:.2f}")
         if git_sha_drift(state.git_sha, git_sha):
             _warn(
                 f"git SHA changed since this run was last advanced: "
@@ -1276,9 +1322,14 @@ def _run_outer_loop(
         shards_dir = run_dir / "shards" / f"gen_{new_gen:03d}"
         shards_dir.mkdir(parents=True, exist_ok=True)
         threads_used = sp.worker_threads or max((os.cpu_count() or 8) - 1, 1)
+        # The *annealed* rate, from state — not `sp.handicap_rate`, which is only
+        # the initial condition and is inside `config_hash` (MODEL.md §4).
+        handicap_rate = resolve_initial_rate(state.handicap_rate, sp.handicap_rate)
+        state.handicap_rate = handicap_rate
         _log(
             f"phase: self-play  ({sp.games_per_gen} games, sims {sp.sims_fast}/{sp.sims_full} "
-            f"@ {sp.full_search_rate:.2f}, batch {sp.batch_size}, {threads_used} threads)",
+            f"@ {sp.full_search_rate:.2f}, batch {sp.batch_size}, {threads_used} threads, "
+            f"handicap {handicap_rate:.2f})",
             gen=new_gen,
             total_gens=cfg.gens,
         )
@@ -1299,7 +1350,7 @@ def _run_outer_loop(
             temperature_plies=sp.temperature_plies,
             temperature=sp.temperature,
             opening=sp.opening,
-            handicap_rate=sp.handicap_rate,
+            handicap_rate=handicap_rate,
             handicap_max=sp.handicap_max,
             random_opening_plies=sp.random_opening_plies,
             max_plies=sp.max_plies,
@@ -1376,9 +1427,27 @@ def _run_outer_loop(
             gen=new_gen,
             limit=cfg.export.games_per_gen,
         )
-        health = summarise_generation(export_result.games)
+        # Over *every* game in the generation, not just the exported subset —
+        # `export.games_per_gen` caps what is written, and a controller fed a
+        # 20-of-200 subsample would be measuring the export limit.
+        health = export_result.summary
+        if health is None:
+            health = summarise_generation(export_result.games)
         for line in format_generation_report(export_result):
             _log(f"  {line}", gen=new_gen, total_gens=cfg.gens)
+
+        # ---- 4a′. curriculum ratchet (MODEL.md §4) ----
+        # Evaluated after self-play, so it applies from the next generation on.
+        anneal_stats = AnnealStats.from_summary(
+            health, no_progress_plies=sp.no_progress_plies
+        )
+        decision = decide_handicap_rate(
+            handicap_rate, anneal_stats, sp.handicap_anneal, gen=new_gen
+        )
+        _log(f"curriculum: {decision.message}", gen=new_gen, total_gens=cfg.gens)
+        # `state.handicap_rate` is advanced at commit, not here: a crash between
+        # the two would otherwise redo this generation's self-play at the new
+        # rate, having thrown away the data that justified it.
 
         # ---- 4b. held-out validation ----
         val_metrics: dict[str, object] | None = None
@@ -1472,6 +1541,12 @@ def _run_outer_loop(
             mean_abs_score_diff=_num(health, "mean_abs_score_diff"),
             policy_target_entropy=_num(health, "policy_target_entropy"),
             policy_uniform_entropy=_num(health, "policy_uniform_entropy"),
+            handicap_rate=decision.previous,
+            handicap_rate_next=decision.rate,
+            unseeded_games=anneal_stats.unseeded_games,
+            # `None`, not `nan`: "not measured" and "measured as zero" are
+            # different facts, and only one of them belongs in a plot.
+            natural_termination_rate=_finite(anneal_stats.natural_termination_rate),
             ladder_elo=ladder_elo,
             self_play_seconds=sp_seconds,
             train_seconds=train_seconds,
@@ -1486,6 +1561,8 @@ def _run_outer_loop(
         # validation metric, the full data-health block, and every ladder rung.
         entry: dict[str, object] = {"git_sha": git_sha, **asdict(record)}
         entry.update({f"data_{k}": v for k, v in health.items()})
+        entry["handicap_anneal_reason"] = decision.reason
+        entry["handicap_anneal_stepped"] = decision.stepped
         if val_metrics is not None:
             entry.update({f"val_{k}": v for k, v in val_metrics.items()})
         if rungs:
@@ -1518,6 +1595,10 @@ def _run_outer_loop(
         state.current_gen = new_gen
         state.current_phase = "complete"
         state.git_sha = git_sha
+        # The ratchet lands in the same atomic write as the generation it was
+        # measured from, so the rate and the completed-generation count can
+        # never disagree.
+        state.handicap_rate = decision.rate
         state.save_atomic(run_dir / "state.json")
 
         # ---- the per-generation summary line ----
@@ -1531,7 +1612,10 @@ def _run_outer_loop(
             f"complete in {_fmt_secs(time.time() - gen_t)}  ·  "
             f"loss {_fmt(record.train_loss_total, 4)}  ·  "
             f"decisive {_fmt(health.get('decisive_rate'), 2)}  ·  "
-            f"plies {_fmt(health.get('mean_plies'), 0)}  ·  {entropy_str}"
+            f"plies {_fmt(health.get('mean_plies'), 0)}  ·  "
+            f"handicap {decision.previous:.2f}"
+            + (f"→{decision.rate:.2f}" if decision.stepped else "")
+            + f"  ·  {entropy_str}"
             + (f"  ·  elo {ladder_elo:+.0f}" if ladder_elo is not None else ""),
             gen=new_gen,
             total_gens=cfg.gens,
@@ -1562,6 +1646,15 @@ def _run_outer_loop(
 
 def _opt(metrics: StepMetrics | None, name: str) -> float | None:
     return float(getattr(metrics, name)) if metrics is not None else None
+
+
+def _finite(value: float | None) -> float | None:
+    """`None` for anything that is not a real number, so `state.json` carries a
+    JSON `null` rather than a `NaN` token no strict parser will read back."""
+    if value is None:
+        return None
+    v = float(value)
+    return None if math.isnan(v) else v
 
 
 def _num(d: dict | None, key: str) -> float | None:
