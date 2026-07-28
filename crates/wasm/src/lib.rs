@@ -6,12 +6,20 @@
 //!     index list, picks one, and applies it back. No serde, no JSON.
 //!   * Cells cross as `u8` indices `0..81`; JS computes (q, r) by `(c % 9, c / 9)`.
 
-use abalone_game::{decode, encode, Game, GameState, Move, Side};
+use abalone_encoder::{encode_planes, PLANE_SIZE};
+use abalone_game::{decode, encode, Game, GameState, Move, Side, MOVE_SPACE};
 use abalone_mcts::eval::{evaluate, Weights};
-use abalone_mcts::{heuristic, search, SearchConfig};
+use abalone_mcts::{heuristic, search, LeafEval, Search, SearchConfig};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use wasm_bindgen::prelude::*;
+
+/// Class order of the 3-way value head, matching `model/batch.py` and
+/// `ort_eval.rs`. The browser must collapse it the same way the trainer does
+/// or the eval bar and the search disagree with self-play.
+const VALUE_WIN: usize = 0;
+const VALUE_LOSS: usize = 2;
+const VALUE_CLASSES: usize = 3;
 
 #[wasm_bindgen]
 #[derive(Copy, Clone)]
@@ -102,7 +110,11 @@ impl WasmGame {
 
     /// Legal move indices for the side to move.
     pub fn legal_indices(&self) -> Vec<u16> {
-        self.inner.legal_moves().iter().map(|&m| encode(m)).collect()
+        self.inner
+            .legal_moves()
+            .iter()
+            .map(|&m| encode(m))
+            .collect()
     }
 
     /// Cells occupied by the moving group of `idx`, as `[c0, c1, c2, c3]`
@@ -211,7 +223,8 @@ impl WasmGame {
     /// O(1); useful as the eval-bar value when the analysis panel is off
     /// or while MCTS is computing.
     pub fn eval_white_pov(&self) -> f32 {
-        let pov_to_move = evaluate(&self.inner.board, self.inner.turn, &Weights::default());
+        let pov_to_move =
+            evaluate(&self.inner.board, self.inner.turn, &Weights::default());
         match self.inner.turn {
             Side::White => pov_to_move,
             Side::Black => -pov_to_move,
@@ -269,6 +282,220 @@ impl WasmGame {
             root_eval,
         })
     }
+
+    /// Start a network-guided search from the current position, to be driven
+    /// from JS as a coroutine (see [`WasmSearch`]). Nothing is evaluated here:
+    /// the caller alternates [`WasmSearch::next_batch`] and
+    /// [`WasmSearch::submit`] until [`WasmSearch::is_done`].
+    pub fn begin_search(
+        &self,
+        simulations: u32,
+        batch_size: usize,
+        c_puct: f32,
+        seed: u32,
+    ) -> WasmSearch {
+        let cfg = SearchConfig {
+            simulations: simulations.max(1),
+            c_puct,
+            batch_size: batch_size.max(1),
+            // Exploration noise is a self-play device; a browser opponent
+            // should play its best move, not a deliberately noised one.
+            dirichlet_eps: 0.0,
+            ..Default::default()
+        };
+        WasmSearch {
+            inner: Search::begin(&self.inner, &cfg, u64::from(seed)),
+            batch: Vec::with_capacity(cfg.batch_size),
+            planes: Vec::new(),
+            root_turn: self.inner.turn,
+        }
+    }
+}
+
+/// A network-guided MCTS driven from JavaScript, because `onnxruntime-web`'s
+/// `run()` is async and WASM cannot await it. Selection, virtual loss, backup
+/// and the node arena all stay in Rust — the same [`Search`] self-play uses —
+/// and only the forward pass crosses back to JS:
+///
+/// ```js
+/// const s = game.begin_search(400, 16, 1.4, seed);
+/// for (;;) {
+///   const planes = s.next_batch();          // (n, 14, 9, 9) flattened
+///   if (planes.length === 0) break;
+///   const out = await session.run({ planes: tensor(planes) });
+///   s.submit(out.policy_logits.data, out.value.data);
+/// }
+/// const r = s.result();
+/// ```
+#[wasm_bindgen]
+pub struct WasmSearch {
+    inner: Search,
+    /// The positions behind the batch last handed to JS. Kept because
+    /// `submit` must gather each leaf's policy logits in that leaf's own
+    /// `legal_moves()` order — the order [`Search`] expects its priors in.
+    batch: Vec<Game>,
+    /// Reused staging buffer for the encoded batch.
+    planes: Vec<f32>,
+    root_turn: Side,
+}
+
+#[wasm_bindgen]
+impl WasmSearch {
+    /// Positions awaiting evaluation, encoded as a flattened `(n, 14, 9, 9)`
+    /// float tensor. An empty result means the search is finished.
+    ///
+    /// Calling this twice without an intervening [`submit`](Self::submit)
+    /// discards the un-submitted batch, reverting its virtual loss.
+    pub fn next_batch(&mut self) -> Vec<f32> {
+        self.batch.clear();
+        self.batch.extend_from_slice(self.inner.next_batch());
+        self.planes.clear();
+        self.planes.resize(self.batch.len() * PLANE_SIZE, 0.0);
+        for (i, g) in self.batch.iter().enumerate() {
+            encode_planes(
+                g,
+                &mut self.planes[i * PLANE_SIZE..(i + 1) * PLANE_SIZE],
+            );
+        }
+        self.planes.clone()
+    }
+
+    /// Positions in the batch last returned by [`next_batch`](Self::next_batch).
+    pub fn batch_len(&self) -> usize {
+        self.batch.len()
+    }
+
+    /// Hand back the network's raw output for the last batch: `policy_logits`
+    /// of `n * 2562` and `value` of `n * 3` (win, draw, loss), both exactly as
+    /// the ONNX graph emits them. Masking to legal moves, the softmax over
+    /// them, and the `P(win) - P(loss)` collapse all happen here, so the
+    /// browser applies the identical arithmetic to `ort_eval.rs`.
+    pub fn submit(
+        &mut self,
+        policy_logits: &[f32],
+        value: &[f32],
+    ) -> Result<(), JsError> {
+        let n = self.batch.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if policy_logits.len() != n * MOVE_SPACE {
+            return Err(JsError::new(&format!(
+                "policy_logits has {} elements, expected {} ({n}x{MOVE_SPACE})",
+                policy_logits.len(),
+                n * MOVE_SPACE,
+            )));
+        }
+        if !value.len().is_multiple_of(n) {
+            return Err(JsError::new(&format!(
+                "value has {} elements, not divisible by batch {n}",
+                value.len(),
+            )));
+        }
+        let value_dim = value.len() / n;
+
+        let mut evals = Vec::with_capacity(n);
+        for (i, g) in self.batch.iter().enumerate() {
+            let v = collapse_value(&value[i * value_dim..(i + 1) * value_dim])?;
+            let row = &policy_logits[i * MOVE_SPACE..(i + 1) * MOVE_SPACE];
+            let legal = g.legal_moves();
+            let logits: Vec<f32> =
+                legal.iter().map(|&m| row[encode(m) as usize]).collect();
+            evals.push(LeafEval {
+                value: v,
+                priors: Some(softmax(logits)),
+            });
+        }
+        self.inner.submit(&evals);
+        Ok(())
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.inner.is_done()
+    }
+
+    /// Simulations backed up into the root so far — a progress readout while
+    /// the search is still running.
+    pub fn root_visits(&self) -> u32 {
+        self.inner.root_visits()
+    }
+
+    /// Ranked root children, in the same shape [`WasmGame::analyze`] returns.
+    /// `None` until the first [`submit`](Self::submit) has expanded the root,
+    /// and for a terminal position.
+    pub fn result(&self) -> Option<AnalysisResult> {
+        let res = self.inner.result()?;
+        let to_white_sign = if self.root_turn == Side::White {
+            1.0f32
+        } else {
+            -1.0f32
+        };
+        let n = res.visits.len();
+        let mut indices = Vec::with_capacity(n);
+        let mut evals = Vec::with_capacity(n);
+        let mut visits = Vec::with_capacity(n);
+        for (&(mv, v), &q) in res.visits.iter().zip(res.q_parent_pov.iter()) {
+            indices.push(encode(mv));
+            evals.push(q * to_white_sign);
+            visits.push(v);
+        }
+        let root_eval = res
+            .visits
+            .iter()
+            .zip(res.q_parent_pov.iter())
+            .max_by_key(|((_, v), _)| *v)
+            .map(|(_, q)| *q * to_white_sign)
+            .unwrap_or(0.0);
+        Some(AnalysisResult {
+            indices,
+            evals,
+            visits,
+            root_eval,
+        })
+    }
+
+    /// Move index the search would play: the most-visited root child.
+    /// `-1` if the root has no children.
+    pub fn best_index(&self) -> i32 {
+        match self.inner.result() {
+            Some(r) => encode(r.best) as i32,
+            None => -1,
+        }
+    }
+}
+
+/// Collapse one row of the value head to the scalar MCTS backs up. Mirrors
+/// `ort_eval::collapse_value`: 3-way softmax then `P(win) - P(loss)`, with the
+/// draw class contributing nothing. A width-1 head passes straight through.
+fn collapse_value(row: &[f32]) -> Result<f32, JsError> {
+    match row.len() {
+        VALUE_CLASSES => {
+            let p = softmax(row.to_vec());
+            Ok(p[VALUE_WIN] - p[VALUE_LOSS])
+        }
+        1 => Ok(row[0]),
+        other => Err(JsError::new(&format!(
+            "value head has width {other}, expected 3 (win, draw, loss) or 1 (scalar)"
+        ))),
+    }
+}
+
+fn softmax(mut logits: Vec<f32>) -> Vec<f32> {
+    if logits.is_empty() {
+        return logits;
+    }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for x in logits.iter_mut() {
+        *x = (*x - max).exp();
+        sum += *x;
+    }
+    if sum > 0.0 {
+        for x in logits.iter_mut() {
+            *x /= sum;
+        }
+    }
+    logits
 }
 
 /// Result of a single MCTS analysis pass. Fields are exposed via getters

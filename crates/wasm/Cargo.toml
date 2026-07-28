@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 abalone-game = { path = "../game" }
 abalone-mcts = { path = "../mcts" }
+abalone-encoder = { path = "../encoder" }
 rand = { version = "0.8", features = ["small_rng"] }
 wasm-bindgen = "0.2"
 
