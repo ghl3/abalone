@@ -16,6 +16,21 @@ interface Props {
   onApply: (idx: number) => void;
   simulations: number;
   onSimulationsChange: (n: number) => void;
+  /** Which evaluator produced these numbers. */
+  engineLabel: string;
+  /** Search in flight; rows below are for the previous position. */
+  busy?: boolean;
+  /** Simulations completed so far, for the in-flight search. */
+  busyVisits?: number;
+  /** One-line provenance under the rows: provider, timing, load state. */
+  footer?: string;
+  /** Raw value/score heads at the root, White's POV. */
+  wdlWhite?: [number, number, number] | null;
+  expectedScoreWhite?: number | null;
+}
+
+function pct(p: number): string {
+  return `${Math.round(p * 100)}%`;
 }
 
 function formatEval(v: number): string {
@@ -39,15 +54,19 @@ export default function AnalysisPanel({
   onApply,
   simulations,
   onSimulationsChange,
+  engineLabel,
+  busy = false,
+  busyVisits = 0,
+  footer,
+  wdlWhite,
+  expectedScoreWhite,
 }: Props) {
   return (
     <div
+      className="panel"
       style={{
         width: 280,
         alignSelf: "stretch",
-        background: "var(--panel)",
-        border: "1px solid var(--border)",
-        borderRadius: 12,
         padding: 14,
         display: "flex",
         flexDirection: "column",
@@ -61,9 +80,11 @@ export default function AnalysisPanel({
           alignItems: "baseline",
         }}
       >
-        <div style={{ fontSize: 13, fontWeight: 600 }}>Engine analysis</div>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>{engineLabel}</div>
         <div style={{ color: "var(--muted)", fontSize: 11 }}>
-          MCTS · {totalVisits} visits
+          {busy
+            ? `thinking · ${busyVisits}/${simulations}`
+            : `MCTS · ${totalVisits} visits`}
         </div>
       </div>
 
@@ -76,7 +97,7 @@ export default function AnalysisPanel({
           color: "var(--muted)",
         }}
       >
-        <span style={{ minWidth: 28 }}>{simulations}</span>
+        <span style={{ color: "var(--faint)" }}>depth</span>
         <input
           type="range"
           min={50}
@@ -84,9 +105,55 @@ export default function AnalysisPanel({
           step={50}
           value={simulations}
           onChange={(e) => onSimulationsChange(parseInt(e.target.value, 10))}
-          style={{ flex: 1 }}
+          style={{ flex: 1, accentColor: "var(--accent)" }}
         />
+        <span
+          style={{
+            minWidth: 34,
+            textAlign: "right",
+            fontFamily: "var(--mono)",
+            color: "var(--text)",
+          }}
+        >
+          {simulations}
+        </span>
       </div>
+
+      {wdlWhite && (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 3,
+            padding: "8px 0",
+            borderTop: "1px solid var(--border)",
+            borderBottom: "1px solid var(--border)",
+            fontSize: 11,
+            fontFamily: "ui-monospace, SF Mono, Menlo, monospace",
+          }}
+        >
+          <div style={{ color: "var(--muted)", fontFamily: "inherit" }}>
+            Network read · no search
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span>W {pct(wdlWhite[0])}</span>
+            <span style={{ color: "var(--muted)" }}>
+              draw {pct(wdlWhite[1])}
+            </span>
+            <span>B {pct(wdlWhite[2])}</span>
+          </div>
+          {expectedScoreWhite != null && (
+            <div style={{ color: "var(--muted)" }}>
+              expected score{" "}
+              <span style={{ color: "var(--text)" }}>
+                {expectedScoreWhite >= 0 ? "+" : ""}
+                {expectedScoreWhite.toFixed(1)}
+              </span>{" "}
+              marbles (White)
+            </div>
+          )}
+        </div>
+      )}
 
       <div
         style={{
@@ -137,6 +204,21 @@ export default function AnalysisPanel({
           );
         })}
       </div>
+
+      {footer && (
+        <div
+          style={{
+            marginTop: "auto",
+            paddingTop: 8,
+            borderTop: "1px solid var(--border)",
+            color: "var(--muted)",
+            fontSize: 11,
+            lineHeight: 1.4,
+          }}
+        >
+          {footer}
+        </div>
+      )}
     </div>
   );
 }
