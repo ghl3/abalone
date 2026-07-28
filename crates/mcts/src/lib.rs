@@ -16,7 +16,7 @@
 //! back. That matters for the browser, where `onnxruntime-web`'s `run()` is
 //! async and WASM cannot await — the whole search (selection, virtual loss,
 //! backup, node arena) stays in Rust while inference happens in the JS
-//! runtime (`docs/ARCHITECTURE.md` §2.4).
+//! runtime (`docs/ARCHITECTURE.md` §2.5).
 //!
 //! Batteries-included evaluators:
 //!

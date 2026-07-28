@@ -22,10 +22,11 @@ opponent — never as a teacher, never as a bootstrap.
 ```
 crates/game/       rules, board, move generation, termination
 crates/mcts/       PUCT search with a pull-based batched API
-crates/selfplay/   encoder, ORT inference, selfplay-batch, eval-match
+crates/encoder/    position -> (14,9,9) planes; shared by trainer and browser
+crates/selfplay/   ORT inference, selfplay-batch, eval-match
 crates/wasm/       browser bindings for the search
 model/             PyTorch training loop, replay buffer, evaluation, reporting
-web/               Next.js review tool
+web/               Next.js app: play against the trained network, or analyse
 config/            run configs: dry_run, validation, medium, standard
 docs/              design docs and dated records
 ```
@@ -45,6 +46,9 @@ uv run python -m model.train_loop --config config/medium.yaml
 
 # Read a run back — trajectory, ladder, per-head generalisation, warnings
 uv run python -m model.report --run latest
+
+# Play the trained network in a browser (loads web/public/models/best.onnx)
+cd web && npm install && npm run dev
 
 # Re-measure a finished run against anchors of your choosing
 ABALONE_USE_COREML=1 uv run python -m model.posthoc_ladder --run <run-id>

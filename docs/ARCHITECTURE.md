@@ -18,8 +18,10 @@ Three subsystems, three languages, each chosen for one reason.
 │  RUST  — rules, search, self-play, inference                             │
 │                                                                          │
 │   abalone-game ──► abalone-mcts ──► abalone-selfplay ──► shards (parquet)│
-│        │                 │                  ▲                            │
-│        └─────────────────┴──► abalone-wasm  │ ONNX                       │
+│        │                 │            ▲     ▲                            │
+│        │        abalone-encoder ──────┴─────┼───┐                        │
+│        └─────────────────┴──► abalone-wasm ◄┼───┘                        │
+│                                    │        │ ONNX                       │
 │                                    │        │                            │
 └────────────────────────────────────┼────────┼────────────────────────────┘
                                      │        │
@@ -135,7 +137,18 @@ with `intra_threads(1)` so its internal pool does not fight the worker pool.
 **Shard writes are atomic** — write to `<name>.parquet.tmp`, rename on `finish()`
 — so the trainer, which polls the directory, never reads a file without a footer.
 
-### 2.4 `abalone-wasm` — browser boundary
+### 2.4 `abalone-encoder` — the plane encoding
+
+Position → `(14, 9, 9)` planes, and nothing else. It is its own crate rather
+than a module of `abalone-selfplay` because the browser needs the identical
+encoding and the `wasm32` target cannot link `ort` or `parquet`. Re-exported as
+`abalone_selfplay::encoder`, so the trainer's paths are unchanged.
+
+The point is that trainer and browser cannot drift by construction: there is one
+Rust implementation, compiled twice. The Python twin in `model/encoder.py`
+remains, pinned by the golden-fixture conformance test (§5.6).
+
+### 2.5 `abalone-wasm` — browser boundary
 
 A deliberately narrow `wasm-bindgen` surface:
 
@@ -273,7 +286,8 @@ gather table.
 Side-to-move relative. The ply normaliser is tied to the configured ply cap and
 **must** move in lockstep with it across both implementations.
 
-Consumed by: `abalone-selfplay::encoder`, `model/encoder.py`, the browser
+Consumed by: `abalone-encoder` (and through it `abalone-selfplay` and
+`abalone-wasm`), `model/encoder.py`, the browser
 evaluator.
 
 ### 5.3 ONNX signature
@@ -424,7 +438,50 @@ Interactive board with click-to-select and drag-with-snap, legal-move
 highlighting, and sumito preview. The engine is the WASM build of the same Rust
 crates the trainer uses, so browser rules and training rules cannot drift.
 
-### 7.2 Review mode — the primary goal
+Two tabs, because the two jobs want opposite things from the same engine:
+
+- **Play vs engine** — pick a side and a difficulty (a named simulation budget,
+  from `Beginner` = raw policy with no search up to `Maximum` = 1600). The board
+  rotates 180° when you take Black so your own marbles are always the near side,
+  and the pointer delta is mirrored with it. No eval bar and no move list: the
+  network searches on its own turn only, so it is neither computing nor
+  displaying an opinion while you think.
+- **Analysis** — both sides played by hand, with the eval bar, the ranked move
+  list, hover preview and click-to-play, and a choice of evaluator (trained
+  network or the heuristic benchmark).
+
+### 7.2 Game review — your own games
+
+A finished game (or one in progress) can be reviewed from the result banner or
+the toolbar. Entering review snapshots the move list, so starting a new game
+does not pull the record out from under it, and then sweeps the whole game:
+every position it passed through is searched in play order at review depth.
+
+That sweep is the point. During play the engine only ever searched its *own*
+turns, so the interesting half of the record — yours — has never been looked
+at. Afterwards it is cheap: a position costs well under a tenth of a second on
+WebGPU, so a full game is seconds.
+
+Each move is then graded by what the eval did across it, from the mover's POV,
+into best / good / inaccuracy / blunder. The bands are deliberately wide and
+the grades few: the underlying eval is a 3M-parameter network at a few hundred
+simulations, and a scale nobody trusts is worse than a coarse one they do.
+
+The screen is a board with a ply scrubber (slider, transport buttons, ← →),
+an eval graph over the game, and the move list. The graph plots on a square
+root scale — real games sit inside ±0.2, which a linear [-1, 1] axis renders as
+a flat line — with the raw number in the tooltip. Hovering a flagged move
+previews what the engine wanted instead, using the same overlay the analysis
+panel uses.
+
+**One rule the review made explicit:** never hold a wasm handle across renders.
+The position for a ply is created, read, and freed inside a single memo, and
+only plain data escapes. The earlier pattern — memoise the handle, free the
+stale one from an effect — dies under React's strict-mode remount, which runs
+the unmount cleanup and then reuses the handle it just freed
+(`null pointer passed to rust`).
+
+### 7.3 Self-play review — the primary goal
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -452,14 +509,35 @@ current network believes now. That is a training-pipeline debugger as much as a
 product feature — it makes "the policy target is uniform" something you can
 *see*, not something you have to infer from a loss curve.
 
-### 7.3 Browser inference
+### 7.4 Browser inference
 
-`onnxruntime-web` (WASM backend, WebGPU where available) running inside a Web
-Worker, driven by the pull-based search API from §2.4. The worker keeps the UI
-thread responsive during analysis. The network is the same ONNX artifact the
-trainer exports, served from `web/public/models/`.
+`onnxruntime-web` running inside a Web Worker, driven by the pull-based search
+API from §2.5. WebGPU is preferred and the threaded WASM backend is the
+fallback; the provider that took is reported in the analysis panel. The worker
+keeps the UI thread responsive during search. The network is the same ONNX
+artifact the trainer exports, served from `web/public/models/`.
 
-### 7.4 Game format and notation
+Three things are load-bearing and easy to get wrong:
+
+- **Masking and collapsing happen in Rust**, not JS. The worker hands
+  `policy_logits` and `value` back to `WasmSearch::submit` exactly as the graph
+  emitted them; the legal-move gather, the softmax over them and the
+  `P(win) − P(loss)` collapse are the same lines `ort_eval.rs` runs. JS only
+  moves `Float32Array`s.
+- **Cross-origin isolation is required for threads.** `SharedArrayBuffer` needs
+  COOP/COEP, set in `next.config.mjs`; without them ORT is capped at one thread.
+- **`ort.env.wasm.wasmPaths` must point somewhere real.** Left unset it resolves
+  against the hashed webpack chunk URL and the first session 404s, so
+  `scripts/copy-ort-assets.mjs` stages the binaries into `public/ort/`.
+
+The root position's own heads come free: the search's first batch *is* the root
+expansion, so the worker reads `value` and `score` from that pass and reports
+the outcome distribution and expected capture differential alongside the
+searched Q. They are kept distinct on purpose — the searched Q is a backed-up
+scalar that cannot be decomposed into probabilities, and the gap between the two
+is exactly what search found.
+
+### 7.5 Game format and notation
 
 Games are JSON, emitted by `export_game.py` directly from shards:
 
@@ -539,15 +617,15 @@ The training pipeline has been rebuilt against this document.
 | Encoder sharing | duplicated, untested across languages | 832-fixture golden conformance test | §5.6 |
 | Replay buffer | per-example loop, 4,536 B/position | vectorised, 32 B/position bitboards | §3 |
 | Game export | none | `export_game.py` → reviewable JSON | §7.4 |
+| Web engine | heuristic MCTS in WASM | trained network via `onnxruntime-web` in a worker | §7.4 |
+| WASM search | single-leaf `search()` | pull-based coroutine driven from JS | §2.5 |
 
 ### 10.2 Remaining
 
 | Area | Current | Target | Ref |
 | --- | --- | --- | --- |
-| Encoder sharing | conformance-tested duplication | single implementation via PyO3 | §5.6 |
-| Web engine | heuristic MCTS in WASM | trained network via `onnxruntime-web` | §7.3 |
-| WASM search | old single-leaf `search()` | pull-based coroutine (already exists in `abalone-mcts`) | §2.4 |
-| Web mode | play only | play + review | §7.2 |
+| Encoder sharing | one Rust crate (`abalone-encoder`) + conformance-tested Python twin | single implementation via PyO3 | §5.6 |
+| Web mode | play vs engine, analysis, review of your own games | + review of exported self-play games | §7.3 |
 | Notation | engine-internal only | standard Abalone notation for display/parse | §7.4 |
 | Position sharing | none | permalinks encoding board + counters + ply | §7.4 |
 | Repo entry point | no root README | README pointing at `docs/` | — |
