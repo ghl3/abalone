@@ -95,8 +95,6 @@ def test_both_metric_schemas_produce_the_same_row(record: dict) -> None:
     assert row.natural == pytest.approx(1.0)
     assert row.handicap == pytest.approx(0.55)
     assert row.gap == pytest.approx(0.94, abs=0.005)
-    assert row.val_ce == pytest.approx(2.0466)
-    assert row.val_acc == pytest.approx(0.677)
     assert row.elo == pytest.approx(544.7)
     assert row.seconds == pytest.approx(1278.0)
 
@@ -109,14 +107,37 @@ def test_the_entropy_gap_is_reconstructed_when_it_was_not_logged() -> None:
     assert entropy_gap({"gen": 1}) is None
 
 
-def test_the_rolling_holdout_is_preferred_over_the_frozen_one() -> None:
-    """The frozen holdout is a drift indicator; the rolling one is
-    current-distribution. When both are present the table shows the one that
-    can be gated on."""
+def test_the_two_holdouts_are_never_collapsed_into_one_number() -> None:
+    """They answer different questions and they disagree exactly when it
+    matters. At generation 5 of ruby-panther the rolling accuracy fell
+    0.667 → 0.554 while the frozen accuracy rose 0.644 → 0.649: the curriculum
+    had cut the handicap rate from 0.33 to 0.13, so the newest generation held
+    far fewer near-terminal seeded positions and the rolling holdout's *task*
+    got harder. Nothing regressed. One "val" column showing either number alone
+    tells the reader the opposite of what happened."""
     row = Row.from_metrics(
-        {"gen": 4, "val_rolling/value_ce": 1.1, "val_frozen/value_ce": 2.9}
+        {
+            "gen": 5,
+            "val_rolling/value_ce": 0.8143,
+            "val_rolling/value_accuracy": 0.5537,
+            "val_frozen/value_ce": 0.9438,
+            "val_frozen/value_accuracy": 0.6486,
+        }
     )
-    assert row.val_ce == pytest.approx(1.1)
+    assert row.rolling_ce == pytest.approx(0.8143)
+    assert row.rolling_acc == pytest.approx(0.5537)
+    assert row.frozen_ce == pytest.approx(0.9438)
+    assert row.frozen_acc == pytest.approx(0.6486)
+
+
+def test_a_legacy_single_holdout_is_read_as_the_frozen_one() -> None:
+    """Runs from before the split had one fixed holdout, so `val_value_ce` is
+    the frozen column. Filing it under rolling would put a fixed-distribution
+    measurement in the column reserved for current-distribution ones."""
+    row = Row.from_metrics({"gen": 6, "val_value_ce": 2.0466, "val_value_accuracy": 0.677})
+    assert row.frozen_ce == pytest.approx(2.0466)
+    assert row.frozen_acc == pytest.approx(0.677)
+    assert row.rolling_ce is None
 
 
 # --------------------------------------------------------------------------- #
@@ -310,7 +331,10 @@ def test_the_table_has_a_row_per_generation_plus_a_header() -> None:
 
 def test_every_documented_column_is_present() -> None:
     header = format_table([])[0]
-    for column in ("plies", "dec", "nat", "hcap", "Hgap", "cap/100", "val CE", "val acc", "elo"):
+    for column in (
+        "plies", "dec", "nat", "hcap", "Hgap", "cap/100",
+        "frzCE", "frzAcc", "rolCE", "rolAcc", "elo",
+    ):
         assert column in header, column
 
 

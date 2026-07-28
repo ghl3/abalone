@@ -232,8 +232,16 @@ class Row:
     handicap: float | None
     gap: float | None
     captures: float | None
-    val_ce: float | None
-    val_acc: float | None
+    #: Value head on the *frozen* holdout — a fixed set of positions, so this is
+    #: the only value number comparable across generations. It is the one that
+    #: should fall monotonically.
+    frozen_ce: float | None
+    frozen_acc: float | None
+    #: Value head on the *rolling* holdout — a slice of the newest generation.
+    #: Same distribution as the training data, so it detects memorisation; but
+    #: its distribution moves with the curriculum, so it is not a quality trend.
+    rolling_ce: float | None
+    rolling_acc: float | None
     epochs: float | None
     elo: float | None
     elo_lo: float | None
@@ -266,17 +274,20 @@ class Row:
                 "selfplay/captures_per_100_plies",
                 "data_captures_per_100_plies",
             ),
-            # The rolling holdout first: it is current-distribution and can be
-            # gated on. The frozen one is a drift indicator (MODEL.md §8.1).
-            val_ce=get(
-                row, "val_rolling/value_ce", "val_frozen/value_ce", "val_value_ce"
-            ),
-            val_acc=get(
-                row,
-                "val_rolling/value_accuracy",
-                "val_frozen/value_accuracy",
-                "val_value_accuracy",
-            ),
+            # Shown side by side rather than one falling back to the other.
+            # They answer different questions and they disagree in exactly the
+            # situation that matters: at generation 5 of ruby-panther the
+            # rolling accuracy fell 0.667 → 0.554 while the frozen accuracy
+            # rose 0.644 → 0.649. Nothing regressed — the curriculum had cut
+            # the handicap rate from 0.33 to 0.13, so the newest generation's
+            # positions carried far fewer near-terminal seeded games where the
+            # winner is obvious. The rolling holdout's *task* got harder. A
+            # single "val" column showing the rolling number reads as a
+            # regression and is why the frozen holdout exists.
+            frozen_ce=get(row, "val_frozen/value_ce", "val_value_ce"),
+            frozen_acc=get(row, "val_frozen/value_accuracy", "val_value_accuracy"),
+            rolling_ce=get(row, "val_rolling/value_ce"),
+            rolling_acc=get(row, "val_rolling/value_accuracy"),
             epochs=get(
                 row, "buffer/epochs_this_gen", "train/epochs_over_buffer"
             ),
@@ -339,8 +350,11 @@ COLUMNS: tuple[tuple[str, int, Any], ...] = (
     ("hcap", 5, lambda r: fmt(r.handicap, 2)),
     ("Hgap", 5, lambda r: fmt(r.gap, 2)),
     ("cap/100", 7, lambda r: fmt(r.captures, 2)),
-    ("val CE", 7, lambda r: fmt(r.val_ce, 4)),
-    ("val acc", 7, lambda r: fmt(r.val_acc, 3)),
+    # Frozen first: it is the trend line. Rolling second: it is the alarm.
+    ("frzCE", 7, lambda r: fmt(r.frozen_ce, 4)),
+    ("frzAcc", 6, lambda r: fmt(r.frozen_acc, 3)),
+    ("rolCE", 7, lambda r: fmt(r.rolling_ce, 4)),
+    ("rolAcc", 6, lambda r: fmt(r.rolling_acc, 3)),
     ("epochs", 6, lambda r: fmt(r.epochs, 1)),
     ("time", 6, lambda r: fmt_secs(r.seconds)),
     ("elo [95% CI]", 22, fmt_elo),
