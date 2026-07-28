@@ -100,12 +100,13 @@ from model.eval import (
     LadderRung,
     ladder_summary,
     mean_elo_basis,
-    resolved_regressions,
     model_spec,
+    resolved_regressions,
     run_ladder,
     start_self_play,
 )
 from model.export_game import (
+    SELFPLAY_PREFIX,
     export_generation,
     format_generation_report,
     selfplay_metrics,
@@ -2069,6 +2070,7 @@ def _run_outer_loop(
         # ---- 6. commit ----
         gen_shards = find_shards_for_gen(run_dir / "shards", new_gen)
         gen_positions = buffer.chunk_size(new_gen)
+        gen_games = _num(health, "games")
         gen_seconds = time.time() - gen_t
 
         # Every measurement, under its own namespace, in one dict. Nothing here
@@ -2171,8 +2173,37 @@ def _run_outer_loop(
             buffer_size=buffer.total_size(),
             shard_count=len(gen_shards),
             positions=gen_positions,
+            games=int(gen_games) if gen_games is not None else None,
         )
         state.append_history(record)
+
+        # The two run-to-date axes, summed over `state.history` — so they
+        # survive a resume and are right for runs that predate the metrics.
+        # Each goes in the namespace of the thing it counts, so it plots
+        # beside its per-generation rate.
+        #
+        # They are tracked separately because neither implies the other:
+        # `positions` is how much Abalone the run has seen, `train_steps` is
+        # how hard it has been optimised on it, and the replay buffer sits
+        # between them turning one into the other at a ratio set by
+        # `replay_buffer_gens` and the step budget. A run can stall by
+        # exhausting either — too little new experience, or too little
+        # gradient descent over it — and the two look identical on a chart
+        # that plots only generation number.
+        #
+        # TensorBoard has no running-sum transform, so without these the only
+        # way to read either off a chart is to integrate by eye.
+        totals = state.totals(cfg.self_play.games_per_gen)
+        metrics.update(
+            namespaced(
+                SELFPLAY_PREFIX.rstrip("/"),
+                {
+                    "cumulative_games": totals.games,
+                    "cumulative_positions": totals.positions,
+                },
+            )
+        )
+        metrics.update(namespaced("train", {"cumulative_steps": totals.train_steps}))
 
         # metrics.jsonl carries strictly more than `state.history`: every metric
         # every measurement module emitted, plus the non-scalar payloads

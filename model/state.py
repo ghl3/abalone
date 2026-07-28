@@ -33,7 +33,7 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 Phase = Literal[
     "self_play", "training", "export", "validate", "ladder", "complete"
@@ -44,6 +44,35 @@ def _filtered(cls: type, raw: dict[str, Any]) -> dict[str, Any]:
     """`raw` restricted to `cls`'s fields."""
     names = {f.name for f in fields(cls)}
     return {k: v for k, v in raw.items() if k in names}
+
+
+class Totals(NamedTuple):
+    """Run-to-date counters, summed over `RunState.history`.
+
+    Two independent axes, and neither is recoverable from the other.
+
+    `games`/`positions` are **experience**: how much Abalone the run has
+    actually seen. `train_steps` is **optimisation**: how much gradient descent
+    has been done on it. Doubling `replay_buffer_gens` or `steps_per_gen_max`
+    moves the second without producing a single new position; doubling
+    `games_per_gen` moves the first without taking a single extra step.
+
+    Positions are rows, not distinct board states. Measured on `ruby-panther`,
+    the two differ by 0.28% at generation 2 and 1.26% at generation 14 — the
+    rate rises as the policy sharpens and revisits lines — so treating rows as
+    distinct positions is accurate to about a percent, but it is an
+    approximation and not a definition.
+
+    Samples fed to the optimiser is `train_steps × train.batch_size`, which is
+    larger than `positions` by the number of times the buffer is resampled
+    (6.2× over `ruby-panther`'s 14 generations). It is deliberately not a field
+    here: it depends on a config value this class does not have, and it counts
+    D6-augmented views rather than anything unique.
+    """
+
+    games: int
+    positions: int
+    train_steps: int
 
 
 @dataclass
@@ -124,6 +153,10 @@ class GenRecord:
     buffer_size: int | None = None
     shard_count: int | None = None
     positions: int | None = None
+    #: Games self-play completed this generation. Normally
+    #: `self_play.games_per_gen`, but recorded rather than assumed because a
+    #: crashed generation is redone and the shards are what get counted.
+    games: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> GenRecord:
@@ -209,3 +242,28 @@ class RunState:
 
     def append_history(self, record: GenRecord) -> None:
         self.history.append(record)
+
+    def totals(self, games_per_gen: int | None = None) -> Totals:
+        """Run-to-date [`Totals`][model.state.Totals], summed over `history`.
+
+        Derived rather than carried as counters, so it is correct for runs that
+        predate it and cannot drift out of step with the per-generation records
+        it sums. `history` gains a row only when a generation commits, so a
+        generation redone after a crash is counted once, not twice.
+
+        `games_per_gen` backfills records written before the `games` field
+        existed. It is inside `config_hash`, so it cannot change within a run
+        and the reconstruction is exact — worth doing, because extending a
+        finished run is a workflow this project explicitly wants and a silently
+        short total would misreport every generation after the resume.
+        `positions` and `train_steps` need no such fallback: both have been
+        recorded since the first schema.
+        """
+        return Totals(
+            games=sum(
+                r.games if r.games is not None else (games_per_gen or 0)
+                for r in self.history
+            ),
+            positions=sum(r.positions or 0 for r in self.history),
+            train_steps=sum(r.train_steps or 0 for r in self.history),
+        )

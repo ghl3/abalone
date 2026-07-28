@@ -138,6 +138,58 @@ def test_state_load_tolerates_unknown_keys(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Run-to-date totals                                                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_totals_sum_the_history() -> None:
+    state = RunState.fresh("r", "h")
+    for gen, (games, positions, steps) in enumerate(
+        [(400, 57_699, 400), (400, 33_717, 400), (400, 30_905, 518)], start=1
+    ):
+        state.append_history(
+            GenRecord(gen=gen, games=games, positions=positions, train_steps=steps)
+        )
+    assert state.totals() == (1200, 122_321, 1318)
+
+
+def test_totals_are_zero_before_any_generation_commits() -> None:
+    assert RunState.fresh("r", "h").totals(400) == (0, 0, 0)
+
+
+def test_experience_and_optimisation_are_independent_axes() -> None:
+    """The point of tracking both. Same positions, different step budgets, and
+    nothing in one total reveals the other — the replay buffer sits between
+    them at a ratio set by `replay_buffer_gens` and the step cap."""
+    lean, heavy = RunState.fresh("a", "h"), RunState.fresh("b", "h")
+    for gen in (1, 2):
+        lean.append_history(GenRecord(gen=gen, positions=40_000, train_steps=500))
+        heavy.append_history(GenRecord(gen=gen, positions=40_000, train_steps=5_000))
+    assert lean.totals().positions == heavy.totals().positions == 80_000
+    assert (lean.totals().train_steps, heavy.totals().train_steps) == (1_000, 10_000)
+
+
+def test_totals_backfill_games_for_records_that_predate_the_field() -> None:
+    """`ruby-panther`'s history has `positions` but no `games`. Extending such a
+    run must not silently report 5,600 fewer games than it played —
+    `games_per_gen` is inside `config_hash`, so it reconstructs exactly."""
+    state = RunState.fresh("r", "h")
+    state.append_history(GenRecord(gen=1, positions=57_699))  # legacy row
+    state.append_history(GenRecord(gen=2, games=400, positions=33_717))
+    assert state.totals(400).games == 800
+    assert state.totals(400).positions == 91_416
+
+
+def test_totals_survive_a_round_trip(tmp_path: Path) -> None:
+    state = RunState.fresh("r", "h")
+    state.append_history(
+        GenRecord(gen=1, games=400, positions=57_699, train_steps=400)
+    )
+    state.save_atomic(tmp_path / "state.json", fsync=False)
+    assert RunState.load(tmp_path / "state.json").totals() == (400, 57_699, 400)
+
+
+# --------------------------------------------------------------------------- #
 # Ladder scheduling                                                            #
 # --------------------------------------------------------------------------- #
 
