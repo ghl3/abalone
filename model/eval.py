@@ -514,9 +514,39 @@ def mean_elo(rungs: Sequence[LadderRung]) -> float:
     when the network is doing well. That makes the mean a lower bound too, and
     is precisely why `ladder_summary` reports `clamped_fraction` beside it and
     the loop refuses to print one without the other.
+
+    **With no frozen rungs there is nothing fixed left but the floors**, and the
+    floors are swept from about generation 3 onwards — the mean would be a
+    constant sample-size bound reported as a strength, which is the exact
+    failure the `clamped` machinery exists to expose. A trailing-only ladder is
+    a deliberate configuration (it is the only shape that survives a run being
+    extended later), so in that case this falls back to the trailing rungs and
+    the number means "how far ahead of my recent past selves am I". That is not
+    comparable across generations, and nothing should treat it as if it were:
+    `ladder/score_vs_gen_minus_k` is the per-generation signal to read.
     """
-    vals = [r.elo for r in _measured(rungs) if r.is_fixed_reference]
-    return sum(vals) / len(vals) if vals else float("nan")
+    elo, _ = mean_elo_basis(rungs)
+    return elo
+
+
+def mean_elo_basis(rungs: Sequence[LadderRung]) -> tuple[float, str]:
+    """`mean_elo` plus the name of what it actually averaged.
+
+    Callers that print the number must print the basis with it. "Mean over
+    fixed-reference rungs" is a lie when the fixed references were all swept and
+    the value came from the trailing rungs instead, and a mislabelled metric is
+    the failure mode this project has paid for repeatedly.
+    """
+    measured = _measured(rungs)
+    fixed = [r.elo for r in measured if r.is_fixed_reference]
+    if any(not r.clamped for r in measured if r.is_fixed_reference):
+        return sum(fixed) / len(fixed), "fixed-reference rungs"
+    trailing = [r.elo for r in measured if r.kind == KIND_TRAILING]
+    if trailing:
+        return sum(trailing) / len(trailing), "trailing rungs (no fixed rung resolved)"
+    if fixed:
+        return sum(fixed) / len(fixed), "fixed-reference rungs, all clamped"
+    return float("nan"), "nothing measured"
 
 
 def clamped_fraction(rungs: Sequence[LadderRung]) -> float:
@@ -531,7 +561,37 @@ def clamped_fraction(rungs: Sequence[LadderRung]) -> float:
     return sum(1 for r in measured if r.clamped) / len(measured)
 
 
-def ladder_summary(rungs: Sequence[LadderRung]) -> dict[str, float]:
+def _trailing_offsets(
+    rungs: Sequence[LadderRung], gen: int | None
+) -> list[tuple[LadderRung, int]]:
+    """Trailing rungs paired with the offset `k` they represent.
+
+    The offset is not stored on the rung — `ladder_opponents` resolves `gen − k`
+    to a filename and the rung only carries that path — so it is recovered as
+    `gen − (generation in the filename)`.
+
+    `gen` must be supplied by the caller and is not inferred from the rungs.
+    Anchoring on the newest trailing opponent instead would be right only when
+    `1` is among the offsets, and silently off by a constant otherwise: a
+    gauntlet of `[2, 4, 8]` at generation 12 would label its rungs 0, 2 and 6.
+    A mislabelled offset is worse than a missing one, because the series looks
+    plottable and answers a different question every generation.
+    """
+    if gen is None:
+        return []
+    out: list[tuple[LadderRung, int]] = []
+    for rung in rungs:
+        if rung.kind != KIND_TRAILING:
+            continue
+        m = re.search(r"gen_(\d+)\.onnx", rung.opponent)
+        if m:
+            offset = gen - int(m.group(1))
+            if offset > 0:
+                out.append((rung, offset))
+    return out
+
+
+def ladder_summary(rungs: Sequence[LadderRung], gen: int | None = None) -> dict[str, float]:
     """Flat, already-namespaced `ladder/…` metrics for one ladder.
 
     Per-rung numbers are always emitted — the headline mean is a convenience,
@@ -572,6 +632,25 @@ def ladder_summary(rungs: Sequence[LadderRung]) -> dict[str, float]:
         if vals:
             out[f"ladder/elo_mean_{kind}"] = sum(vals) / len(vals)
 
+    # The per-generation signal, keyed by *offset* rather than by opponent name.
+    #
+    # `ladder/score/gen_007` is a different series every generation, so it
+    # cannot be plotted as a trend. `ladder/score_vs_gen_minus_2` is the same
+    # question asked at every generation — "how do I do against the network I
+    # was two generations ago" — and it is stationary in a way absolute Elo is
+    # not. A fixed anchor saturates once beaten; `gen − k` improves as fast as
+    # the network does, so a flat 0.75 here means the learning rate is holding
+    # and a drift toward 0.50 means it has stalled.
+    #
+    # It also survives a run being extended. Nothing here depends on any other
+    # generation's ladder having been run, so adding five more generations to a
+    # finished run yields five more comparable points and changes none of the
+    # earlier ones.
+    for rung, offset in _trailing_offsets(rungs, gen):
+        out[f"ladder/score_vs_gen_minus_{offset}"] = rung.result.score_a
+        out[f"ladder/elo_vs_gen_minus_{offset}"] = rung.result.elo_a
+        out[f"ladder/clamped_vs_gen_minus_{offset}"] = float(rung.clamped)
+
     for rung in rungs:
         tag = _slug(rung.opponent)
         r = rung.result
@@ -601,6 +680,7 @@ __all__ = [
     "clamped_fraction",
     "ladder_summary",
     "mean_elo",
+    "mean_elo_basis",
     "model_spec",
     "opponent_label",
     "run_eval_match",

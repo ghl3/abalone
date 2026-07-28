@@ -150,37 +150,40 @@ validation:
     positions: 8192
 
 anchor_ladder:
-  # Ten ladders over the run, plus the final one.
-  #
-  # Cost is no longer the constraint it was. `eval-match` was missing the
-  # fixed-batch padding that self-play already had, so CoreML recompiled per
-  # input shape and a rung took ~186 s per 9-game wave. With that fixed, the
-  # generation-8 ladder of `ruby-panther` played 128 games across 5 rungs in
-  # **5.4 minutes**. At the widened anchor set below (up to 10 rungs, ~280
-  # games) a ladder is ~12 min, so ~2 h over the whole run against ~38 h of
-  # self-play. Games per rung is now the right place to spend, not the first
-  # place to cut: 12 games is a ±145 Elo interval and measures nothing.
-  every_gens: 5
+  # Every generation. Cost is no longer the constraint it was: `eval-match` was
+  # missing the fixed-batch padding that self-play already had, so CoreML
+  # recompiled per input shape and a rung took ~186 s per 9-game wave. With that
+  # fixed, `ruby-panther`'s generation-8 ladder played 128 games across 5 rungs
+  # in **5.4 minutes**. This panel is ~152 games, so ~6.5 min a generation
+  # against ~45 min of self-play — about 12% overhead for a measurement every
+  # generation instead of every fifth.
+  every_gens: 1
   run_on_final_gen: true
   games: 32
   floor_games: 12
   simulations: 200
   # Floor anchors: losing to these is a bug, beating them is not a result.
-  # `heuristic@800` is retired as a milestone and as a rung (MODEL.md §8.2).
+  # `random` is swept from about generation 3 and stays swept — it is kept
+  # anyway because it costs ~30 s and it is the check that catches a
+  # catastrophic regression instantly. `heuristic@100` has actual positional
+  # judgement and stays meaningful longer. `heuristic@800` is retired as a
+  # milestone and as a rung (MODEL.md §8.2).
   opponents: [random, heuristic@100]
-  # Fixed reference points, spanning the run: "am I beating my past self" is
-  # what gives a monotone curve, and it is what catches a silent regression.
-  # These are the rungs the headline Elo averages.
+  # **Deliberately empty.** An absolute generation number can name a checkpoint
+  # that will never exist — `[1, 25]` in a 12-generation run — which is a bug
+  # this project hit twice. It also breaks the workflow of extending a finished
+  # run by a few generations, since the "fixed" reference is fixed to a run
+  # length that just changed. Everything a frozen anchor was for is better
+  # served by an offset, which cannot name a nonexistent generation.
+  frozen_gens: []
+  # The gauntlet, and the whole measurement. `gen − k` improves as fast as the
+  # network does, so unlike a fixed anchor it never saturates: a flat 0.75
+  # against `gen − 4` generation after generation means the learning rate is
+  # holding, and a drift toward 0.50 means it has stalled. That is a more
+  # direct read on "is more training helping" than any rating number, and it
+  # needs no cross-generation state at all.
   #
-  # Spaced every 10 rather than the old `[1, 25]`, so there is always a fixed
-  # anchor inside the resolvable band. With `[1, 25]` the ladders from gen 10
-  # to gen 25 had exactly one usable rung between them — see `trailing_gens`.
-  frozen_gens: [1, 10, 20, 30, 40]
-  # The moving rungs: they improve as the network does, so they are the ones
-  # still resolving anything at generation 45. Excluded from the headline mean
-  # precisely because they move.
-  #
-  # The offsets are picked from measured resolution, not taste. Run
+  # The spread is picked from measured resolution, not taste. Run
   # `ruby-panther` at ~85 Elo/generation, 32 games per rung
   # (docs/2026-07-28-first-strength-measurement.md):
   #
@@ -190,10 +193,13 @@ anchor_ladder:
   #   6 generations back  +470 [+306, +720]  resolves, pressing the ceiling
   #   8+ generations back                    swept 32-0-0, reports a bound
   #
-  # So the usable band is roughly 2-6 generations and `4` is the middle of it.
-  # Keeping `1` and `2` costs little and they become the informative ones if
-  # the per-generation rate rises.
-  trailing_gens: [1, 2, 4]
+  # All four offsets are kept rather than tuned to today's band, because the
+  # useful one *moves*: at ~85 Elo/gen it is 2 and 4, but as per-generation
+  # gains shrink later in a long run, 8 becomes the informative rung and 1 the
+  # useless one. A clamped rung costs ~80 s, which is a cheap premium for never
+  # being out of band. `retention.keep_last_onnx` must cover the deepest
+  # offset; `RunConfig.validate` enforces that.
+  trailing_gens: [1, 2, 4, 8]
   batch_size: 32
   c_puct: 1.4
   opening: belgian

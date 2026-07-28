@@ -99,6 +99,7 @@ from model.eval import (
     LadderOpponent,
     LadderRung,
     ladder_summary,
+    mean_elo_basis,
     model_spec,
     run_ladder,
     start_self_play,
@@ -218,6 +219,40 @@ def entropy_ratio_alarm(ratio: float | None, threshold: float, gen: int) -> bool
     except (TypeError, ValueError):
         return False
     return not math.isnan(r) and r > threshold
+
+
+#: How far the value head may over-predict draws before it is hedging rather
+#: than modelling. A head that emits the same class for everything is the
+#: failure this project actually suffered — three generations of a constant
+#: output, unnoticed, because aggregate accuracy looked plausible.
+DRAW_COLLAPSE_MARGIN = 0.25
+
+
+def draw_collapse_alarm(
+    predicted_rate: float | None, observed_rate: float | None, margin: float
+) -> bool:
+    """True when the value head predicts draws far more often than they occur.
+
+    **This detects a collapsed head, not collapsed data.** In the original
+    failure every game *was* a draw, so a head predicting draws was correct and
+    this comparison would have stayed silent — `data_draw_rate` and the
+    self-play decisive rate are what catch that, and they do. What this catches
+    is the other direction: decisive games in the data and a head that has
+    stopped committing to either side, which is what hedging to the majority
+    class looks like once the curriculum is working.
+
+    Silent when either rate is missing or `nan`; no measurement is not a bad
+    measurement.
+    """
+    if predicted_rate is None or observed_rate is None:
+        return False
+    try:
+        p, o = float(predicted_rate), float(observed_rate)
+    except (TypeError, ValueError):
+        return False
+    if math.isnan(p) or math.isnan(o):
+        return False
+    return p - o > margin
 
 
 def retention_victims(files: list[Path], keep: int, protected: set[Path]) -> list[Path]:
@@ -1276,6 +1311,19 @@ def _validation_phase(
     # entropy tracks current data and alarming on it is meaningful. When it is
     # unavailable there is no holdout-based alarm — the equivalent check on
     # full self-play data runs separately and is always available.
+    predicted_draws = out.get(f"{VAL_ROLLING_PREFIX}value_predicted_draw_rate")
+    observed_draws = out.get(f"{VAL_ROLLING_PREFIX}data_draw_rate")
+    if draw_collapse_alarm(predicted_draws, observed_draws, DRAW_COLLAPSE_MARGIN):
+        _warn(
+            f"the value head predicts a draw for {_fmt(predicted_draws)} of held-out "
+            f"positions but only {_fmt(observed_draws)} of them actually drew — it is "
+            f"hedging to the majority class rather than committing to a side. Check "
+            f"value_accuracy_early and the per-class recalls before spending another "
+            f"generation",
+            gen=new_gen,
+            total_gens=cfg.gens,
+        )
+
     ratio = out.get(f"{VAL_ROLLING_PREFIX}data_policy_entropy_ratio")
     if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn, new_gen):
         _warn(
@@ -1379,13 +1427,13 @@ def _report_ladder(rungs: list[LadderRung], gen: int, total_gens: int) -> float 
             gen=gen,
             total_gens=total_gens,
         )
-    summary = ladder_summary(rungs)
-    elo = summary.get("ladder/elo_mean")
+    summary = ladder_summary(rungs, gen)
+    elo, basis = mean_elo_basis(rungs)
     lo, hi = summary.get("ladder/elo_mean_ci95_lo"), summary.get("ladder/elo_mean_ci95_hi")
     ci = f" [{lo:+.0f}, {hi:+.0f}]" if lo is not None and hi is not None else ""
     frac = summary.get("ladder/clamped_fraction", float("nan"))
     _log(
-        f"  ladder Elo (mean over fixed-reference rungs): {elo:+.0f}{ci}  ·  "
+        f"  ladder Elo (mean over {basis}): {elo:+.0f}{ci}  ·  "
         f"{int(summary['ladder/rungs_clamped'])}/{int(summary['ladder/rungs_measured'])} "
         f"rungs clamped ({frac:.0%})  ·  {_fmt_secs(summary['ladder/seconds'])}",
         gen=gen,
@@ -2003,7 +2051,7 @@ def _run_outer_loop(
             )
         )
         if rungs:
-            metrics.update(ladder_summary(rungs))
+            metrics.update(ladder_summary(rungs, new_gen))
         metrics.update(
             namespaced(
                 "perf",

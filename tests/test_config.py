@@ -550,3 +550,55 @@ def test_unknown_keys_are_rejected_even_without_validation(tmp_path: Path) -> No
     path.write_text("gens: 12\nnot_a_real_knob: 3\n")
     with pytest.raises((ValueError, TypeError)):
         RunConfig.from_yaml(path, validate=False)
+
+
+# --------------------------------------------------------------------------- #
+# Extending a finished run                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_extending_a_run_does_not_invalidate_its_config_hash(tmp_path: Path) -> None:
+    """"Add five more generations" must not look like a different experiment.
+    `gens` is an outer-loop bound, not a property of the data or the model, so
+    it is in `HASH_EXCLUDED` — a resume compares the hash and refuses on a
+    mismatch, and bumping the generation count must not trip that."""
+    cfg = RunConfig.from_yaml(Path("config/medium.yaml"))
+    before = cfg.hash()
+    cfg.gens += 5
+    cfg.validate()
+    assert cfg.hash() == before
+
+
+def test_a_trailing_only_ladder_survives_extension(tmp_path: Path) -> None:
+    """The reason absolute `frozen_gens` were dropped. An offset resolves
+    against whatever generation is current, so extending a run just produces
+    more comparable points; `frozen_gens: [25]` in a 12-generation run names a
+    checkpoint that never existed and never will."""
+    cfg = RunConfig.from_yaml(Path("config/medium.yaml"))
+    assert cfg.anchor_ladder.frozen_gens == []
+    cfg.gens = 17
+    cfg.validate()  # would raise if a frozen anchor were out of range
+
+
+def test_retention_must_outlive_the_deepest_gauntlet_offset() -> None:
+    """Generation N's gauntlet plays `gen - max(trailing_gens)`, resolved from a
+    file on disk. Retention silently drops a missing rung — deliberately, so a
+    collected checkpoint cannot crash a ladder five hours into a run — which is
+    exactly why the two settings have to be reconciled here instead."""
+    cfg = RunConfig.from_yaml(Path("config/standard.yaml"))
+    cfg.anchor_ladder.trailing_gens = [1, 2, 4, 8]
+    cfg.retention.keep_last_onnx = 7
+    with pytest.raises(ValueError, match=r"keep_last_onnx"):
+        cfg.validate()
+    cfg.retention.keep_last_onnx = 8
+    cfg.validate()
+
+
+def test_an_empty_gauntlet_is_rejected() -> None:
+    """Trailing rungs are the only opponents that improve as the network does.
+    Without them every rung saturates and the ladder stops resolving — which is
+    the failure that cost this project two entire runs."""
+    cfg = RunConfig.from_yaml(Path("config/standard.yaml"))
+    cfg.anchor_ladder.trailing_gens = []
+    with pytest.raises(ValueError, match=r"trailing_gens must not be empty"):
+        cfg.validate()

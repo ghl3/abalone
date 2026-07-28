@@ -530,6 +530,12 @@ class AnchorLadderConfig:
                 isinstance(g, int) and not isinstance(g, bool) and g > 0,
                 f"anchor_ladder.frozen_gens are positive generation numbers, got {g!r}",
             )
+        _require(
+            bool(self.trailing_gens),
+            "anchor_ladder.trailing_gens must not be empty: trailing rungs are the "
+            "only opponents that improve as the network does, so without them every "
+            "rung saturates and the ladder stops resolving.",
+        )
         for k in self.trailing_gens:
             _require(
                 isinstance(k, int) and not isinstance(k, bool) and k > 0,
@@ -641,6 +647,20 @@ class RunConfig:
         self.self_play.validate()
         self.train.validate()
         self.anchor_ladder.validate()
+        # The gauntlet's opponents are `gen - k`, resolved from files on disk.
+        # Retention must therefore keep at least `max(k)` ONNX exports, or a
+        # ladder silently drops its most informative rungs — and, worse, a run
+        # that is *extended* later ("add five more generations") cannot find the
+        # opponents its first new generation needs. Silent dropping is by design
+        # so a collected checkpoint does not crash a ladder five hours in, which
+        # is exactly why this has to be caught here instead.
+        deepest = max((int(k) for k in self.anchor_ladder.trailing_gens), default=0)
+        _require(
+            self.retention.keep_last_onnx >= deepest,
+            f"retention.keep_last_onnx ({self.retention.keep_last_onnx}) is below the "
+            f"deepest anchor_ladder.trailing_gens offset ({deepest}); that rung would "
+            f"be collected before the ladder could play it.",
+        )
         for g in self.anchor_ladder.frozen_gens:
             # A generation is never its own opponent, so a frozen anchor at or
             # beyond the last generation is silently dropped from every ladder

@@ -242,6 +242,11 @@ class Row:
     #: its distribution moves with the curriculum, so it is not a quality trend.
     rolling_ce: float | None
     rolling_acc: float | None
+    #: Value accuracy over the first `PHASE_EDGES_PLIES[1]` plies. The aggregate
+    #: is dominated by late positions where a marble count settles the outcome,
+    #: so it dilutes exactly the signal worth watching: between generations 8
+    #: and 12 of ruby-panther the aggregate moved +0.019 and the opening +0.034.
+    early_acc: float | None
     epochs: float | None
     elo: float | None
     elo_lo: float | None
@@ -288,6 +293,9 @@ class Row:
             frozen_acc=get(row, "val_frozen/value_accuracy", "val_value_accuracy"),
             rolling_ce=get(row, "val_rolling/value_ce"),
             rolling_acc=get(row, "val_rolling/value_accuracy"),
+            early_acc=get(
+                row, "val_rolling/value_accuracy_early", "val_frozen/value_accuracy_early"
+            ),
             epochs=get(
                 row, "buffer/epochs_this_gen", "train/epochs_over_buffer"
             ),
@@ -355,6 +363,9 @@ COLUMNS: tuple[tuple[str, int, Any], ...] = (
     ("frzAcc", 6, lambda r: fmt(r.frozen_acc, 3)),
     ("rolCE", 7, lambda r: fmt(r.rolling_ce, 4)),
     ("rolAcc", 6, lambda r: fmt(r.rolling_acc, 3)),
+    # The opening-accuracy headline. Deliberately beside `rolAcc` so the
+    # dilution is visible: they move together, and the early one moves more.
+    ("early", 6, lambda r: fmt(r.early_acc, 3)),
     ("epochs", 6, lambda r: fmt(r.epochs, 1)),
     ("time", 6, lambda r: fmt_secs(r.seconds)),
     ("elo [95% CI]", 22, fmt_elo),
@@ -467,6 +478,69 @@ def warnings_for(rows: list[Row], records: list[dict[str, Any]]) -> list[str]:
             )
     if not records:
         out.append("this run has written no generation records yet")
+    return out
+
+
+def format_value_head(records: list[dict[str, Any]]) -> list[str]:
+    """The newest generation's value accuracy as a function of game phase.
+
+    Read each bucket against *itself* across generations, not against its
+    neighbours. The buckets are conditional — only games that lasted at least
+    `k` plies reach the bucket at `k`, and games that run long are
+    systematically the closer ones — so the rise from left to right is mostly
+    the task getting easier, not the network getting better at it.
+
+    The column that matters is the leftmost. Late positions are readable off a
+    marble count and every network scores well there, which is why the
+    aggregate hides progress.
+    """
+    row = next(
+        (
+            r
+            for r in reversed(records)
+            if isinstance(r.get("val_rolling/value_phase"), list)
+            or isinstance(r.get("val_frozen/value_phase"), list)
+        ),
+        None,
+    )
+    if row is None:
+        return ["    (no generation has recorded a phase curve yet)"]
+    which = (
+        "val_rolling/" if isinstance(row.get("val_rolling/value_phase"), list) else "val_frozen/"
+    )
+    curve = [b for b in row[f"{which}value_phase"] if isinstance(b, dict)]
+    if not curve:
+        return ["    (phase curve is empty)"]
+
+    out = [
+        f"    gen {row.get('gen', '?')}, {which.rstrip('/')} — value head by game phase",
+        f"      {'plies':>11}{'n':>8}{'accuracy':>10}{'confidence':>12}"
+        f"{'brier':>8}{'draws':>8}",
+    ]
+    for b in curve:
+        n = int(b.get("count") or 0)
+        cells = (
+            f"{b.get('accuracy', float('nan')):>10.3f}"
+            f"{b.get('mean_confidence', float('nan')):>12.3f}"
+            f"{b.get('brier', float('nan')):>8.3f}"
+            f"{b.get('draw_rate', float('nan')):>8.3f}"
+            if n
+            else f"{'-':>10}{'-':>12}{'-':>8}{'-':>8}"
+        )
+        span = f"{b.get('ply_lower')}-{b.get('ply_upper')}"
+        out.append(f"      {span:>11}{n:>8}{cells}")
+
+    extras = [
+        ("predicted draw rate", f"{which}value_predicted_draw_rate"),
+        ("observed draw rate", f"{which}data_draw_rate"),
+        ("gap to search value (q)", f"{which}value_q_gap"),
+        ("sign agreement with q", f"{which}value_q_sign_agreement"),
+    ]
+    shown = [(label, _num(row, key)) for label, key in extras]
+    if any(v is not None for _, v in shown):
+        out.append("")
+        for label, v in shown:
+            out.append(f"      {label:26} {fmt(v, 3)}")
     return out
 
 
@@ -602,6 +676,9 @@ def render(run_dir: Path, records: list[dict[str, Any]], tail: int | None) -> li
     lines.append("")
     lines.append("generalisation")
     lines.extend(format_generalisation(shown_records))
+    lines.append("")
+    lines.append("value head")
+    lines.extend(format_value_head(shown_records))
     lines.append("")
 
     problems = warnings_for(shown, records)

@@ -42,6 +42,7 @@ from model.train_loop import (
     LadderRung,
     _count_completed_games,
     _fmt_secs,
+    draw_collapse_alarm,
     entropy_ratio_alarm,
     epoch_budget_steps,
     epochs_alarm,
@@ -684,7 +685,33 @@ def test_mean_elo_excludes_trailing_rungs() -> None:
 
 def test_mean_elo_is_nan_with_nothing_to_average() -> None:
     assert math.isnan(mean_elo([]))
-    assert math.isnan(mean_elo([_rung("model:a.onnx", 10.0, KIND_TRAILING)]))
+
+
+def test_a_trailing_only_ladder_falls_back_to_its_trailing_rungs() -> None:
+    """A gauntlet with no frozen anchors is a deliberate configuration — it is
+    the only shape that survives a run being extended later, since an absolute
+    `frozen_gens` entry can name a generation that will never exist. With the
+    floors swept (they are, from about generation 3) the fixed-reference mean is
+    a constant sample-size bound dressed up as a strength, so falling back to
+    the rungs that still resolve is the honest answer."""
+    rungs = [
+        _rung("random", 597.0, KIND_FLOOR, elo_a_clamped=True),
+        _rung("model:gen_011.onnx", 55.0, KIND_TRAILING),
+        _rung("model:gen_010.onnx", 177.0, KIND_TRAILING),
+    ]
+    assert mean_elo(rungs) == pytest.approx(116.0)
+
+
+def test_an_unswept_fixed_anchor_still_wins_over_the_trailing_fallback() -> None:
+    """The fallback is for when the fixed references have run out of
+    resolution, not a general preference — a frozen rung that actually resolved
+    is the more comparable number and must take precedence."""
+    rungs = [
+        _rung("random", 597.0, KIND_FLOOR, elo_a_clamped=True),
+        _rung("model:gen_006.onnx", 255.0, KIND_FROZEN),
+        _rung("model:gen_011.onnx", 55.0, KIND_TRAILING),
+    ]
+    assert mean_elo(rungs) == pytest.approx((597.0 + 255.0) / 2)
 
 
 def test_mean_elo_skips_unmeasured_rungs() -> None:
@@ -894,3 +921,83 @@ def test_entropy_alarm_never_reads_the_frozen_holdout():
         "the entropy alarm must not read the frozen holdout — it is constant by "
         "construction and produces a false alarm every generation"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Value-head draw collapse                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_hedging_to_draws_raises_the_alarm() -> None:
+    """Decisive games in the data and a head predicting draws for most of them
+    is the head having stopped committing to a side."""
+    assert draw_collapse_alarm(0.90, 0.03, 0.25)
+
+
+def test_a_head_matching_the_data_is_silent() -> None:
+    assert not draw_collapse_alarm(0.05, 0.03, 0.25)
+
+
+def test_a_margin_exactly_at_the_threshold_is_silent() -> None:
+    assert not draw_collapse_alarm(0.28, 0.03, 0.25)
+
+
+def test_collapsed_DATA_does_not_raise_this_alarm() -> None:
+    """The original failure: every game drew, so a head predicting draws was
+    *correct*. This alarm is about the head, and must not fire here — the
+    self-play decisive rate and `data_draw_rate` are what catch collapsed data,
+    and a second alarm on the same event is how warnings stop being read."""
+    assert not draw_collapse_alarm(1.0, 1.0, 0.25)
+
+
+@pytest.mark.parametrize("bad", [None, float("nan")])
+def test_a_missing_rate_is_not_an_alarm(bad) -> None:
+    assert not draw_collapse_alarm(bad, 0.03, 0.25)
+    assert not draw_collapse_alarm(0.9, bad, 0.25)
+
+
+# --------------------------------------------------------------------------- #
+# Per-offset ladder metrics — the per-generation, extension-safe signal        #
+# --------------------------------------------------------------------------- #
+
+
+def test_trailing_rungs_are_keyed_by_offset_not_by_opponent_name() -> None:
+    """`ladder/score/gen_007` is a different series every generation and cannot
+    be plotted as a trend. `ladder/score_vs_gen_minus_2` asks the same question
+    at every generation, which is what makes it readable — and it stays valid
+    when a finished run is extended, because it depends on no other
+    generation's ladder having been run."""
+    rungs = [
+        _rung("random", 597.0, KIND_FLOOR, elo_a_clamped=True),
+        _rung("model:gen_011.onnx", 55.0, KIND_TRAILING, score_a=0.578),
+        _rung("model:gen_010.onnx", 177.0, KIND_TRAILING, score_a=0.734),
+        _rung("model:gen_008.onnx", 364.0, KIND_TRAILING, score_a=0.891),
+        _rung("model:gen_004.onnx", 597.0, KIND_TRAILING, score_a=0.969),
+    ]
+    out = ladder_summary(rungs, gen=12)
+    assert out["ladder/score_vs_gen_minus_1"] == pytest.approx(0.578)
+    assert out["ladder/score_vs_gen_minus_2"] == pytest.approx(0.734)
+    assert out["ladder/score_vs_gen_minus_4"] == pytest.approx(0.891)
+    assert out["ladder/score_vs_gen_minus_8"] == pytest.approx(0.969)
+
+
+def test_offsets_are_measured_from_the_probe_generation_not_the_newest_rung() -> None:
+    """Anchoring on the newest trailing opponent is right only when `1` is among
+    the offsets. A gauntlet of [2, 4] at generation 12 would otherwise label its
+    rungs 0 and 2 — a mislabelled series looks plottable and silently answers a
+    different question than its name claims."""
+    rungs = [
+        _rung("model:gen_010.onnx", 177.0, KIND_TRAILING, score_a=0.73),
+        _rung("model:gen_008.onnx", 364.0, KIND_TRAILING, score_a=0.89),
+    ]
+    out = ladder_summary(rungs, gen=12)
+    assert "ladder/score_vs_gen_minus_0" not in out
+    assert out["ladder/score_vs_gen_minus_2"] == pytest.approx(0.73)
+    assert out["ladder/score_vs_gen_minus_4"] == pytest.approx(0.89)
+
+
+def test_offset_metrics_are_omitted_when_the_generation_is_unknown() -> None:
+    """A missing offset is recoverable; a wrong one is not."""
+    rungs = [_rung("model:gen_010.onnx", 177.0, KIND_TRAILING, score_a=0.73)]
+    out = ladder_summary(rungs)
+    assert not [k for k in out if "vs_gen_minus" in k]
