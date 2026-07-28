@@ -1522,7 +1522,31 @@ def _resolve_resume(cfg: RunConfig, resume_arg: str | None) -> tuple[str, RunSta
             raise FileNotFoundError(f"no state.json for {resume_arg}")
     state = RunState.load(run_dir / "state.json")
 
-    if state.config_hash != cfg.hash():
+    # Compare against the run's own archived config, field by field, rather
+    # than against the fingerprint in state.json.
+    #
+    # The hash is computed *through* `HASH_EXCLUDED`, so broadening that set
+    # changes the hash function and every previously stored fingerprint becomes
+    # unreachable — a run nobody touched suddenly cannot be resumed. That is not
+    # hypothetical: moving `anchor_ladder` into the exclusion set (it measures,
+    # it cannot invalidate a shard) locked `ruby-panther` out of being extended.
+    # Both sides of a config-to-config comparison are pruned with today's rules,
+    # so the check stays correct across changes to its own definition.
+    archived = run_dir / "config.yaml"
+    if archived.exists():
+        # `validate=False`: the archived config may predate rules added since,
+        # and it describes a run that already happened either way.
+        prev = RunConfig.from_yaml(archived, validate=False)
+        diff = cfg.semantic_diff(prev)
+        if diff:
+            listing = "\n".join(f"    {p}" for p in diff)
+            raise RuntimeError(
+                f"config differs from {archived} in fields that change the data "
+                f"or the model:\n{listing}\n"
+                f"refuse to resume; pass --no-resume to start a fresh run."
+            )
+    elif state.config_hash != cfg.hash():
+        # No archived config (a very old run): fall back to the fingerprint.
         raise RuntimeError(
             f"config hash mismatch on resume:\n"
             f"  state.config_hash  = {state.config_hash}\n"

@@ -399,8 +399,6 @@ def test_hash_is_stable_across_key_order(tmp_path: Path) -> None:
         lambda c: setattr(c.validation.rolling, "every_gens", 5),
         lambda c: setattr(c.train, "target_epochs_per_gen", 3.0),
         lambda c: setattr(c.self_play.handicap_anneal, "max_step_multiple", 2.0),
-        lambda c: setattr(c.anchor_ladder, "games", 100),
-        lambda c: setattr(c.anchor_ladder, "trailing_gens", [3]),
     ],
 )
 def test_semantic_changes_change_the_hash(mutate) -> None:
@@ -602,3 +600,70 @@ def test_an_empty_gauntlet_is_rejected() -> None:
     cfg.anchor_ladder.trailing_gens = []
     with pytest.raises(ValueError, match=r"trailing_gens must not be empty"):
         cfg.validate()
+
+
+def test_the_ladder_is_measurement_and_does_not_change_the_hash() -> None:
+    """The ladder plays its games under `eval/`, writes no shards, and never
+    touches training — so changing the opponent panel cannot invalidate a single
+    position in the replay buffer. Refusing a resume over it protects nothing
+    and blocks the workflow this project wants: take a finished run and add a
+    few more generations. Extending `ruby-panther` was refused for exactly this
+    reason, purely because its ladder predated the trailing gauntlet.
+
+    This is safe *because* the gauntlet is trailing-only. A changed fixed-anchor
+    set would silently make the early and late Elo curves incomparable, which
+    would be a real reason to hash it; `gen - k` is self-contained per
+    generation, so a panel change affects the generations after it and nothing
+    before."""
+    cfg = RunConfig.from_yaml(Path("config/medium.yaml"))
+    before = cfg.hash()
+    cfg.anchor_ladder.games = 100
+    cfg.anchor_ladder.trailing_gens = [1, 2, 4]
+    cfg.anchor_ladder.every_gens = 3
+    cfg.anchor_ladder.opponents = ["random"]
+    assert cfg.hash() == before
+
+
+def test_the_holdout_size_still_changes_the_hash() -> None:
+    """The counterexample that keeps the exclusion honest: `holdout_positions`
+    decides how much of generation 1 is withheld from training, so it changes
+    the data the model sees and must invalidate a resume. It is the one real
+    difference between `ruby-panther`'s archived config and today's
+    medium.yaml, and the hash is right to catch it."""
+    cfg = RunConfig.from_yaml(Path("config/medium.yaml"))
+    before = cfg.hash()
+    cfg.validation.holdout_positions = None
+    assert cfg.hash() != before
+
+
+def test_semantic_diff_names_the_offending_fields() -> None:
+    """A hash answers "same experiment?" with one bit and no explanation. The
+    diff says which fields changed, which is what the operator needs."""
+    a = RunConfig.from_yaml(Path("config/medium.yaml"))
+    b = RunConfig.from_yaml(Path("config/medium.yaml"))
+    assert a.semantic_diff(b) == []
+    b.self_play.sims_full = 1600
+    b.train.batch_size = 512
+    assert set(a.semantic_diff(b)) == {"self_play.sims_full", "train.batch_size"}
+
+
+def test_semantic_diff_ignores_excluded_paths() -> None:
+    a = RunConfig.from_yaml(Path("config/medium.yaml"))
+    b = RunConfig.from_yaml(Path("config/medium.yaml"))
+    b.gens = 99
+    b.anchor_ladder.trailing_gens = [1]
+    b.retention.keep_last_onnx = 3
+    assert a.semantic_diff(b) == []
+
+
+def test_semantic_diff_survives_a_change_to_the_exclusion_set_itself() -> None:
+    """The failure that blocked extending `ruby-panther`. `hash()` is computed
+    *through* `HASH_EXCLUDED`, so broadening that set changes the hash function
+    and every stored fingerprint becomes unreachable — a run nobody touched can
+    no longer be resumed. A config-to-config diff prunes both sides with today's
+    rules, so it stays correct across changes to its own definition."""
+    a = RunConfig.from_yaml(Path("config/medium.yaml"))
+    b = RunConfig.from_yaml(Path("config/medium.yaml"))
+    stale_hash = "0" * 64  # what state.json would carry from an older build
+    assert a.hash() != stale_hash
+    assert a.semantic_diff(b) == []

@@ -690,6 +690,41 @@ class RunConfig:
             "entire generation from its own training",
         )
 
+    def semantic_diff(self, other: RunConfig) -> list[str]:
+        """Dotted paths where two configs differ in a way that would change the
+        data or the model. `HASH_EXCLUDED` paths are ignored.
+
+        This is what a resume should compare, in preference to `hash()`.
+        A hash answers "is this the same experiment" with one bit and no
+        explanation, and — the reason this exists — it is computed *through*
+        `HASH_EXCLUDED`, so broadening that set changes the hash function and
+        every previously stored fingerprint becomes unreachable. Extending
+        `ruby-panther` was refused for exactly that reason: nothing about the
+        run had changed, but `anchor_ladder` had moved into the exclusion set,
+        so the recomputed hash could not match the one in `state.json`.
+
+        Comparing the current config against the run's own archived
+        `config.yaml` sidesteps that entirely — both sides are pruned with
+        today's exclusion set — and yields the list of offending fields instead
+        of two opaque hex strings.
+        """
+        a = _prune(asdict(self), HASH_EXCLUDED)
+        b = _prune(asdict(other), HASH_EXCLUDED)
+
+        def walk(x: Any, y: Any, path: str = "") -> list[str]:
+            if isinstance(x, dict) and isinstance(y, dict):
+                out: list[str] = []
+                for k in sorted(set(x) | set(y)):
+                    kp = f"{path}.{k}" if path else str(k)
+                    if k not in x or k not in y:
+                        out.append(kp)
+                    else:
+                        out.extend(walk(x[k], y[k], kp))
+                return out
+            return [] if x == y else [path]
+
+        return walk(a, b)
+
     # -- hashing ---------------------------------------------------------------
 
     def hash(self) -> str:
@@ -713,6 +748,20 @@ class RunConfig:
 #: identity, an outer-loop bound, or infrastructure — none of it changes the
 #: distribution of the data or the shape of the model, so changing it on resume
 #: is legitimate and must not invalidate the run.
+#:
+#: `anchor_ladder` is the whole group, not just `threads`. The ladder *measures*
+#: — it plays its games under `eval/`, writes no shards, and never touches
+#: training. Changing the opponent panel cannot invalidate a single position in
+#: the replay buffer, so refusing a resume over it protects nothing and costs
+#: the workflow this project actually wants: taking a finished run and adding a
+#: few more generations to it. Extending `ruby-panther` was refused purely
+#: because its ladder predated the trailing gauntlet.
+#:
+#: This is safe *because* the gauntlet is trailing-only. A fixed anchor set
+#: changed mid-run would silently make the early and late Elo curves
+#: incomparable, which is a real reason to hash it; `gen − k` is self-contained
+#: per generation, so a panel change affects the generations after it and
+#: nothing before.
 HASH_EXCLUDED: frozenset[str] = frozenset(
     {
         "run_id",
@@ -726,7 +775,7 @@ HASH_EXCLUDED: frozenset[str] = frozenset(
         "train.epochs_per_gen_warn",
         "train.poll_interval_ms",
         "validation.overfit_warn_delta",
-        "anchor_ladder.threads",
+        "anchor_ladder",
         "export",
         "retention",
     }
