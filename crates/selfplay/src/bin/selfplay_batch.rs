@@ -29,7 +29,7 @@
 //! `] game M: P plies, final=` substring stable.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -212,13 +212,15 @@ fn main() {
     std::fs::create_dir_all(&args.out_dir).expect("create out-dir");
 
     let next_game = Arc::new(AtomicU32::new(0));
+    let stats = Arc::new(BatchStats::default());
     let total_t = Instant::now();
 
     thread::scope(|s| {
         for tid in 0..args.threads {
             let args = &args;
             let next_game = Arc::clone(&next_game);
-            s.spawn(move || run_worker(tid, args, next_game));
+            let stats = Arc::clone(&stats);
+            s.spawn(move || run_worker(tid, args, next_game, stats));
         }
     });
 
@@ -227,9 +229,72 @@ fn main() {
         args.games,
         total_t.elapsed()
     );
+    // Parsed by `model/train_loop.py::_parse_batch_fill`. Keep the key=value
+    // shape stable; trailing fields may be added.
+    let (raw, net) = stats.means();
+    let width = args.cfg.batch_size.max(1) as f64;
+    eprintln!(
+        "selfplay-batch: nn_calls={} leaves={} plies={} mean_fill={:.2} \
+         mean_fill_net={:.2} width={} fill_frac={:.3}",
+        stats.calls.load(Ordering::Relaxed),
+        stats.leaves.load(Ordering::Relaxed),
+        stats.plies.load(Ordering::Relaxed),
+        raw,
+        net,
+        args.cfg.batch_size.max(1),
+        net / width,
+    );
 }
 
-fn run_worker(tid: usize, args: &Args, next_game: Arc<AtomicU32>) {
+/// How full the evaluator's batches actually were.
+///
+/// Throughput here is *not* CPU-bound — `selfplay-batch` sits near 23% of a
+/// 10-core machine while CoreML works — so positions/second is set by the
+/// number of evaluator calls, and an under-filled batch costs the same wall
+/// time as a full one: `set_fixed_batch` pads every call to one width because
+/// CoreML compiles a separate model per input shape.
+///
+/// That makes fill the quantity to watch. `Search::next_batch` collects
+/// `batch_size` *distinct* non-terminal leaves, and both of those words are
+/// ways to come up short: a sharpening policy sends repeated descents down the
+/// same branch (virtual loss only spreads them so far), and a search near the
+/// capture threshold resolves leaves terminally, which need no evaluation. So
+/// the fill is expected to fall exactly as the network gets better — and
+/// generations 6 and 7 of run `ruby-panther` halved in positions/second with a
+/// byte-identical config while the policy entropy gap rose 0.959 → 1.191.
+/// This counter is what tells us whether those are the same fact.
+#[derive(Default)]
+struct BatchStats {
+    /// Calls to the evaluator, including one root expansion per search.
+    calls: AtomicU64,
+    /// Leaves summed over those calls.
+    leaves: AtomicU64,
+    /// Plies played, which is also the number of searches — and therefore the
+    /// number of size-1 root-expansion calls to discount.
+    plies: AtomicU64,
+}
+
+impl BatchStats {
+    /// `(mean fill, mean fill excluding root expansions)`, in leaves per call.
+    fn means(&self) -> (f64, f64) {
+        let calls = self.calls.load(Ordering::Relaxed) as f64;
+        let leaves = self.leaves.load(Ordering::Relaxed) as f64;
+        let plies = self.plies.load(Ordering::Relaxed) as f64;
+        let raw = if calls > 0.0 { leaves / calls } else { 0.0 };
+        // One root expansion per search, always a batch of exactly one. Left in
+        // the raw figure it drags the mean down by a fixed amount that has
+        // nothing to do with how well the search is batching.
+        let net_calls = calls - plies;
+        let net = if net_calls > 0.0 {
+            (leaves - plies) / net_calls
+        } else {
+            0.0
+        };
+        (raw, net)
+    }
+}
+
+fn run_worker(tid: usize, args: &Args, next_game: Arc<AtomicU32>, stats: Arc<BatchStats>) {
     // Per-thread session: each worker loads its own ONNX. ORT 2.x's
     // Session::run takes &mut self, and a shared Mutex<Session> would
     // bottleneck all inference through one thread. ~30 MB × threads of
@@ -251,9 +316,21 @@ fn run_worker(tid: usize, args: &Args, next_game: Arc<AtomicU32>) {
             break;
         }
         let seed = args.seed.wrapping_add(u64::from(game_id));
+        let mut calls = 0u64;
+        let mut leaves = 0u64;
         let outcome = play_game(&args.cfg, game_id, seed, |batch| {
+            // Counted locally and flushed once per game: nine workers hammering
+            // one atomic per evaluator call would be contention added by the
+            // instrument measuring the contention.
+            calls += 1;
+            leaves += batch.len() as u64;
             evaluator.evaluate_batch(batch).expect("ort evaluate")
         });
+        stats.calls.fetch_add(calls, Ordering::Relaxed);
+        stats.leaves.fetch_add(leaves, Ordering::Relaxed);
+        stats
+            .plies
+            .fetch_add(outcome.trajectory.len() as u64, Ordering::Relaxed);
 
         // Lazily create a shard writer; rotate every `shard_games`.
         if writer.is_none() {
