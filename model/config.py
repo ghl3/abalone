@@ -602,12 +602,27 @@ class RunConfig:
     # -- loading ---------------------------------------------------------------
 
     @classmethod
-    def from_yaml(cls, path: Path) -> RunConfig:
+    def from_yaml(cls, path: Path, *, validate: bool = True) -> RunConfig:
+        """Load a config, validating it by default.
+
+        `validate=False` is for **reading an archived config back**, which is
+        not the same act as starting a run with it. Every rule in `validate()`
+        was added because some run had already been damaged by its absence, so
+        a rule added today will reject a config written yesterday — and the
+        run it describes is exactly the one you need to load in order to
+        analyse or re-measure it. `model/posthoc_ladder.py` exists to re-play
+        finished runs whose anchors were misconfigured, and would have been
+        unable to open a single one of them.
+
+        Unknown keys are still rejected: a config this loader cannot represent
+        is a config it would silently misreport, which is a different failure.
+        """
         raw = yaml.safe_load(Path(path).read_text()) or {}
         if not isinstance(raw, dict):
             raise ValueError(f"{path}: top level must be a mapping, got {type(raw).__name__}")
         cfg = _from_dict(cls, raw)
-        cfg.validate()
+        if validate:
+            cfg.validate()
         return cfg
 
     def to_yaml(self, path: Path) -> None:

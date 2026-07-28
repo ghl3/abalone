@@ -526,3 +526,27 @@ def test_rolling_holdout_cadence_counts_from_the_frozen_holdout() -> None:
 )
 def test_rolling_holdout_can_be_switched_off(v: ValidationConfig) -> None:
     assert not any(v.is_rolling_holdout_gen(g) for g in range(1, 20))
+
+
+def test_an_archived_config_can_be_loaded_without_validation(tmp_path: Path) -> None:
+    """Every rule in `validate()` was added because a run had already been
+    damaged by its absence — so a rule added today rejects a config written
+    yesterday, and that run is exactly the one you need to open in order to
+    analyse or re-measure it. `model/posthoc_ladder.py` re-plays finished runs
+    whose ladder anchors were wrong; validating on load would have made it
+    unable to open a single one of them."""
+    path = tmp_path / "config.yaml"
+    path.write_text("gens: 12\nanchor_ladder:\n  every_gens: 4\n  trailing_gens: [4]\n")
+    with pytest.raises(ValueError, match=r"trailing_gens"):
+        RunConfig.from_yaml(path)
+    cfg = RunConfig.from_yaml(path, validate=False)
+    assert cfg.anchor_ladder.trailing_gens == [4]
+
+
+def test_unknown_keys_are_rejected_even_without_validation(tmp_path: Path) -> None:
+    """A config this loader cannot represent is one it would silently
+    misreport — a different failure from a rule postdating the run."""
+    path = tmp_path / "config.yaml"
+    path.write_text("gens: 12\nnot_a_real_knob: 3\n")
+    with pytest.raises((ValueError, TypeError)):
+        RunConfig.from_yaml(path, validate=False)
