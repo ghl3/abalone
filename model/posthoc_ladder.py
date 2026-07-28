@@ -107,8 +107,10 @@ def main() -> int:
             no_progress_plies=la.no_progress_plies,
             threads=la.threads,
             on_rung=lambda r: print(
-                f"    {r.label:16} {r.result.wins:3}-{r.result.draws:2}-{r.result.losses:2}"
-                f"  score {r.score:.3f}  elo {r.elo_str()}"
+                f"    {r.label:16} {r.result.wins_a:3}-{r.result.draws:2}-"
+                f"{r.result.wins_b:2}  score {r.score:.3f}  "
+                f"plies {r.result.mean_plies:5.1f}  elo {r.elo_str()}",
+                flush=True,
             ),
         )
         report["probes"][str(probe)] = {
@@ -117,10 +119,12 @@ def main() -> int:
             "rungs": [
                 {
                     "opponent": r.opponent,
-                    "wins": r.result.wins,
+                    "wins": r.result.wins_a,
                     "draws": r.result.draws,
-                    "losses": r.result.losses,
+                    "losses": r.result.wins_b,
                     "score": r.score,
+                    "mean_plies": r.result.mean_plies,
+                    "distinct_transcripts": r.result.distinct_transcripts,
                     "elo": r.result.elo_a,
                     "ci95": [r.result.elo_a_ci95_lo, r.result.elo_a_ci95_hi],
                     "clamped": r.clamped,

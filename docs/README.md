@@ -33,3 +33,4 @@ These are living documents and are edited in place.
 | Document | Summary |
 | --- | --- |
 | [2026-07-27-architecture-review.md](2026-07-27-architecture-review.md) | Full-codebase review + roadmap. Diagnoses why the gen 1–3 training run learned nothing; two silent correctness bugs; prioritised plan. |
+| [2026-07-28-first-strength-measurement.md](2026-07-28-first-strength-measurement.md) | Run `ruby-panther`, 12 generations. The project's first non-clamped Elo: ~75–90 per generation over six resolved rungs, plus what the result does not establish. |
