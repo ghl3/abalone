@@ -1,15 +1,23 @@
 # Standard run — the real one. 50 generations.
 #
-# Budget (MODEL.md §9): 200 games × ~150 plies × playout-cap-randomised
-# 200/800 sims is ~10M network evaluations per generation. Batched leaf
-# evaluation plus CoreML is what makes that a few minutes rather than an hour,
-# so `use_coreml: true` is not optional here.
+# Budget, measured on run `ruby-panther` rather than estimated: 400 games ×
+# ~107 plies × playout-cap-randomised 200/800 sims is ~15M network evaluations
+# per generation, and self-play sustains ~22 positions/s on an M1 Pro through
+# CoreML. That is **~45 minutes of self-play per generation**, so this run is
+# roughly 40 hours end to end. `use_coreml: true` is not optional: the CPU path
+# is over an order of magnitude slower.
 #
-# The milestones are in MODEL.md §8.2 and none of them mention the heuristic:
-# sustained >= +100 Elo per 10 generations against frozen checkpoints with
-# intervals excluding zero, and games *lengthening* toward 120-200 plies with
-# captures_per_100_plies falling while natural termination stays high. Expect
-# the first genuinely non-random play around gen 10. Read a run back with
+# Before starting one, check `runs/` is excluded from Spotlight. Indexing the
+# shard tree cost about 1.6 cores continuously on the previous run and grew as
+# it went; there is a `.metadata_never_index` marker but System Settings →
+# Spotlight → Search Privacy is the reliable version.
+#
+# The milestones are in MODEL.md §8.2: sustained >= +100 Elo per 10 generations
+# against frozen checkpoints with intervals excluding zero, and games
+# *lengthening* toward 120-200 plies with captures_per_100_plies falling while
+# natural termination stays high. `ruby-panther` hit non-random play by gen 2-3
+# and ran at ~85 Elo/generation over 12 generations, so the bar above is a
+# floor, not a target. Read a run back with
 # `uv run python -m model.report --run latest`.
 seed: 0
 gens: 50
@@ -61,8 +69,9 @@ self_play:
     # A permanent 10% trickle: 5–4 capture positions are strategically critical
     # and essentially never visited by self-play from a fresh start.
     floor: 0.10
-    # 200 games/gen at rate 0.7 leaves ~60 unseeded — comfortably above this,
-    # and the margin only grows as the rate falls.
+    # 400 games/gen at rate 0.7 leaves ~120 unseeded — comfortably above this,
+    # and the margin only grows as the rate falls. `ruby-panther` measured
+    # 351-368 unseeded games per generation once the rate reached its floor.
     min_unseeded_games: 20
     schedule: {}
   random_opening_plies: 2
@@ -143,19 +152,14 @@ validation:
 anchor_ladder:
   # Ten ladders over the run, plus the final one.
   #
-  # Cost, measured: `eval-match` sustains ~2.1k NN evaluations/s aggregate on
-  # an M1 Pro against `selfplay-batch`'s ~16k, so a checkpoint rung is ~186 s
-  # per 9-game wave at 200 sims. This ladder is
-  #
-  #   2 floor rungs x 12 games      ~   4 min
-  #   3 checkpoint rungs x 32 games ~  37 min   (4 waves each)
-  #                                 -----------
-  #                                 ~ 41 min per ladder, ~7 h over the run
-  #
-  # against ~8 h of self-play. That ratio is uncomfortable and the honest fix
-  # is `eval-match`'s throughput, not fewer games — a rung with 12 games is a
-  # ±145 Elo interval and measures nothing. Until then, `every_gens: 10` is the
-  # cheapest knob and costs only resolution in time.
+  # Cost is no longer the constraint it was. `eval-match` was missing the
+  # fixed-batch padding that self-play already had, so CoreML recompiled per
+  # input shape and a rung took ~186 s per 9-game wave. With that fixed, the
+  # generation-8 ladder of `ruby-panther` played 128 games across 5 rungs in
+  # **5.4 minutes**. At the widened anchor set below (up to 10 rungs, ~280
+  # games) a ladder is ~12 min, so ~2 h over the whole run against ~38 h of
+  # self-play. Games per rung is now the right place to spend, not the first
+  # place to cut: 12 games is a ±145 Elo interval and measures nothing.
   every_gens: 5
   run_on_final_gen: true
   games: 32
@@ -167,14 +171,29 @@ anchor_ladder:
   # Fixed reference points, spanning the run: "am I beating my past self" is
   # what gives a monotone curve, and it is what catches a silent regression.
   # These are the rungs the headline Elo averages.
-  frozen_gens: [1, 25]
+  #
+  # Spaced every 10 rather than the old `[1, 25]`, so there is always a fixed
+  # anchor inside the resolvable band. With `[1, 25]` the ladders from gen 10
+  # to gen 25 had exactly one usable rung between them — see `trailing_gens`.
+  frozen_gens: [1, 10, 20, 30, 40]
   # The moving rungs: they improve as the network does, so they are the ones
   # still resolving anything at generation 45. Excluded from the headline mean
-  # precisely because they move. Keep the offsets strictly below `every_gens`
-  # — an offset >= the ladder period always reaches back past the previous
-  # ladder, to a checkpoint this network has already been shown to beat, and
-  # every rung clamps.
-  trailing_gens: [1, 2]
+  # precisely because they move.
+  #
+  # The offsets are picked from measured resolution, not taste. Run
+  # `ruby-panther` at ~85 Elo/generation, 32 games per rung
+  # (docs/2026-07-28-first-strength-measurement.md):
+  #
+  #   1 generation back   +55  [-63, +188]   does NOT resolve — CI spans zero
+  #   2 generations back  +177 [ +59, +353]  marginal
+  #   4 generations back  +364 [+227, +720]  resolves cleanly
+  #   6 generations back  +470 [+306, +720]  resolves, pressing the ceiling
+  #   8+ generations back                    swept 32-0-0, reports a bound
+  #
+  # So the usable band is roughly 2-6 generations and `4` is the middle of it.
+  # Keeping `1` and `2` costs little and they become the informative ones if
+  # the per-generation rate rises.
+  trailing_gens: [1, 2, 4]
   batch_size: 32
   c_puct: 1.4
   opening: belgian
