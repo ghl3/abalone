@@ -143,11 +143,16 @@ anchor_ladder:
   # retired (MODEL.md §8.2): its evaluator cannot tell one capture of margin
   # from four, and a 1.1M network beat it after 180 games.
   opponents: [random, heuristic@100]
-  # Fixed reference points; these are what the headline Elo averages.
-  frozen_gens: [1, 6]
-  # The moving rung. It improves as the network does, so unlike every fixed
-  # anchor it still has resolution at generation 12.
-  trailing_gens: [4]
+  # Fixed reference points; these are what the headline Elo averages. Both must
+  # exist by the first ladder (gen 4) or the rung is silently dropped — gen 6
+  # was here and never played once.
+  frozen_gens: [1, 4]
+  # The moving rungs, and the only ones with resolution left late in the run.
+  # These must be *near*: an offset >= `every_gens` always reaches back past the
+  # previous ladder, so the opponent is one the network already swept. The
+  # gen-4 ladder of run ruby-panther faced random/heuristic@100/gen_001 with
+  # `trailing_gens: [4]` (gen - 4 = gen 0, dropped) and clamped every rung.
+  trailing_gens: [1, 2]
   batch_size: 32
   c_puct: 1.4
   opening: belgian

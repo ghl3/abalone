@@ -168,10 +168,13 @@ anchor_ladder:
   # what gives a monotone curve, and it is what catches a silent regression.
   # These are the rungs the headline Elo averages.
   frozen_gens: [1, 25]
-  # The moving rung: gen - 5 improves as the network does, so it is the one
+  # The moving rungs: they improve as the network does, so they are the ones
   # still resolving anything at generation 45. Excluded from the headline mean
-  # precisely because it moves.
-  trailing_gens: [5]
+  # precisely because they move. Keep the offsets strictly below `every_gens`
+  # — an offset >= the ladder period always reaches back past the previous
+  # ladder, to a checkpoint this network has already been shown to beat, and
+  # every rung clamps.
+  trailing_gens: [1, 2]
   batch_size: 32
   c_puct: 1.4
   opening: belgian

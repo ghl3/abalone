@@ -495,9 +495,13 @@ class AnchorLadderConfig:
     #: the generation is not strictly earlier than the current one, or its ONNX
     #: has been collected by retention.
     frozen_gens: list = field(default_factory=lambda: [1])
-    #: Offsets back from the current generation: `[5]` plays `gen − 5`. The
-    #: rung that keeps its resolution once the fixed anchors are all swept.
-    trailing_gens: list = field(default_factory=lambda: [5])
+    #: Offsets back from the current generation: `[1, 2]` plays `gen − 1` and
+    #: `gen − 2`. The rungs that keep their resolution once the fixed anchors
+    #: are all swept — which requires them to be *near*. The default was `[5]`
+    #: and that was the bug: paired with `every_gens: 4` it resolved to gen 0
+    #: at the first ladder and to a previously-swept checkpoint at every one
+    #: after, so no ladder in either completed run ever measured anything.
+    trailing_gens: list = field(default_factory=lambda: [1, 2])
     batch_size: int = 32
     c_puct: float = 1.4
     # Openings and early-ply sampling are what make N games N samples rather
@@ -521,11 +525,30 @@ class AnchorLadderConfig:
             _require(
                 isinstance(spec, str), f"anchor_ladder.opponents must be strings, got {spec!r}"
             )
+        for g in self.frozen_gens:
+            _require(
+                isinstance(g, int) and not isinstance(g, bool) and g > 0,
+                f"anchor_ladder.frozen_gens are positive generation numbers, got {g!r}",
+            )
         for k in self.trailing_gens:
             _require(
                 isinstance(k, int) and not isinstance(k, bool) and k > 0,
                 f"anchor_ladder.trailing_gens are positive generation offsets, got {k!r}",
             )
+        # The trailing rung's whole job is to be the *near* opponent — the one
+        # that improves in step with the network and so never saturates. A
+        # distant offset is a fixed reference point wearing a moving rung's
+        # clothes, and belongs in `frozen_gens`. It also dies at the early
+        # ladders: `every_gens: 4` with `trailing_gens: [4]` resolves to gen 0
+        # at the first ladder, which left run ruby-panther's gen-4 ladder with
+        # gen_001 as its only checkpoint rung. Every rung clamped.
+        _require(
+            not self.trailing_gens or min(int(k) for k in self.trailing_gens) <= 2,
+            f"anchor_ladder.trailing_gens {self.trailing_gens} has no offset <= 2. "
+            f"The trailing rung must reach a recent generation or it saturates "
+            f"like a frozen anchor and the ladder resolves nothing; use e.g. "
+            f"[1, 2].",
+        )
 
 
 @dataclass
@@ -599,6 +622,15 @@ class RunConfig:
         self.self_play.validate()
         self.train.validate()
         self.anchor_ladder.validate()
+        for g in self.anchor_ladder.frozen_gens:
+            # A generation is never its own opponent, so a frozen anchor at or
+            # beyond the last generation is silently dropped from every ladder
+            # it was meant to appear in.
+            _require(
+                int(g) < self.gens,
+                f"anchor_ladder.frozen_gens has {g}, but the run is only "
+                f"{self.gens} generations; that rung would never be played.",
+            )
         _require(
             self.validation.holdout_gen >= 1,
             "validation.holdout_gen must be >= 1 (generations are 1-indexed)",
