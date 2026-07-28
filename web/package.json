@@ -7,12 +7,14 @@
     "build": "next build",
     "start": "next start",
     "build:wasm": "wasm-pack build ../crates/wasm --target bundler --out-dir ../../web/wasm",
-    "prebuild": "npm run build:wasm",
-    "predev": "npm run build:wasm"
+    "prebuild": "npm run build:wasm && npm run copy:ort",
+    "predev": "npm run build:wasm && npm run copy:ort",
+    "copy:ort": "node scripts/copy-ort-assets.mjs"
   },
   "dependencies": {
     "abalone-wasm": "file:./wasm",
     "next": "^15.1.0",
+    "onnxruntime-web": "^1.27.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

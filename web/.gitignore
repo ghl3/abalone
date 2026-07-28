@@ -11,3 +11,6 @@ wasm/
 
 # Build artifacts
 *.tsbuildinfo
+
+# Staged onnxruntime-web binaries (copied from node_modules by predev/prebuild)
+public/ort/
