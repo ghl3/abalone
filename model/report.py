@@ -540,16 +540,27 @@ def format_generalisation(records: list[dict[str, Any]]) -> list[str]:
         f"      {'head':12}{'train':>9}{'rolling':>9}{'gap':>9}{'w':>6}"
         f"{'share':>8}  labels",
     ]
+    # A share of a negative total is arithmetically fine and unreadable: at
+    # generation 12 of ruby-panther every head held out *better* than it
+    # trained, and "value 28%" for a −0.105 contribution to a −0.379 total
+    # invites exactly the wrong reading. There is no gap to apportion, so the
+    # column is suppressed and the table says why.
+    apportionable = total > 1e-9
     for name, weight, labelling, tr, va, contribution in measured:
         # Shares are of the *weighted* gap, so they can exceed 100% or go
         # negative: a head that generalises better than it trains offsets the
         # others rather than adding to them.
-        share = f"{contribution / total * 100:7.0f}%" if abs(total) > 1e-9 else f"{'-':>8}"
+        share = f"{contribution / total * 100:7.0f}%" if apportionable else f"{'-':>8}"
         out.append(
             f"      {name:12}{tr:9.4f}{va:9.4f}{va - tr:+9.3f}{weight:6.2f}"
             f"{share}  {labelling}"
         )
     out.append(f"      {'total':12}{'':9}{'':9}{total:+9.3f}")
+    if not apportionable:
+        out.append(
+            "      no generalisation gap to apportion — the holdout loss is at "
+            "or below the training loss"
+        )
     return out
 
 

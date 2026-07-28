@@ -533,3 +533,30 @@ def test_a_run_with_no_rolling_holdout_says_so() -> None:
     """Silence would read as "no gap"; there is simply no measurement."""
     lines = format_generalisation([{"gen": 1, "train/loss_total": 4.0}])
     assert any("no generation has a rolling holdout" in ln for ln in lines)
+
+
+def test_a_negative_total_gap_suppresses_the_share_column() -> None:
+    """Generation 12 of ruby-panther held out better than it trained on every
+    head: total −0.379. Shares of a negative total are arithmetically valid and
+    read as their own opposite — "value 28%" for a −0.105 contribution suggests
+    value is the problem when there is no problem. Suppress and say so."""
+    row = {
+        "gen": 12,
+        "train/loss_total": 4.1483,
+        "train/loss_value": 0.6154,
+        "train/loss_score": 1.7012,
+        "train/loss_policy": 3.2663,
+        "train/loss_capture_map": 0.0756,
+        "val_rolling/loss_total": 3.7693,
+        "val_rolling/loss_value": 0.5107,
+        "val_rolling/loss_score": 1.7496,
+        "val_rolling/loss_policy": 2.9852,
+        "val_rolling/loss_capture_map": 0.0736,
+    }
+    lines = format_generalisation([row])
+    assert any("no generalisation gap to apportion" in ln for ln in lines)
+    assert not any("%" in ln for ln in lines if "head" not in ln)
+    total = next(ln for ln in lines if "total" in ln)
+    assert float(total.split()[-1]) == pytest.approx(
+        row["val_rolling/loss_total"] - row["train/loss_total"], abs=5e-4
+    )
