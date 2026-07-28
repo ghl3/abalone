@@ -579,6 +579,10 @@ class RunConfig:
     seed: int = 0
     gens: int = 50
     runs_root: str = "runs"
+    #: Where `export.web_export` copies the best-by-Elo ONNX. `{run_id}` is
+    #: interpolated, and throwaway configs must use it: the default path is the
+    #: one the web app loads, and every config once pointed at it, so a dry run
+    #: replaced the published model with a network trained on six games.
     web_export_path: str = "web/public/models/best.onnx"
     #: Trunk size, from `model.abalone_net.PRESETS`.
     net_preset: str = "base"

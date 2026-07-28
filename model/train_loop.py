@@ -1952,7 +1952,12 @@ def _run_outer_loop(
                     total_gens=cfg.gens,
                 )
                 if cfg.export.web_export:
-                    web_dst = REPO_ROOT / cfg.web_export_path
+                    # `{run_id}` lets a throwaway run keep its artifact to
+                    # itself. Without it every config pointed at the same
+                    # `web/public/models/best.onnx`, so a six-game dry run
+                    # silently replaced the web app's model with a network
+                    # trained for ninety seconds.
+                    web_dst = REPO_ROOT / cfg.web_export_path.format(run_id=cfg.run_id)
                     web_dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(new_onnx, web_dst)
                     _log(f"  web export → {web_dst}", gen=new_gen, total_gens=cfg.gens)

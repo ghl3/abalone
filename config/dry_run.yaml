@@ -14,7 +14,9 @@
 seed: 0
 gens: 3
 runs_root: runs
-web_export_path: web/public/models/best.onnx
+# Run-scoped on purpose. A dry run's network has seen six games and must never
+# land on the path the web app loads — `{run_id}` is interpolated at export.
+web_export_path: runs/{run_id}/web/best.onnx
 # 6×96. The dry run measures plumbing, not capacity.
 net_preset: small
 # CoreML compiles one model per input shape, per thread. At this size the

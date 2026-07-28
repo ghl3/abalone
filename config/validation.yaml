@@ -25,7 +25,10 @@
 seed: 0
 gens: 6
 runs_root: runs
-web_export_path: web/public/models/best.onnx
+# Run-scoped: this config exists to check that the loop produces signal, not to
+# produce a model anyone should play against. `{run_id}` is interpolated at
+# export time.
+web_export_path: runs/{run_id}/web/best.onnx
 # 6×96, ~1.1M params. Capacity is not what is being tested here.
 net_preset: small
 # 0.9 pos/s on CPU vs 29.5 pos/s on CoreML at batch 32. The batched search
