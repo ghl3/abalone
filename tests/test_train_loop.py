@@ -36,6 +36,7 @@ from model.eval import (
     mean_elo,
     model_spec,
     opponent_label,
+    resolved_regressions,
 )
 from model.state import GenRecord, RunState
 from model.train_loop import (
@@ -1001,3 +1002,46 @@ def test_offset_metrics_are_omitted_when_the_generation_is_unknown() -> None:
     rungs = [_rung("model:gen_010.onnx", 177.0, KIND_TRAILING, score_a=0.73)]
     out = ladder_summary(rungs)
     assert not [k for k in out if "vs_gen_minus" in k]
+
+
+# --------------------------------------------------------------------------- #
+# Which checkpoint `best.onnx` points at                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_confident_loss_is_a_regression() -> None:
+    """Score 0.20 over 32 games: the upper end of the interval is nowhere near
+    0.5, so the network really is weaker than that opponent."""
+    rungs = [_rung("model:gen_012.onnx", -240.0, KIND_TRAILING, score_a=0.20, score_a_stderr=0.07)]
+    assert [r.opponent for r in resolved_regressions(rungs)] == ["model:gen_012.onnx"]
+
+
+def test_noise_around_even_is_not_a_regression() -> None:
+    """Generation 13 vs generation 12: 0.547 +/- 0.088, a 95% interval of about
+    +/-0.17. Keying promotion on "did I beat my predecessor" here would make
+    `best.onnx` hop about on coin flips, which is why the rule is regression-
+    based rather than improvement-based."""
+    rungs = [_rung("model:gen_012.onnx", 33.0, KIND_TRAILING, score_a=0.547, score_a_stderr=0.088)]
+    assert resolved_regressions(rungs) == []
+    # Even losing the match outright is not enough on its own.
+    rungs = [_rung("model:gen_012.onnx", -33.0, KIND_TRAILING, score_a=0.453, score_a_stderr=0.088)]
+    assert resolved_regressions(rungs) == []
+
+
+def test_losing_to_a_floor_anchor_counts() -> None:
+    """Losing to `random` is not a subtle signal and must not be excused for
+    being a floor rung rather than a trailing one."""
+    rungs = [_rung("random", -300.0, KIND_FLOOR, score_a=0.10, score_a_stderr=0.05)]
+    assert len(resolved_regressions(rungs)) == 1
+
+
+def test_a_swept_rung_is_never_a_regression() -> None:
+    rungs = [_rung("model:gen_005.onnx", 720.0, KIND_TRAILING, score_a=1.0,
+                   score_a_stderr=0.0, elo_a_clamped=True)]
+    assert resolved_regressions(rungs) == []
+
+
+def test_a_rung_without_a_stderr_is_not_a_regression() -> None:
+    """No measurement is not a bad measurement."""
+    rungs = [_rung("model:gen_012.onnx", -240.0, KIND_TRAILING, score_a=0.2)]
+    assert resolved_regressions(rungs) == []

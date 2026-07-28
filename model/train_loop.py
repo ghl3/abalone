@@ -100,6 +100,7 @@ from model.eval import (
     LadderRung,
     ladder_summary,
     mean_elo_basis,
+    resolved_regressions,
     model_spec,
     run_ladder,
     start_self_play,
@@ -2005,21 +2006,52 @@ def _run_outer_loop(
             )
             ladder_elo = _report_ladder(rungs, new_gen, cfg.gens)
 
-        # ---- best-by-Elo tracking; this is all `best.onnx` means now ----
-        if ladder_elo is not None and not math.isnan(ladder_elo):
-            if state.best_elo is None or ladder_elo > state.best_elo:
+        # ---- which checkpoint `best.onnx` points at ----
+        #
+        # Promote the newest generation unless the ladder caught it *confidently*
+        # losing to one of its own recent ancestors. Two rules were rejected on
+        # the way here, both for reasons this run demonstrated:
+        #
+        # "highest ladder Elo" — what this used to do — compares numbers with
+        # different bases. Generation 12 recorded +658 as a mean over floor
+        # rungs that were all clamped; generation 13 recorded +256 as a mean
+        # over trailing rungs. Neither is wrong, they simply are not the same
+        # measurement, and comparing them left `best.onnx` on generation 12
+        # while generation 13 was beating it head to head.
+        #
+        # "did it beat the previous generation" is unusable at this resolution.
+        # Generation 13 scored 0.547 against generation 12 with a 95% interval
+        # of about ±0.17 — a coin flip, and the published model would hop about
+        # on noise.
+        #
+        # So: improvement is the expectation and does not need certifying every
+        # generation; a *resolved* regression is the thing worth acting on.
+        if rungs:
+            regressions = resolved_regressions(rungs)
+            if regressions:
+                worst = min(regressions, key=lambda r: r.score)
+                _warn(
+                    f"generation {new_gen} is measurably weaker than {worst.label} "
+                    f"(score {worst.score:.3f} ± {worst.result.score_a_stderr:.3f}, "
+                    f"upper 95% bound below 0.5). Keeping best.onnx at gen "
+                    f"{state.best_gen}",
+                    gen=new_gen,
+                    total_gens=cfg.gens,
+                )
+            else:
                 previous = (
-                    f"gen {state.best_gen} ({state.best_elo:+.0f})"
-                    if state.best_elo is not None
-                    else "gen 000 (never measured)"
+                    f"gen {state.best_gen}" if state.best_gen else "gen 000 (none yet)"
                 )
                 state.best_gen = new_gen
+                # Informational only — the promotion decision above does not
+                # read it. Kept so `report.py` can show what the ladder said at
+                # the generation that was promoted.
                 state.best_elo = ladder_elo
                 state.best_onnx = f"checkpoints/gen_{new_gen:03d}.onnx"
                 _link_or_copy(new_onnx, ckpt_dir / "best.onnx")
                 _log(
-                    f"  best checkpoint → gen {new_gen} (ladder Elo {ladder_elo:+.0f}), "
-                    f"was {previous}",
+                    f"  best checkpoint → gen {new_gen} (no resolved regression "
+                    f"across {len(rungs)} rungs), was {previous}",
                     gen=new_gen,
                     total_gens=cfg.gens,
                 )
@@ -2248,15 +2280,16 @@ def _run_outer_loop(
             )
 
     _section()
-    if state.best_elo is not None:
+    if state.best_gen:
         _log(
-            f"all generations complete. Best by ladder Elo: gen {state.best_gen} "
-            f"({state.best_elo:+.0f}) → {state.best_onnx}"
+            f"all generations complete. best.onnx → gen {state.best_gen} "
+            f"({state.best_onnx}), the newest generation with no resolved "
+            f"regression on its ladder."
         )
     else:
         _log(
             "all generations complete. No ladder ever ran, so no checkpoint was "
-            f"selected by Elo; the latest export is {state.current_onnx}."
+            f"promoted; the latest export is {state.current_onnx}."
         )
     return 0
 

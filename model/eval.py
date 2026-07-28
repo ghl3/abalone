@@ -549,6 +549,32 @@ def mean_elo_basis(rungs: Sequence[LadderRung]) -> tuple[float, str]:
     return float("nan"), "nothing measured"
 
 
+def resolved_regressions(rungs: Sequence[LadderRung]) -> list[LadderRung]:
+    """Rungs where the network is *confidently* worse than the opponent.
+
+    "Confidently" is the whole point: a rung is only counted when the upper end
+    of its 95% interval on the score sits below 0.5, so ordinary
+    generation-to-generation noise cannot trigger it.
+
+    This exists because the obvious promotion rule — "did I beat my immediate
+    predecessor" — is unusable at the resolution we have. Generation 13 scored
+    0.547 against generation 12 with a 95% interval of roughly ±0.17: a
+    coin-flip dressed as a decision, and keying `best.onnx` on it would make the
+    published model hop about at random. The ladder's job here is to catch a
+    *regression*, not to certify every increment.
+
+    Floor rungs count too. Losing to `random` is not a subtle signal.
+    """
+    out: list[LadderRung] = []
+    for r in _measured(rungs):
+        se = r.result.score_a_stderr
+        if math.isnan(r.score) or math.isnan(se):
+            continue
+        if r.score + 1.96 * se < 0.5:
+            out.append(r)
+    return out
+
+
 def clamped_fraction(rungs: Sequence[LadderRung]) -> float:
     """Fraction of the measured rungs whose Elo is a sample-size bound.
 
@@ -681,6 +707,7 @@ __all__ = [
     "ladder_summary",
     "mean_elo",
     "mean_elo_basis",
+    "resolved_regressions",
     "model_spec",
     "opponent_label",
     "run_eval_match",

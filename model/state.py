@@ -145,6 +145,12 @@ class RunState:
     #: a promotion — self-play always uses `current_onnx` — it only selects the
     #: web export.
     best_gen: int = 0
+    #: **Informational only.** The ladder Elo recorded at the generation
+    #: that was promoted — it does NOT drive promotion. `elo_mean`'s basis
+    #: changes with the panel (fixed-reference rungs when any resolved,
+    #: trailing rungs otherwise), so comparing it across generations
+    #: compares different measurements. Promotion is decided by
+    #: `eval.resolved_regressions`; see the block in `train_loop`.
     best_elo: float | None = None
     best_onnx: str = ""  # path relative to runs/<run-id>/
     current_onnx: str = ""
