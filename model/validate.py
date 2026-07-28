@@ -101,6 +101,7 @@ import torch.nn.functional as F
 from model.batch import (
     SCORE_OFFSET,
     VALUE_DRAW,
+    VALUE_LOSS,
     VALUE_WIN,
     Batch,
 )
@@ -141,9 +142,31 @@ DATASET_KEY_PREFIX = "data_"
 #: Top-k used by `policy_top5_agreement`.
 TOP_K = 5
 
-#: The one returned value that is not a scalar. A generic logger (TensorBoard,
-#: a CSV writer) should skip it; it belongs in `metrics.jsonl`.
-NON_SCALAR_KEYS: frozenset[str] = frozenset({"value_calibration"})
+#: Absolute-ply boundaries for the value calibration-by-phase curve.
+#:
+#: The question this answers is "how early in a game does the network know who
+#: is winning", and a stronger network answers it sooner. Aggregate accuracy
+#: cannot: it is dominated by late positions where a marble count settles the
+#: matter and every network looks good. Opening accuracy is where the headroom
+#: is, and it is invisible in the mean.
+#:
+#: Absolute ply, not fraction-of-game. Fraction would put the realised game
+#: length in the denominator, which is itself an outcome — "70% of the way
+#: through" means something different in a 60-ply game than a 190-ply one, and
+#: the network cannot know which it is in. `ply / max_plies` (plane 12) divides
+#: by the *cap*, a constant, so it is absolute ply rescaled and converts back
+#: exactly.
+#:
+#: **Read these buckets as conditional.** Only games that lasted at least `k`
+#: plies contribute to the bucket at `k`, and games that run long are
+#: systematically the closer ones. Accuracy in the late buckets is measured on
+#: a harder subsample and is not comparable to the early buckets in absolute
+#: terms — compare a bucket against itself across generations.
+PHASE_EDGES_PLIES: tuple[int, ...] = (0, 20, 40, 60, 100, 200)
+
+#: The returned values that are not scalars. A generic logger (TensorBoard, a
+#: CSV writer) should skip them; they belong in `metrics.jsonl`.
+NON_SCALAR_KEYS: frozenset[str] = frozenset({"value_calibration", "value_phase"})
 
 
 def validate(
@@ -272,6 +295,15 @@ class _Accumulator:
         # errors".
         onehot = F.one_hot(t.value, num_classes=value_probs.shape[1]).to(value_probs.dtype)
         self._push("value_brier_rows", ((value_probs - onehot) ** 2).sum(dim=1))
+        # Probability assigned to the class the network actually picked. Paired
+        # with accuracy per phase it separates the two ways a value head fails:
+        # confident and wrong is a different problem from unsure and right.
+        self._push("value_confidence", value_probs.max(dim=1).values)
+        self._push("value_predicted", value_logits.argmax(dim=1))
+        # Scalar expectation of the value head, on the same [-1, +1] scale as
+        # the search's `q`, so the two are directly comparable.
+        self._push("value_expected", value_probs[:, VALUE_WIN] - value_probs[:, VALUE_LOSS])
+        self._push("q_target", t.q)
 
         # -- score -----------------------------------------------------------
         self._push("score_ce_rows", F.cross_entropy(score_logits, t.score, reduction="none"))
@@ -355,10 +387,61 @@ class _Accumulator:
         # -- value ------------------------------------------------------------
         value_ce = float(self._get("value_ce_rows").mean())
         value_brier = float(self._get("value_brier_rows").mean())
-        value_accuracy = float(self._get("value_correct").mean())
+        value_correct = self._get("value_correct")
+        value_accuracy = float(value_correct.mean())
         p_win = self._get("p_win")
-        won = (self._get("value_target") == VALUE_WIN).astype(np.float64)
+        value_target = self._get("value_target")
+        won = (value_target == VALUE_WIN).astype(np.float64)
         calibration, ece = _calibration(p_win, won, calibration_bins)
+
+        # Accuracy as a function of how far into the game the position sits.
+        # The aggregate is dominated by late positions, where a marble count
+        # settles the outcome and every network scores well; the opening is
+        # where the headroom is and where improvement actually shows.
+        ply_fraction_rows = self._get("ply_fraction").astype(np.float64)
+        confidence = self._get("value_confidence")
+        is_draw_rows = (value_target == VALUE_DRAW).astype(np.float64)
+        if max_plies:
+            phase = _phase_curve(
+                ply_fraction_rows * float(max_plies),
+                value_correct,
+                confidence,
+                self._get("value_brier_rows"),
+                is_draw_rows,
+                PHASE_EDGES_PLIES,
+            )
+        else:
+            # Plane 12 holds ply/max_plies; without the cap there is no way back
+            # to an absolute ply, and bucketing the fraction would silently mean
+            # something different for a run with a different cap.
+            phase = _empty_phase(PHASE_EDGES_PLIES)
+        early = phase[0]
+
+        # The collapse this project actually suffered: the value head learned to
+        # emit a constant when no game ever ended decisively, and three
+        # generations passed before anybody noticed. Predicted draw rate against
+        # the observed draw rate names it directly — a head predicting 90% draws
+        # into 3% draws has stopped modelling anything, and `value_accuracy`
+        # alone will not say so.
+        predicted = self._get("value_predicted")
+        predicted_draw_rate = float((predicted == VALUE_DRAW).mean())
+
+        # Per-class recall. A head can look healthy in aggregate while being
+        # blind to one outcome — losses are the expensive one to miss.
+        def _recall(cls: int) -> float:
+            mask = value_target == cls
+            return float(value_correct[mask].mean()) if mask.any() else nan
+
+        # How much the search moves the value head. The value analogue of
+        # `policy_kl_visits_from_prior`: `q` is the search's root value for this
+        # position, so the gap is what search is correcting. On the rolling
+        # holdout `q` comes from the network being measured; on the frozen one
+        # it comes from whichever network played that generation, which is why
+        # this is reported and not alarmed on.
+        v_net = self._get("value_expected")
+        q_rows = self._get("q_target")
+        value_q_gap = float(np.abs(v_net - q_rows).mean())
+        value_q_sign_agreement = float((np.sign(v_net) == np.sign(q_rows)).mean())
 
         # -- score ------------------------------------------------------------
         score_ce = float(self._get("score_ce_rows").mean())
@@ -373,9 +456,8 @@ class _Accumulator:
         capture_sep = _separation(cap_prob, cap_label)
 
         # -- data health -------------------------------------------------------
-        value_target = self._get("value_target")
-        draw_rate = float((value_target == VALUE_DRAW).mean())
-        ply_fraction = float(self._get("ply_fraction").mean())
+        draw_rate = float(is_draw_rows.mean())
+        ply_fraction = float(ply_fraction_rows.mean())
 
         # Same weighting as the training objective, so the two curves are
         # directly comparable and a train/validation gap is readable off them.
@@ -408,6 +490,20 @@ class _Accumulator:
             "value_accuracy": value_accuracy,
             "value_ece": ece,
             "value_calibration": calibration,
+            # The headline of the phase curve: how well the network knows the
+            # outcome in the first 20 plies, where it cannot yet be read off a
+            # marble count. This is the number that should climb.
+            "value_accuracy_early": early["accuracy"],
+            "value_brier_early": early["brier"],
+            "value_confidence_early": early["mean_confidence"],
+            "value_confidence": float(confidence.mean()),
+            "value_predicted_draw_rate": predicted_draw_rate,
+            "value_recall_win": _recall(VALUE_WIN),
+            "value_recall_draw": _recall(VALUE_DRAW),
+            "value_recall_loss": _recall(VALUE_LOSS),
+            "value_q_gap": value_q_gap,
+            "value_q_sign_agreement": value_q_sign_agreement,
+            "value_phase": phase,
             # score
             "score_ce": score_ce,
             "score_mae": score_mae,
@@ -458,6 +554,16 @@ METRIC_KEYS: tuple[str, ...] = (
     "value_brier",
     "value_accuracy",
     "value_ece",
+    "value_accuracy_early",
+    "value_brier_early",
+    "value_confidence_early",
+    "value_confidence",
+    "value_predicted_draw_rate",
+    "value_recall_win",
+    "value_recall_draw",
+    "value_recall_loss",
+    "value_q_gap",
+    "value_q_sign_agreement",
     "score_ce",
     "score_mae",
     "score_accuracy",
@@ -495,6 +601,7 @@ def _empty_metrics(calibration_bins: int) -> dict[str, object]:
     nan = float("nan")
     out: dict[str, object] = {k: 0 if k in _COUNT_KEYS else nan for k in METRIC_KEYS}
     out["value_calibration"] = _empty_calibration(calibration_bins)
+    out["value_phase"] = _empty_phase(PHASE_EDGES_PLIES)
     return out
 
 
@@ -553,6 +660,65 @@ def _calibration(
     return curve, ece
 
 
+def _empty_phase(edges: tuple[int, ...]) -> list[dict[str, float]]:
+    nan = float("nan")
+    return [
+        {
+            "ply_lower": int(edges[i]),
+            "ply_upper": int(edges[i + 1]),
+            "count": 0,
+            "mean_ply": nan,
+            "accuracy": nan,
+            "mean_confidence": nan,
+            "brier": nan,
+            "draw_rate": nan,
+        }
+        for i in range(len(edges) - 1)
+    ]
+
+
+def _phase_curve(
+    ply: np.ndarray,
+    correct: np.ndarray,
+    confidence: np.ndarray,
+    brier: np.ndarray,
+    is_draw: np.ndarray,
+    edges: tuple[int, ...],
+) -> list[dict[str, float]]:
+    """Value-head quality as a function of how far into the game the position is.
+
+    The curve is the artifact worth reading; the scalars derived from it are a
+    convenience for alarming and for TensorBoard. A network that is improving
+    shows the *early* buckets climbing while the late ones sit near their
+    ceiling — late positions are easy for everyone, so aggregate accuracy moves
+    only slightly while the thing you care about moves a lot.
+
+    `is_draw` is carried because a bucket's accuracy is uninterpretable without
+    it: at the ply cap almost everything adjudicates, and a bucket that is 60%
+    draws rewards a network that has learned to shrug.
+    """
+    curve: list[dict[str, float]] = []
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+        # Half-open, except the last bucket, which must catch the ply cap itself.
+        in_bin = (ply >= lo) & (ply < hi) if i < len(edges) - 2 else (ply >= lo) & (ply <= hi)
+        count = int(in_bin.sum())
+        nan = float("nan")
+        curve.append(
+            {
+                "ply_lower": int(lo),
+                "ply_upper": int(hi),
+                "count": count,
+                "mean_ply": float(ply[in_bin].mean()) if count else nan,
+                "accuracy": float(correct[in_bin].mean()) if count else nan,
+                "mean_confidence": float(confidence[in_bin].mean()) if count else nan,
+                "brier": float(brier[in_bin].mean()) if count else nan,
+                "draw_rate": float(is_draw[in_bin].mean()) if count else nan,
+            }
+        )
+    return curve
+
+
 def _auc(scores: np.ndarray, labels: np.ndarray) -> float:
     """ROC AUC via the Mann–Whitney rank statistic.
 
@@ -593,6 +759,7 @@ __all__ = [
     "DEFAULT_CAPTURE_THRESHOLD",
     "METRIC_KEYS",
     "NON_SCALAR_KEYS",
+    "PHASE_EDGES_PLIES",
     "NUM_VALID_CELLS",
     "TOP_K",
     "VAL_FROZEN_PREFIX",

@@ -682,7 +682,10 @@ def test_every_metric_is_json_serialisable() -> None:
         ScriptedNet(*zeros_like_outputs(3)), [make_batch(size=3, seed=34)], CPU, max_plies=200
     )
     for key, value in out.items():
-        if key == "value_calibration":
+        # `NON_SCALAR_KEYS` rather than a literal: this test exists to catch a
+        # metric that a generic logger cannot write, and hardcoding the current
+        # curve's name would make it silently stop covering the next one.
+        if key in NON_SCALAR_KEYS:
             continue
         assert type(value) in (int, float), (key, type(value))
     json.dumps(out)
@@ -771,7 +774,7 @@ def test_real_network_produces_the_full_metric_set() -> None:
     batches = [make_batch(size=4, seed=17), make_batch(size=3, seed=18)]
     out = validate(model, batches, CPU, max_plies=200)
 
-    assert set(out) == set(METRIC_KEYS) | {"value_calibration"}
+    assert set(out) == set(METRIC_KEYS) | NON_SCALAR_KEYS
     assert out["positions"] == 7
     assert out["policy_rows"] == 7
     assert math.isfinite(out["loss_total"])
