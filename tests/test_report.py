@@ -28,8 +28,10 @@ from model.report import (
     find_run,
     fmt,
     fmt_elo,
+    format_generalisation,
     format_ladder,
     format_table,
+    overfit_advice,
     read_metrics,
     render,
     warnings_for,
@@ -436,3 +438,74 @@ def test_latest_finds_a_run_that_has_not_finished_a_generation(tmp_path):
     os.utime(live / "state.json", (1_800_000_000, 1_800_000_000))
 
     assert find_run(tmp_path, "latest") == live
+
+
+# --------------------------------------------------------------------------- #
+# Per-head generalisation                                                      #
+# --------------------------------------------------------------------------- #
+
+#: Generation 5 of run `ruby-panther-20260727-2159`, verbatim. The weighted
+#: gaps sum to +0.196, which is exactly `val_rolling/loss_total` minus
+#: `train/loss_total` — so this fixture also pins the decomposition against the
+#: total it claims to explain.
+RUBY_PANTHER_GEN5 = {
+    "gen": 5,
+    "train/loss_total": 4.643936919429588,
+    "train/loss_value": 0.58236700129555,
+    "train/loss_score": 1.7344449979458076,
+    "train/loss_policy": 3.7898768702068844,
+    "train/loss_capture_map": 0.07684192068615936,
+    "val_rolling/loss_total": 4.840102575771317,
+    "val_rolling/loss_value": 0.8143404934332805,
+    "val_rolling/loss_score": 1.978124231839729,
+    "val_rolling/loss_policy": 3.715790487409203,
+    "val_rolling/loss_capture_map": 0.08835306768582996,
+}
+
+
+def test_the_decomposition_sums_to_the_total_gap() -> None:
+    """If the per-head contributions do not add up to `rolling - train`, the
+    table is inventing a story about a number it cannot account for."""
+    row = RUBY_PANTHER_GEN5
+    lines = format_generalisation([row])
+    total_line = next(ln for ln in lines if "total" in ln)
+    printed = float(total_line.split()[-1])
+    expected = row["val_rolling/loss_total"] - row["train/loss_total"]
+    assert printed == pytest.approx(expected, abs=5e-4)
+
+
+def test_a_head_that_generalises_better_shows_a_negative_share() -> None:
+    """`policy` trained to 3.7899 and held out at 3.7158 — it generalises
+    *better* than it trains, because training averages over older generations
+    while the rolling holdout is a slice of the newest. Reporting that as a
+    positive contribution would hide the only good news in the table."""
+    lines = format_generalisation([RUBY_PANTHER_GEN5])
+    policy = next(ln for ln in lines if ln.strip().startswith("policy"))
+    assert "-0.074" in policy
+    assert "-38%" in policy
+
+
+def test_advice_points_at_games_when_the_per_game_heads_dominate() -> None:
+    """The whole point of the decomposition: value + score carry 137% of this
+    gap, so the fix is more self-play. Telling the reader to cut steps here
+    would make the value head worse, not better."""
+    advice = overfit_advice(RUBY_PANTHER_GEN5)
+    assert "games_per_gen" in advice
+    assert "cutting" in advice and "steps" in advice
+
+
+def test_advice_points_at_steps_when_the_per_position_heads_dominate() -> None:
+    """The mirror case, which must give the opposite instruction."""
+    row = dict(RUBY_PANTHER_GEN5)
+    row["val_rolling/loss_value"] = row["train/loss_value"]
+    row["val_rolling/loss_score"] = row["train/loss_score"]
+    row["val_rolling/loss_policy"] = row["train/loss_policy"] + 0.5
+    advice = overfit_advice(row)
+    assert "target_epochs_per_gen" in advice
+    assert "games_per_gen" not in advice
+
+
+def test_a_run_with_no_rolling_holdout_says_so() -> None:
+    """Silence would read as "no gap"; there is simply no measurement."""
+    lines = format_generalisation([{"gen": 1, "train/loss_total": 4.0}])
+    assert any("no generation has a rolling holdout" in ln for ln in lines)

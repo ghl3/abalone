@@ -62,6 +62,30 @@ EPOCHS_WARN = 8.0
 #: is memorising the buffer. Mirrors `validation.overfit_warn_delta`.
 OVERFIT_WARN = 0.35
 
+#: The four heads, their default weight in the total loss (mirrors
+#: `LossWeightsConfig`), and — the reason this table exists — how many
+#: independent labels each one actually gets.
+#:
+#: `value` and `score` are labelled *per game*: every position in a game shares
+#: the same `z` and the same final capture differential. So their effective
+#: sample size is the number of games in the buffer (hundreds), not the number
+#: of positions (tens of thousands), and each label is seen once per position
+#: per epoch — of the order of a hundred times a generation. `policy` and
+#: `capture_map` are labelled per position and have no such ceiling.
+#:
+#: That asymmetry is not a hypothesis. At generation 5 of ruby-panther the
+#: train→rolling gap decomposed as value +0.232, score +0.244×0.15, capture_map
+#: +0.011×0.15 and policy **−0.074** — the two per-game heads accounted for more
+#: than the whole gap, and the per-position heads generalised at or better than
+#: training. Reading that off the total loss alone is impossible, which is why
+#: the decomposition is printed rather than left to be recomputed by hand.
+HEADS: tuple[tuple[str, float, str], ...] = (
+    ("value", 1.00, "per-game"),
+    ("score", 0.15, "per-game"),
+    ("policy", 1.00, "per-position"),
+    ("capture_map", 0.15, "per-position"),
+)
+
 
 # --------------------------------------------------------------------------- #
 # Reading a run                                                                #
@@ -410,11 +434,13 @@ def warnings_for(rows: list[Row], records: list[dict[str, Any]]) -> list[str]:
             and row.train_loss is not None
             and row.rolling_loss - row.train_loss > OVERFIT_WARN
         ):
+            record = next((r for r in records if r.get("gen") == row.gen), None)
             out.append(
                 f"{g}: val_rolling loss {row.rolling_loss:.4f} exceeds training loss "
                 f"{row.train_loss:.4f} by {row.rolling_loss - row.train_loss:.3f} — the "
                 f"rolling holdout is the same distribution as the training data, so "
-                f"this gap is memorisation of the buffer"
+                f"this gap is memorisation of the buffer. "
+                + (overfit_advice(record) if record else "")
             )
     measured = [r for r in rows if r.plies is not None]
     if len(measured) >= 3:
@@ -427,6 +453,89 @@ def warnings_for(rows: list[Row], records: list[dict[str, Any]]) -> list[str]:
             )
     if not records:
         out.append("this run has written no generation records yet")
+    return out
+
+
+def overfit_advice(record: dict[str, Any]) -> str:
+    """Which head is doing the memorising, and therefore what to change.
+
+    "More games" and "fewer steps" are opposite actions and the total loss
+    cannot tell you which one you need. Per-game heads (`value`, `score`) are
+    capped by the number of *games* in the buffer, so they want more self-play.
+    Per-position heads (`policy`, `capture_map`) are capped by steps, so they
+    want a smaller step budget. See `HEADS`.
+    """
+    weighted: dict[str, float] = {}
+    for name, weight, labelling in HEADS:
+        tr = _num(record, f"train/loss_{name}")
+        va = _num(record, f"val_rolling/loss_{name}")
+        if tr is not None and va is not None:
+            weighted[labelling] = weighted.get(labelling, 0.0) + (va - tr) * weight
+    total = sum(weighted.values())
+    if not weighted or abs(total) < 1e-9:
+        return ""
+    per_game = weighted.get("per-game", 0.0) / total
+    if per_game >= 0.8:
+        return (
+            f"{per_game * 100:.0f}% of it is the per-game heads (value, score), whose "
+            f"labels are shared by every position in a game — the effective sample "
+            f"size is the game count, not the position count. Raise "
+            f"self_play.games_per_gen or widen train.replay_buffer_gens; cutting "
+            f"steps will not help"
+        )
+    if per_game <= 0.2:
+        return (
+            f"{(1 - per_game) * 100:.0f}% of it is the per-position heads (policy, "
+            f"capture_map), which are capped by steps rather than games — lower "
+            f"train.target_epochs_per_gen"
+        )
+    return (
+        f"per-game heads account for {per_game * 100:.0f}% of it; see the "
+        f"generalisation table"
+    )
+
+
+def format_generalisation(records: list[dict[str, Any]]) -> list[str]:
+    """Decompose the newest generation's train→val_rolling gap by head.
+
+    The total loss says *whether* the network is memorising the buffer. This
+    says *which head* is, and the answer decides the fix: a per-game head that
+    overfits wants more games, while a per-position head that overfits wants
+    fewer steps. Those are opposite actions, and the total cannot tell them
+    apart. See `HEADS`.
+    """
+    row = next(
+        (r for r in reversed(records) if _num(r, "val_rolling/loss_total") is not None),
+        None,
+    )
+    if row is None:
+        return ["    (no generation has a rolling holdout yet)"]
+
+    measured: list[tuple[str, float, str, float, float, float]] = []
+    for name, weight, labelling in HEADS:
+        tr = _num(row, f"train/loss_{name}")
+        va = _num(row, f"val_rolling/loss_{name}")
+        if tr is not None and va is not None:
+            measured.append((name, weight, labelling, tr, va, (va - tr) * weight))
+    if not measured:
+        return ["    (no per-head losses recorded)"]
+
+    total = sum(m[5] for m in measured)
+    out = [
+        f"    gen {row.get('gen', '?')}: train → val_rolling, by head",
+        f"      {'head':12}{'train':>9}{'rolling':>9}{'gap':>9}{'w':>6}"
+        f"{'share':>8}  labels",
+    ]
+    for name, weight, labelling, tr, va, contribution in measured:
+        # Shares are of the *weighted* gap, so they can exceed 100% or go
+        # negative: a head that generalises better than it trains offsets the
+        # others rather than adding to them.
+        share = f"{contribution / total * 100:7.0f}%" if abs(total) > 1e-9 else f"{'-':>8}"
+        out.append(
+            f"      {name:12}{tr:9.4f}{va:9.4f}{va - tr:+9.3f}{weight:6.2f}"
+            f"{share}  {labelling}"
+        )
+    out.append(f"      {'total':12}{'':9}{'':9}{total:+9.3f}")
     return out
 
 
@@ -465,6 +574,9 @@ def render(run_dir: Path, records: list[dict[str, Any]], tail: int | None) -> li
     lines.append("")
     lines.append("ladder")
     lines.extend(format_ladder(shown_records))
+    lines.append("")
+    lines.append("generalisation")
+    lines.extend(format_generalisation(shown_records))
     lines.append("")
 
     problems = warnings_for(shown, records)
