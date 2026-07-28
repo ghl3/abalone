@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 abalone-game = { path = "../game" }
 abalone-mcts = { path = "../mcts" }
+abalone-encoder = { path = "../encoder" }
 rand = { version = "0.8", features = ["small_rng"] }
 # Arrow IPC + Parquet for shard files. Picked over a hand-rolled binary
 # format because (a) pyarrow gives Python zero-copy numpy reads, (b)

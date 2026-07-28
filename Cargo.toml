@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/game", "crates/mcts", "crates/selfplay", "crates/wasm"]
+members = [
+    "crates/game",
+    "crates/mcts",
+    "crates/encoder",
+    "crates/selfplay",
+    "crates/wasm",
+]
 
 [workspace.package]
 version = "0.1.0"

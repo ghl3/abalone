@@ -33,6 +33,12 @@
 //!
 //! **Hex geometry needs no special handling.** In axial coordinates all six
 //! neighbours land inside a plain 3×3 kernel, so `Conv2d` is correct here.
+//!
+//! **Why its own crate.** Both `abalone-selfplay` (which re-exports it as
+//! `abalone_selfplay::encoder`) and `abalone-wasm` need this, and the wasm
+//! target cannot link `ort` or `parquet`. Keeping the encoding in one crate
+//! keeps the trainer and the browser bit-identical by construction rather
+//! than by vigilance.
 
 use abalone_game::bitboard::{BitIter, VALID_MASK};
 use abalone_game::Game;
@@ -60,7 +66,8 @@ pub const PLY_PLANE: usize = 12;
 /// Plane index of the valid-cell mask.
 pub const VALID_MASK_PLANE: usize = 13;
 
-const _: () = assert!(OPP_LOSSES_PLANE == OWN_LOSSES_PLANE + LOSS_THERMOMETER_PLANES);
+const _: () =
+    assert!(OPP_LOSSES_PLANE == OWN_LOSSES_PLANE + LOSS_THERMOMETER_PLANES);
 const _: () = assert!(PLY_PLANE == OPP_LOSSES_PLANE + LOSS_THERMOMETER_PLANES);
 const _: () = assert!(NUM_INPUT_CHANNELS == VALID_MASK_PLANE + 1);
 
@@ -361,7 +368,10 @@ mod tests {
 
         g.max_plies = 0;
         let v = plane_of(&encode(&g), PLY_PLANE)[0];
-        assert!(v.is_finite() && v == 0.0, "degenerate cap must not produce NaN");
+        assert!(
+            v.is_finite() && v == 0.0,
+            "degenerate cap must not produce NaN"
+        );
     }
 
     #[test]
@@ -412,8 +422,13 @@ mod tests {
             let buf = encode(&g);
             let mask = plane_of(&buf, VALID_MASK_PLANE);
             for p in [OWN_MARBLES_PLANE, OPP_MARBLES_PLANE] {
-                for (i, (&m, &v)) in mask.iter().zip(plane_of(&buf, p)).enumerate() {
-                    assert!(m != 0.0 || v == 0.0, "marble on off-board cell {i} of plane {p}");
+                for (i, (&m, &v)) in
+                    mask.iter().zip(plane_of(&buf, p)).enumerate()
+                {
+                    assert!(
+                        m != 0.0 || v == 0.0,
+                        "marble on off-board cell {i} of plane {p}"
+                    );
                 }
             }
         }

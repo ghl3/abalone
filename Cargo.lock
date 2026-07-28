@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "abalone-encoder"
+version = "0.1.0"
+dependencies = [
+ "abalone-game",
+ "rand",
+]
+
+[[package]]
 name = "abalone-game"
 version = "0.1.0"
 dependencies = [
@@ -23,6 +31,7 @@ dependencies = [
 name = "abalone-selfplay"
 version = "0.1.0"
 dependencies = [
+ "abalone-encoder",
  "abalone-game",
  "abalone-mcts",
  "arrow",
@@ -39,6 +48,7 @@ dependencies = [
 name = "abalone-wasm"
 version = "0.1.0"
 dependencies = [
+ "abalone-encoder",
  "abalone-game",
  "abalone-mcts",
  "getrandom 0.2.17",

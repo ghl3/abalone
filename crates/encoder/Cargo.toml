@@ -1,0 +1,22 @@
+[package]
+name = "abalone-encoder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lib]
+name = "abalone_encoder"
+path = "src/lib.rs"
+
+# Rules only. The encoding is consumed by the trainer's evaluator *and* by the
+# browser, and the browser build cannot link `ort` or `parquet` — which is why
+# this lives outside `abalone-selfplay` despite being used almost exclusively
+# from there.
+[dependencies]
+abalone-game = { path = "../game" }
+
+[dev-dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+
+[lints]
+workspace = true

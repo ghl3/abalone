@@ -28,7 +28,11 @@
 //! only those carry a policy target. Every position still carries value, score
 //! and capture-map targets, which is what makes the trade profitable.
 
-pub mod encoder;
+/// Plane encoding, re-exported so `abalone_selfplay::encoder` still resolves.
+/// It lives in its own crate because the browser build needs it too and cannot
+/// link this crate's `ort`/`parquet` dependencies.
+pub use abalone_encoder as encoder;
+
 pub mod ort_eval;
 pub mod shard;
 
