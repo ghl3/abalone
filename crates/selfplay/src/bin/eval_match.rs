@@ -429,9 +429,21 @@ impl Player {
         };
         match &spec.kind {
             PlayerKind::Model(p) => Player::Model {
-                evaluator: Box::new(
-                    OrtEvaluator::from_onnx(p).expect("load onnx model"),
-                ),
+                evaluator: {
+                    let mut e = OrtEvaluator::from_onnx(p).expect("load onnx model");
+                    // Pad every forward to one fixed width. ORT's CoreML
+                    // provider compiles a separate model per input shape, and
+                    // a search's final batch is almost always partial, so
+                    // without this every match thrashes the compiler.
+                    //
+                    // Self-play has always done this; eval-match did not, and
+                    // the cost was not subtle. A 32-game rung at 200 sims ran
+                    // 492,800 evaluations in 2417s — 204 evals/s against
+                    // self-play's ~16,000/s on the same machine, 78x slower,
+                    // and 40 minutes of a 53.7-minute ladder.
+                    e.set_fixed_batch(Some(cfg.batch_size.max(1)));
+                    Box::new(e)
+                },
                 cfg,
             },
             PlayerKind::Heuristic => Player::Heuristic {
