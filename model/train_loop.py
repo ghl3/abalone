@@ -194,11 +194,24 @@ def should_validate(gen: int, *, enabled: bool, holdout_gen: int, every_gens: in
     return (gen - holdout_gen) % every_gens == 0
 
 
-def entropy_ratio_alarm(ratio: float | None, threshold: float) -> bool:
+#: Generations whose near-uniform policy targets are expected rather than a
+#: fault. Generation 1 is played by the randomly-initialised network: its priors
+#: *are* uniform, so PUCT spreads visits nearly evenly and the ratio sits above
+#: any useful threshold by construction. Alarming on it fires on every run that
+#: has ever been started, which is the fastest way to teach a reader that this
+#: warning means nothing.
+ENTROPY_ALARM_FIRST_GEN = 2
+
+
+def entropy_ratio_alarm(ratio: float | None, threshold: float, gen: int) -> bool:
     """True when the MCTS visit distributions are close enough to uniform that
     the policy target carries no information. At 1.0 the data is worthless and
-    every downstream metric is meaningless."""
-    if ratio is None:
+    every downstream metric is meaningless.
+
+    Silent before `ENTROPY_ALARM_FIRST_GEN`, where a high ratio is the expected
+    behaviour of an untrained network rather than evidence of broken search.
+    """
+    if ratio is None or gen < ENTROPY_ALARM_FIRST_GEN:
         return False
     try:
         r = float(ratio)
@@ -1264,7 +1277,7 @@ def _validation_phase(
     # unavailable there is no holdout-based alarm — the equivalent check on
     # full self-play data runs separately and is always available.
     ratio = out.get(f"{VAL_ROLLING_PREFIX}data_policy_entropy_ratio")
-    if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn):
+    if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn, new_gen):
         _warn(
             f"rolling held-out policy target entropy is {_fmt(ratio)} of ln(mean legal "
             f"moves) — search is producing (near) no information, and no downstream "
@@ -2134,7 +2147,7 @@ def _run_outer_loop(
             gen=new_gen,
             total_gens=cfg.gens,
         )
-        if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn):
+        if entropy_ratio_alarm(ratio, cfg.validation.entropy_ratio_warn, new_gen):
             _warn(
                 f"generation {new_gen}'s policy targets are {_fmt(ratio)} of "
                 f"ln(mean legal moves) — MCTS visit distributions are ~uniform, so this "

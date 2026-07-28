@@ -292,30 +292,44 @@ def test_validation_can_be_disabled() -> None:
 # --------------------------------------------------------------------------- #
 
 
+#: A generation at which the alarm is live, for the cases that are about the
+#: ratio rather than about the generation.
+GEN = 5
+
+
 def test_uniform_policy_targets_raise_the_alarm() -> None:
     """`policy_target_entropy == ln(mean legal moves)` means MCTS returned a
     flat visit distribution: the policy target carries zero information, and
     the previous run sat there for three generations without anyone noticing."""
-    assert entropy_ratio_alarm(1.0, 0.95)
+    assert entropy_ratio_alarm(1.0, 0.95, GEN)
 
 
 def test_a_ratio_just_over_the_threshold_raises_the_alarm() -> None:
-    assert entropy_ratio_alarm(0.951, 0.95)
+    assert entropy_ratio_alarm(0.951, 0.95, GEN)
 
 
 def test_a_healthy_ratio_is_silent() -> None:
-    assert not entropy_ratio_alarm(0.62, 0.95)
+    assert not entropy_ratio_alarm(0.62, 0.95, GEN)
 
 
 def test_the_threshold_itself_is_not_an_alarm() -> None:
-    assert not entropy_ratio_alarm(0.95, 0.95)
+    assert not entropy_ratio_alarm(0.95, 0.95, GEN)
 
 
 @pytest.mark.parametrize("value", [None, float("nan"), "n/a"])
 def test_an_unknown_ratio_is_not_an_alarm(value) -> None:
     """No measurement is not the same as a bad measurement; crying wolf on
     `nan` trains people to ignore the warning that matters."""
-    assert not entropy_ratio_alarm(value, 0.95)
+    assert not entropy_ratio_alarm(value, 0.95, GEN)
+
+
+def test_generation_1_is_exempt() -> None:
+    """Generation 1 is played by the randomly-initialised network, whose priors
+    are uniform — so near-uniform visit distributions are the expected result,
+    not evidence of broken search. Run `ruby-panther` fired this every time, and
+    a warning that fires on every run ever started is a warning nobody reads."""
+    assert not entropy_ratio_alarm(1.0, 0.95, 1)
+    assert entropy_ratio_alarm(1.0, 0.95, 2)
 
 
 def test_alarm_matches_the_arithmetic_it_stands_for() -> None:
@@ -324,9 +338,9 @@ def test_alarm_matches_the_arithmetic_it_stands_for() -> None:
     branching = 62
     uniform_entropy = math.log(branching)
     target_entropy = math.log(branching)  # search learned nothing
-    assert entropy_ratio_alarm(target_entropy / uniform_entropy, 0.95)
+    assert entropy_ratio_alarm(target_entropy / uniform_entropy, 0.95, GEN)
     # A distribution concentrated on ~4 moves is healthy.
-    assert not entropy_ratio_alarm(math.log(4) / uniform_entropy, 0.95)
+    assert not entropy_ratio_alarm(math.log(4) / uniform_entropy, 0.95, GEN)
 
 
 # --------------------------------------------------------------------------- #
