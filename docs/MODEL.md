@@ -537,6 +537,42 @@ Every generation:
     total loss minus mean training loss is memorisation of the replay buffer
     and nothing else; that is the one to gate on, and the loop warns when the
     gap exceeds `validation.overfit_warn_delta`.
+
+  **They are reported side by side and must never be collapsed into one
+  number.** They disagree exactly when the curriculum is working. At generation
+  5 of run `ruby-panther`, rolling value accuracy fell 0.667 → 0.554 while
+  frozen accuracy rose 0.644 → 0.649: the controller had cut `handicap_rate`
+  from 0.33 to 0.13, so the newest generation held far fewer near-terminal
+  seeded positions where the winner is obvious. The rolling holdout's *task*
+  got harder; nothing regressed. Read the frozen column for the trend and the
+  rolling column for the alarm.
+- **The generalisation gap, decomposed by head** — because "more games" and
+  "fewer steps" are opposite actions and the total loss cannot tell you which
+  one you need.
+
+  `value` and `score` are labelled **per game**: every position in a game
+  shares one outcome `z` and one final capture differential. Their effective
+  sample size is therefore the number of *games* in the replay buffer —
+  hundreds — not the number of positions, tens of thousands, and each label is
+  seen once per position per epoch, of the order of a hundred times a
+  generation. `policy` and `capture_map` are labelled per position and have no
+  such ceiling.
+
+  Generation 5 of `ruby-panther`, `train → val_rolling`:
+
+  | head | train | rolling | gap | × w | share | labels |
+  |---|---|---|---|---|---|---|
+  | value | 0.5824 | 0.8143 | +0.232 | 1.00 | 118% | per-game |
+  | score | 1.7344 | 1.9781 | +0.244 | 0.15 | 19% | per-game |
+  | policy | 3.7899 | 3.7158 | **−0.074** | 1.00 | −38% | per-position |
+  | capture_map | 0.0768 | 0.0884 | +0.012 | 0.15 | 1% | per-position |
+  | **total** | | | **+0.196** | | | |
+
+  The two per-game heads carry more than the whole gap; the per-position heads
+  generalise at or better than they train. Acting on the total alone would mean
+  cutting the step budget, which starves the policy head to treat a problem it
+  does not have. The lever for a per-game head is `self_play.games_per_gen` and
+  `train.replay_buffer_gens`.
 - **Data health:** decisive rate, mean plies, mean `|d|` at termination,
   `captures_per_100_plies`, and the policy-target entropy gap. If target
   entropy sits at `ln(branching)` — a gap of zero — search is not producing
@@ -561,6 +597,15 @@ Every `anchor_ladder.every_gens` generations:
   - **trailing** — `gen − k`. A *moving* reference that improves as the network
     does, so it never saturates and it is the rung with resolution left at
     generation 45. Excluded from the headline mean precisely because it moves.
+
+    **`k` must be small — 1 or 2.** The trailing rung's entire value is that it
+    is *near*; a distant offset is a fixed reference wearing a moving rung's
+    clothes and belongs in `frozen_gens`. This was not obvious enough to leave
+    as advice: `every_gens: 4` paired with `trailing_gens: [4]` resolves to
+    generation 0 at the first ladder, so the rung is dropped, and reaches back
+    past the previous ladder at every one after — an opponent already shown to
+    be beaten. Two complete runs measured nothing for this reason. The config
+    now rejects it.
 - **Per-rung results are always reported, never only the mean**, and every Elo
   carries its 95% interval. `ladder/clamped_fraction` says how many rungs were
   swept to 0 or 1 and are therefore reporting a sample-size bound rather than a
