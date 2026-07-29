@@ -66,6 +66,16 @@ export interface SearchSnapshot {
   /** The position's expected capture differential, signed for White. */
   rootMarginWhite: number | null;
   topMoves: ScoredMove[];
+  /** Every legal move with its searched Q and visit count, ranked with
+   *  `topMoves` and including it — no notation, no principal variation.
+   *
+   *  `topMoves` is capped at five because generating notation and walking a PV
+   *  for ~50 moves on every 120 ms tick is a stall. The Q values themselves are
+   *  free: the search returns all of them and the cap was only ever about the
+   *  presentation work. Review needs them, because grading a move against the
+   *  best one in the same search requires the move the player actually chose to
+   *  be *in* the data — and a human's move is often not in the top five. */
+  allMoves: { idx: number; evalWhite: number; visits: number }[];
   /** Visits across *all* root children, not just the ones in `topMoves`. */
   totalVisits: number;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import HexBoard, { DIR_SHIFTS, type LastMove, type MovingState } from "./HexBoard";
 import PlayerPlate from "./PlayerPlate";
 import EvalGraph from "./EvalGraph";
@@ -9,6 +9,7 @@ import { useEngine } from "@/lib/engine/useEngine";
 import { SIDE_TINT, formatMargin, percent, tintFor } from "@/lib/outcomeFormat";
 import type { Opening } from "@/lib/engine/protocol";
 import {
+  INACCURACY_POINTS,
   QUALITY_COLOR,
   QUALITY_LABEL,
   reviewMoves,
@@ -35,9 +36,22 @@ interface Props {
 }
 
 /** Review depth. Higher than the engine plays at casually, because a review is
- *  a judgement about moves already made — being slow is fine, being wrong is
- *  not — but still low enough that a 60-move game sweeps in a few seconds. */
-const REVIEW_SIMS = 200;
+ *  a judgement about moves already made: being slow is fine, being wrong is not.
+ *
+ *  Was 200, which measurement did not support. `review-probe` swept 909
+ *  positions across four games at 200/800/3200 simulations
+ *  (docs/NOTEBOOK.md, 2026-07-29). At 200 the most-visited root move held a
+ *  median 12% of the visits and agreed with a 3200-simulation search on 43% of
+ *  positions; it labelled 60% of moves "best" where the deep search allowed
+ *  24%. At 800 that is 19%, 63% and 36%, and the share of real mistakes caught
+ *  rises from 69% to 81% with false positives at 0 of 71. The whole panel
+ *  depends on *which* move is best — the label, the "engine wants" line, the
+ *  hover preview, and the yardstick the cost is measured against — so a
+ *  4× sweep buys the feature its premise.
+ *
+ *  Not free: the sweep is one search per position, so a 60-move game is 4× the
+ *  work it was. The progress bar was already there; this is what it is for. */
+const REVIEW_SIMS = 800;
 const NN_BATCH_SIZE = 16;
 const SIDE_NAME = ["Black", "White"] as const;
 
@@ -131,6 +145,30 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
     () => game.moves.map((m) => wasm.move_notation(m)),
     [game.moves, wasm]
   );
+
+  // Capture differential in every position, signed for White. One replay of the
+  // record, in the same freed-before-return shape as `view` above — this is
+  // ground truth off the game rather than anything the search produced, so it
+  // is complete from the first render and does not wait on the sweep.
+  const captureDiffs = useMemo(() => {
+    const g =
+      game.opening === "belgian"
+        ? wasm.WasmGame.belgian_daisy()
+        : new wasm.WasmGame();
+    try {
+      const diff = () =>
+        g.lost(wasm.WasmSide.Black) - g.lost(wasm.WasmSide.White);
+      const out = [diff()];
+      for (const m of game.moves) {
+        g.apply_index(m);
+        out.push(diff());
+      }
+      return out;
+    } finally {
+      g.free();
+    }
+  }, [wasm, game]);
+
   const reviewed = useMemo(
     () => reviewMoves(game.moves, notations, reads),
     [game.moves, notations, reads]
@@ -177,6 +215,24 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
       isTurn={snapshot.turn === s}
     />
   );
+
+  // Keep the row for the current ply in view while arrowing through the game.
+  // Scrolls the list by its own `scrollTop` rather than calling
+  // `scrollIntoView`, which walks up to every scrollable ancestor and takes the
+  // page along with it. Only moves when the row has actually left the box, so
+  // reading down a visible stretch of moves does not re-centre under you.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const currentRowRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const list = listRef.current;
+    const row = currentRowRef.current;
+    if (!list || !row) return;
+    const lb = list.getBoundingClientRect();
+    const rb = row.getBoundingClientRect();
+    const margin = 4;
+    if (rb.top < lb.top) list.scrollTop -= lb.top - rb.top + margin;
+    else if (rb.bottom > lb.bottom) list.scrollTop += rb.bottom - lb.bottom + margin;
+  }, [ply, reviewed.length]);
 
   const blunders = reviewed.filter((m) => m.quality === "blunder");
   const yourBlunders = blunders.filter(
@@ -307,6 +363,7 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
               onSeek={seek}
               upSide={upSide}
               totalPlies={total}
+              captureDiffs={captureDiffs}
             />
             <div
               style={{
@@ -314,7 +371,11 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
                 justifyContent: "space-between",
                 fontSize: 10,
                 color: "var(--faint)",
-                marginTop: -6,
+                // Was pulled up by 6 to close a gap the svg no longer leaves:
+                // it used to be a fixed-height box letterboxing a 0.6-scale
+                // drawing, and the slack under the curve was padding by
+                // accident. Both bands sit flush now.
+                marginTop: 0,
               }}
             >
               <span>▲ {name(upSide)} ahead</span>
@@ -377,6 +438,7 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
         )}
 
         <div
+          ref={listRef}
           style={{
             display: "flex",
             flexDirection: "column",
@@ -392,6 +454,7 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
             return (
               <div
                 key={m.ply}
+                ref={isCurrent ? currentRowRef : undefined}
                 onClick={() => seek(m.ply + 1)}
                 onMouseEnter={() =>
                   m.quality !== "best" && m.bestIdx >= 0
@@ -437,17 +500,23 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
                     {label}
                   </span>
                 )}
-                {/* Winning chance handed over, in percentage points. Below
-                    half a point there is nothing to report: at review depth
-                    that is noise, and a column of "-0.3" on every move would
-                    bury the two moves that mattered. */}
+                {/* Expected score handed over, in points. Below half a point
+                    there is nothing to report: at review depth that is noise,
+                    and a column of "-0.3" on every move would bury the two
+                    moves that mattered. A move the engine itself picked reads
+                    zero and so prints nothing — the label has already said the
+                    only thing there is to say about it. */}
                 <span
                   style={{
-                    color: m.loss >= 4 ? "var(--illegal)" : "var(--faint)",
+                    color: m.loss >= INACCURACY_POINTS ? "var(--illegal)" : "var(--faint)",
                     minWidth: 40,
                     textAlign: "right",
                   }}
-                  title="Winning chance given up by this move"
+                  title={
+                    m.lossBasis === "swing"
+                      ? "How much worse the position got across this move — measured across two searches, so it carries the engine's own second thoughts as well as yours"
+                      : "Expected score given up against the engine's best move, both read from the same search"
+                  }
                 >
                   {m.loss >= 0.5 ? `-${Math.round(m.loss)}%` : ""}
                 </span>

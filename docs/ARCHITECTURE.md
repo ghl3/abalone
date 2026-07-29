@@ -161,6 +161,7 @@ The bridge between search and training data.
 | `bin/selfplay-batch` | Multi-threaded game generation |
 | `bin/eval-match` | Head-to-head matches, JSON summary |
 | `bin/dump-golden` | Conformance fixtures for the Python side (§5.5) |
+| `bin/review-probe` | Sweeps games at the browser's exact search config, to measure what the review panel measures (§7.6) |
 
 **Threading.** One worker thread per core minus one; each owns its own ORT
 session and its own shard writer. Threads claim games from a shared atomic
@@ -548,29 +549,65 @@ does not pull the record out from under it, and then sweeps the whole game:
 every position it passed through is searched in play order at review depth.
 
 That sweep is the point. During play the engine only ever searched its *own*
-turns, so the interesting half of the record — yours — has never been looked
-at. Afterwards it is cheap: a position costs well under a tenth of a second on
-WebGPU, so a full game is seconds.
+turns, so the interesting half of the record — yours — has never been looked at.
 
-Each move is then graded by **the winning chance the mover gave up**, in
-percentage points, into best / good / inaccuracy / blunder. Points rather than
-eval units for the same reason the analysis panel dropped the eval column:
-"this cost you 6 points of winning chances" is a sentence, and `−0.12` is a
-unit that has to be taught. It is the same measurement — `Δwin ≈ Δeval / 2` at
-a fixed draw share — so the 4-point and 10-point bands are the old 0.08 and 0.2
-restated, not loosened. The bands are deliberately wide and the grades few: the
-underlying estimate is a 3M-parameter network at a few hundred simulations, and
-a scale nobody trusts is worse than a coarse one they do.
+Review depth is **800 simulations**, four times what the panel first shipped
+with. `review-probe` (§7.6) swept 909 positions across four games at 200, 800
+and 3200: at 200 the most-visited root move held a median 12% of the visits and
+agreed with a 3200-simulation search on 43% of positions, while labelling 60% of
+moves "best" where the deep search allowed 24%. Everything on the panel keys off
+*which* move is best — the label, the "engine wants" line, the hover preview,
+the yardstick a cost is measured against — so the depth is the feature's
+premise, not a nicety. At 800 those become 19%, 63% and 36%.
+
+Each move is then graded by **what it cost against the best move available from
+the same position**, in points of expected score, into best / good / inaccuracy
+/ blunder. Two properties earn that definition:
+
+- **Both numbers come off one tree.** The obvious alternative — the root eval
+  before the move against the root eval after it — subtracts two independent
+  searches, and their disagreement is dominated by the search revising itself.
+  Measured that way a move the engine *itself picked* is charged +2.06 ± 0.35
+  points at 200 simulations, +1.49 at 800, +1.07 at 3200: shrinking with depth,
+  never reaching zero, and never the player's doing. The eval a search reports is
+  the Q of its own best child, so in a converged search playing that move
+  preserves the number exactly. Across-move swing survives only as a fallback.
+- **It is zero when you played the engine's move**, by construction, so a row can
+  no longer read `BEST` and a penalty at once.
+
+Expected score (`P(win) + P(draw)/2`) rather than `P(win)`, because draw mass
+climbs over a game — 11% before ply 10, 31% after ply 40 — and every point
+leaving both players' win column would otherwise be charged to whoever moved
+last. It is also exactly the axis the graph plots, `rootEval = 2·score − 1`, so
+`Δscore = Δeval / 2` holds outright and the 4-point and 10-point bands are the
+old 0.08 and 0.2 restated. Validated against the 3200 sweep as ground truth: at
+800 the review flags 0 of 71 moves the deep search calls best and catches 21 of
+26 it charges 4 points or more. The bands are deliberately wide and the grades
+few: the underlying estimate is a 3M-parameter network, and a scale nobody
+trusts is worse than a coarse one they do.
 
 The screen is a board with a ply scrubber (slider, transport buttons, ← →),
-a graph over the game, and the move list. The graph's curve is `rootEval`,
-which is *identically* `P(win) − P(loss)` — so its shape is already a
-probability difference, and only the readout needed changing: the tooltip gives
-the full win/draw/loss triple rather than a signed decimal. It plots on a square
-root scale — real games sit inside ±0.2, which a linear [-1, 1] axis renders as
-a flat line. Hovering a flagged move
-previews what the engine wanted instead, using the same overlay the analysis
-panel uses.
+a graph over the game, and the move list, which follows the scrubber so arrowing
+forward never hides the move being read. Hovering a flagged move previews what
+the engine wanted instead, using the same overlay the analysis panel uses.
+
+The graph's curve is `rootEval`, which is *identically* `P(win) − P(loss)` — so
+its shape is already a probability difference, and only the readout needed
+changing: the tooltip gives the full win/draw/loss triple rather than a signed
+decimal. It plots on a square root scale — real games sit inside ±0.2, which a
+linear [-1, 1] axis renders as a flat line. One consequence to keep in mind
+reading it: a modest change near equality is drawn as a cliff, and a point or two
+of its per-ply jaggedness is the alternating-search bias above rather than
+anything that happened on the board.
+
+Beneath it, on the same x axis and inside the same `<svg>` so one cursor crosses
+both, is the **marble lead** — stepped and linear, deliberately unlike the curve
+above it, because captures are discrete events at a known ply and interpolating
+would draw a marble leaving the board over four moves. It comes off the game
+record rather than the sweep, so it is complete before the analysis finishes and
+owes the network nothing. The engine's *expected* margin stays in the text
+readout: it correlates with the eval curve, and a third view of one thing costs
+clutter for no information.
 
 **One rule the review made explicit:** never hold a wasm handle across renders.
 The position for a ply is created, read, and freed inside a single memo, and
@@ -651,6 +688,12 @@ wall-clock (120 ms) rather than by batch count, and because notation and the PV
 walk are done only for the five rows that will be displayed rather than for all
 ~50 legal moves.
 
+The Q values are a different matter and `allMoves` carries every one of them,
+beside those five rows. The cap was always about presentation work, never about
+the numbers — and review needs the numbers for the move a *player* chose, which
+is frequently not in the top five by visits. Grading it against the best move in
+the same search is impossible without it (§7.2).
+
 ### 7.5 Game format and notation
 
 Games are JSON, emitted by `export_game.py` directly from shards:
@@ -671,6 +714,38 @@ engine form; the engine form remains canonical on the wire.
 **Position permalinks** encode board state, capture counters and ply in the URL,
 so "a particular spot" is shareable — the second half of the tool's stated
 purpose.
+
+### 7.6 Measuring the review — `review-probe`
+
+The review makes claims: this move was best, that one cost you six points. Those
+are checkable, and checking them needs the browser's numbers rather than a
+plausible reconstruction of them.
+
+`crates/selfplay/src/bin/review-probe` plays games and then sweeps every position
+they passed through with the configuration `WasmGame::begin_search` builds —
+`c_puct` 1.4, batch 16, `dirichlet_eps` 0, `track_outcome_stats` on, and the
+worker's own per-ply seed — emitting one JSON line per position with every root
+child's Q and visit count. `--review-sims` repeats, so one game record can be
+swept at several depths and the same verdict compared across them; taking the
+deepest sweep as ground truth is what turns "does this metric work" into a false
+positive rate. `ABALONE_USE_COREML=1` makes a 3200-simulation sweep minutes
+rather than most of an hour.
+
+```text
+review-probe --model web/public/models/best.onnx \
+             --games 4 --review-sims 200 --review-sims 800 --review-sims 3200
+```
+
+It is a measurement tool, not part of any loop: nothing depends on it and it
+writes nothing but its own output. The one thing it needed from the library was
+`OrtEvaluator::evaluate_batch_with_wdl`, which returns the distribution
+`evaluate_batch` was already computing and discarding, so `submit_with_stats` can
+be fed exactly what the browser feeds it.
+
+What it found on first use is in NOTEBOOK.md (2026-07-29) and drives §7.2: the
+across-move measure the panel shipped with charged players ~2 points a move for
+the search's failure to converge, and a review at 200 simulations agreed with a
+3200-simulation search about which move was best on 43% of positions.
 
 ---
 
@@ -706,6 +781,7 @@ train_loop.py  (parent)
 | The resume checkpoint is never garbage-collected | retention skips referenced files |
 | Illegal moves receive zero probability | mask before softmax, both sides |
 | Symmetry augmentation is outcome-preserving | D6 group axiom tests on cell and move permutations |
+| A move's cost is measured inside one search, never across two | `lossVersusBest`; zero when played move is the engine's, by construction (§7.2) |
 
 ---
 
@@ -733,6 +809,8 @@ The training pipeline has been rebuilt against this document.
 | Game export | none | `export_game.py` → reviewable JSON | §7.4 |
 | Web engine | heuristic MCTS in WASM | trained network via `onnxruntime-web` in a worker | §7.4 |
 | WASM search | single-leaf `search()` | pull-based coroutine driven from JS | §2.5 |
+| Move grading | eval before vs eval after, in `P(win)` | played move vs the same search's best, in expected score | §7.2 |
+| Review depth | 200 simulations, unmeasured | 800, chosen against a 3200-simulation ground truth | §7.6 |
 
 ### 10.2 Remaining
 

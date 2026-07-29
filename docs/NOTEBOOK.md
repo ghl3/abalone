@@ -23,6 +23,146 @@ gets its own dated document under `docs/` and the entry links to it.
 
 ---
 
+## 2026-07-29 — the review charged players for the search's own noise
+
+### Goal
+
+Answer a question about the review panel — "how can move 10 be BEST when the
+graph drops that far?" — and fix whatever the answer turned out to be. Ended up
+measuring the panel rather than reading it, which is the only reason the entry
+below is right; see **Two explanations I got wrong** at the end.
+
+### What the question exposed
+
+The screenshot that prompted it is the evidence. Fifteen consecutive rows, both
+sides, every one of them negative: −2, −2, −3, −1, −2, −3, −2, −3, −6, −7, −2,
+−6, −3, −5. Eight of those rows were also labelled `BEST`. Fifteen independent
+coin flips do not land the same way, so the column had a systematic component,
+not noise.
+
+The defect is in what `reviewMoves` measured. It took the root eval before the
+move and the root eval after it — two independent 200-simulation searches of two
+different positions — and charged the difference to the player. But the eval a
+search reports *is* the Q of its own best child: it is already an estimate of
+the position after its best move. In a converged search, playing that move
+preserves the number exactly, and a lost position reads lost from the start
+rather than deteriorating as the forced sequence is played. So on a best move
+that difference has no legitimate content at all. Every point of it is the
+search failing to converge.
+
+`classify` also short-circuits on `played === bestIdx` before it looks at the
+cost, which is why a row could say `BEST` and −7% at once.
+
+### What the measurement says
+
+`crates/selfplay/src/bin/review_probe.rs`, added for this. It plays games and
+sweeps every position with the browser's exact configuration — same `c_puct`
+1.4, batch 16, per-ply seed, `track_outcome_stats` on — and dumps every root
+child's Q. Four games, 909 swept positions, three simulation counts.
+
+Cost charged to a move the search itself picked (points of expected score, mover
+POV, positions with `|eval| <= 0.8`):
+
+| sims | phantom cost on a best move | best move's visit share (median) | agrees with 3200 | labelled "best" |
+|------|-----------------------------|----------------------------------|------------------|-----------------|
+| 200  | +2.06 ± 0.35 (n=159)        | 12.0%                            | 43%              | 60%             |
+| 800  | +1.49 ± 0.31 (n=93)         | 18.8%                            | 63%              | 36%             |
+| 3200 | +1.07 ± 0.20 (n=59)         | 25.4%                            | —                | 24%             |
+
+It shrinks with depth and does not reach zero by 3200, which is the signature of
+an unconverged estimate rather than anything about the moves. **The across-move
+swing is therefore not a usable measure of a move's cost at any depth we can
+afford.**
+
+The within-search measure reads exactly +0.00 on all 159 best moves, by
+construction, and separates: median +1.45 to +2.08 on non-best moves. Validated
+against the 3200 sweep as ground truth, at 200 sims it flags 1 of 71 deep-best
+moves (1% false positive) and catches 18 of 26 moves the deep search charges ≥4
+points (69%); at 800, 0 of 71 and 21 of 26 (81%). Flag rate 7–8% inaccuracy,
+1–3% blunder, stable across depth — the 4/10-point bands did not need retuning.
+
+### Two explanations I got wrong
+
+Recorded because both were stated confidently before anything was measured, and
+the second one shipped in the first draft of this entry.
+
+- **"A best move can still lose ground, because in a bad position everything
+  does."** False, and it took being challenged to see why. That reasoning holds
+  for a static evaluation of the board in front of it. This eval already looked
+  ahead, so the badness is priced in at the start and does not accrue.
+- **"The cost was measured in `P(win)`, and accumulating draw mass is the real
+  bug."** The draw part is real — draw mass does climb, 11.0% before ply 10 to
+  31.1% after ply 40 — but it accounts for only +0.31 ± 0.30 of the ~2 points.
+  About 15%, not the cause. Expected score is still the right unit, and
+  `winChanceFor` really did contradict its own fallback path (`(q + 1) / 2` is
+  drift-free, `P(win)` is not), so the change stands. The diagnosis behind it
+  was wrong.
+
+### What changed
+
+- `winChanceFor` → `scoreFor`, one branch, expected score. `Δscore = Δeval / 2`
+  now holds exactly rather than "at a fixed draw share", so the 4/10-point
+  inaccuracy and blunder bands are the old ones restated.
+- Cost is measured **inside one search**: the played move's Q against the best
+  move's Q, both off the same tree. Exactly zero when the move played was the
+  engine's pick, so the contradiction is structural rather than suppressed. The
+  across-move swing survives only as a fallback, tagged `lossBasis: "swing"` and
+  hovering as a different sentence.
+- `SearchSnapshot.allMoves` — every legal move's searched Q and visit count,
+  beside the five display rows. `topMoves` is capped at five because notation and
+  a PV walk for ~50 moves on a 120 ms tick is a stall; the Q values were always
+  free, and a human's move is frequently outside the top five by visits, which is
+  exactly the case the review exists for. Without this the fallback fired on the
+  moves that matter most.
+- **`REVIEW_SIMS` 200 → 800.** The table above is the argument: at 200 the panel
+  labels 60% of moves "best" where a 16×-deeper search allows 24%, and it picks
+  the same move only 43% of the time. Everything on the panel keys off *which*
+  move is best — the label, the "engine wants" line, the hover preview, the
+  yardstick the cost is measured against. Considered a two-phase sweep (cheap
+  everywhere, deep on flagged plies and on the position being read) and did not
+  take it: one phase at 800 is simpler and the numbers carry it.
+- A move is now gradeable from the read of the position it was played *from*,
+  so the final move of a game gets a grade instead of a silent "good".
+- **Marble-lead band** under the eval curve, in the same `<svg>` on the same x
+  scale so one cursor crosses both. Stepped and linear, deliberately unlike the
+  curve above it: captures are discrete events at a known ply. Off the game
+  record, not the sweep, so it is complete before the sweep finishes. The
+  engine's *expected* margin stays in the text readout — it correlates with the
+  eval curve, so plotting it would have cost clutter for a third view of one
+  thing.
+- The graph was pinning `height={H}` against a 100%-width viewBox, which
+  letterboxes a 0.6-scale drawing inside a taller box; ~19px of the 96 were dead
+  space top and bottom. `height: auto` now, and the caption's compensating
+  `marginTop: -6` came out with it.
+- Move list follows the cursor. Container-local `scrollTop` rather than
+  `scrollIntoView`, which walks every scrollable ancestor and takes the page
+  with it, and only when the row has actually left the box.
+
+### Next steps
+
+- **Measure the browser sweep at 800.** The 4× cost is the one number in the
+  `REVIEW_SIMS` decision that is not measured: 200-sim timings come from the
+  code's own claim of "well under a tenth of a second" per position on WebGPU,
+  not from this session. If a 60-move game no longer sweeps in a tolerable time,
+  the two-phase design in the entry above is the fallback, not a lower depth.
+- **The graph carries the same bias.** It is a sequence of root evals at
+  alternating plies, each optimistic for whoever was to move, so a point or two
+  of its per-ply jaggedness is measurement and not play. Depth shrinks it and
+  cannot remove it. Worth deciding whether the curve should be smoothed or
+  labelled rather than left to read as signal.
+- **`BEST` overclaims even at 800** (36% of moves against the deep search's
+  24%), and it rests on a visit plurality of 19%. Wording, or a margin
+  requirement, rather than more depth.
+
+### Not verified
+
+Typechecks clean; `abalone-selfplay`, `abalone-mcts` and `abalone-game` tests
+pass. Not driven in a browser this session, so the marble band's geometry is
+arithmetic rather than observation and the 800-sim sweep has never been timed
+under WebGPU. Everything about the *metric* above is measured, on 909 positions.
+
+---
+
 ## 2026-07-29 — the analysis view, reviewed and rebuilt
 
 ### Goal

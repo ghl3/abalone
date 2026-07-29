@@ -174,6 +174,11 @@ function readSnapshot(
     rootWdlWhite: triple(rootWdlRaw, 0),
     rootMarginWhite: rootMargin,
     topMoves,
+    allMoves: all.map((m) => ({
+      idx: m.idx,
+      evalWhite: m.evalWhite,
+      visits: m.visits,
+    })),
     totalVisits: visits.reduce((s, v) => s + v, 0),
   };
 }
@@ -251,6 +256,7 @@ async function runSearch(req: SearchRequest) {
         rootWdlWhite: null,
         rootMarginWhite: null,
         topMoves: [],
+        allMoves: [],
         totalVisits: 0,
       },
       elapsedMs: performance.now() - started,

@@ -23,21 +23,78 @@ export interface PlyRead {
   expectedScoreWhite: number | null;
   bestIdx: number;
   topMoves: ScoredMove[];
+  /** Searched Q of *every* legal move, White's POV. What makes grading a move
+   *  against its alternatives possible for any move, rather than only for the
+   *  five the panel happens to display. */
+  allMoves: { idx: number; evalWhite: number; visits: number }[];
 }
 
-/** The mover's chance of winning, from a read. `wdlWhite` is White's, so Black
- *  reads it from the other end. Falls back to splitting the eval when a read
- *  predates the searched distributions. */
-export function winChanceFor(side: 0 | 1, read: PlyRead): number {
-  if (read.wdlWhite) return side === 1 ? read.wdlWhite[0] : read.wdlWhite[2];
+/** The mover's expected score: `P(win) + P(draw)/2`, on 0…1.
+ *
+ *  This, and not `P(win)`, is what a move's cost has to be measured in. Draw
+ *  mass accumulates as a game runs on, and every point that leaves *both*
+ *  players' win column for the draw column reads as a loss for whoever just
+ *  moved — and reads as one again for their opponent next ply. Measured in
+ *  `P(win)` alone, every move in a quiet game looks like a small mistake, with
+ *  no move responsible for any of it. Expected score is neutral to that shift.
+ *
+ *  It is also exactly what the eval graph plots, since `rootEval` is
+ *  `P(win) − P(loss)` and so `score = (rootEval + 1) / 2` — the curve and the
+ *  cost column now describe one axis instead of two. `rootWdlWhite` agrees with
+ *  `rootEval` by construction (`[0] − [2] === rootEval`, protocol.ts), so there
+ *  is no second path to keep in step. */
+export function scoreFor(side: 0 | 1, read: PlyRead): number {
   const q = side === 1 ? read.rootEval : -read.rootEval;
   return (q + 1) / 2;
+}
+
+/** Same, for one root move's searched Q. */
+function scoreOf(side: 0 | 1, evalWhite: number): number {
+  return ((side === 1 ? evalWhite : -evalWhite) + 1) / 2;
+}
+
+/** What the move cost against the best move available *from the same
+ *  position*, both numbers read off the same tree.
+ *
+ *  Preferred over comparing the reads either side of the move, because that
+ *  subtracts two independent searches: their disagreement includes every point
+ *  the deeper look revised, which is the engine changing its mind rather than
+ *  the player doing anything. Within one search the comparison is like for
+ *  like, and — the part that shows — it is exactly zero when the move played
+ *  *was* the engine's pick, so "best" and a cost can no longer contradict each
+ *  other on the same row.
+ *
+ *  Reads `allMoves`, which covers every legal move, and falls back to the five
+ *  display rows only for a read taken before that field existed. Null after
+ *  that, which is the one case still needing the across-move measure. */
+function lossVersusBest(
+  side: 0 | 1,
+  read: PlyRead,
+  played: number
+): number | null {
+  if (read.bestIdx < 0) return null;
+  if (played === read.bestIdx) return 0;
+  const rows = read.allMoves.length > 0 ? read.allMoves : read.topMoves;
+  const playedRow = rows.find((m) => m.idx === played);
+  const bestRow = rows.find((m) => m.idx === read.bestIdx);
+  if (!playedRow || !bestRow) return null;
+  return Math.max(
+    0,
+    (scoreOf(side, bestRow.evalWhite) - scoreOf(side, playedRow.evalWhite)) * 100
+  );
 }
 
 /** Severity of a played move. Deliberately three grades, not five: at review
  *  depth the eval is not precise enough to defend finer distinctions, and a
  *  scale nobody trusts is worse than a coarse one they do. */
 export type MoveQuality = "best" | "good" | "inaccuracy" | "blunder";
+
+/** Where a move's `loss` came from. `alternatives` is the honest one — the
+ *  played move against the best move in the same search. `swing` is the
+ *  fallback for a move the search never ranked, and carries the engine's own
+ *  revision along with the player's mistake; the UI says so on hover rather
+ *  than presenting the two as interchangeable. */
+export type LossBasis = "alternatives" | "swing" | "unknown";
 
 export interface ReviewedMove {
   /** Position index the move was played from. */
@@ -48,28 +105,32 @@ export interface ReviewedMove {
   side: 0 | 1;
   evalBefore: number;
   evalAfter: number | null;
-  /** Percentage points of winning chance the mover gave up. Positive is worse.
+  /** Points of expected score the mover gave up. Positive is worse, and zero
+   *  whenever the move played was the engine's own choice.
    *
-   *  Points rather than eval units because "this cost you 6 points of winning
-   *  chances" is a sentence, and "−0.12" is a unit you have to be taught. The
-   *  two are the same measurement — `Δwin ≈ Δeval / 2` at a fixed draw share —
-   *  so the bands below are the old ones restated, not loosened. */
+   *  Points rather than eval units because "this cost you 6 points" is a
+   *  sentence and "−0.12" is a unit you have to be taught. The two are one
+   *  measurement: `Δscore = Δeval / 2` exactly, no assumption about the draw
+   *  share required, so the bands below are the old ones restated. */
   loss: number;
+  lossBasis: LossBasis;
   quality: MoveQuality;
   bestIdx: number;
   bestNotation: string | null;
 }
 
-/** Winning chance given up, in percentage points. The bands are wide because
- *  the underlying estimate is a 3M-parameter network at a few hundred
- *  simulations, not a tablebase. */
-const INACCURACY = 4;
-const BLUNDER = 10;
+/** Expected score given up, in points. The bands are wide because the
+ *  underlying estimate is a 3M-parameter network at a few hundred simulations,
+ *  not a tablebase. */
+/** Exported because the move list colours the number at the same threshold it
+ *  is labelled at; two copies of "4" would drift apart. */
+export const INACCURACY_POINTS = 4;
+const BLUNDER_POINTS = 10;
 
 export function classify(loss: number, played: number, best: number): MoveQuality {
   if (played === best) return "best";
-  if (loss < INACCURACY) return "good";
-  if (loss < BLUNDER) return "inaccuracy";
+  if (loss < INACCURACY_POINTS) return "good";
+  if (loss < BLUNDER_POINTS) return "inaccuracy";
   return "blunder";
 }
 
@@ -138,6 +199,7 @@ export async function sweepGame(opts: SweepOptions): Promise<PlyRead[]> {
       expectedScoreWhite: res.snapshot.rootMarginWhite,
       bestIdx: res.snapshot.bestIdx,
       topMoves: res.snapshot.topMoves,
+      allMoves: res.snapshot.allMoves,
     });
     opts.onProgress?.(ply + 1, total);
     if (res.snapshot.bestIdx < 0) break; // terminal
@@ -145,9 +207,10 @@ export async function sweepGame(opts: SweepOptions): Promise<PlyRead[]> {
   return reads;
 }
 
-/** Join the move record to the sweep. A move is judged by what the eval did
- *  across it, which needs the read on *both* sides — so the last move can only
- *  be graded once the final position has been searched. */
+/** Join the move record to the sweep. A move is judged against the
+ *  alternatives the search saw beside it, so a move is gradeable as soon as the
+ *  position it was played from has been read — the final move included. Only
+ *  the fallback needs the read on the far side. */
 export function reviewMoves(
   moves: number[],
   notations: string[],
@@ -159,14 +222,22 @@ export function reviewMoves(
     if (!before) break;
     const after = reads[i + 1] ?? null;
     const side: 0 | 1 = i % 2 === 0 ? 0 : 1;
-    // Both reads are taken from the mover's side, so "loss" always means the
-    // player to move made things worse for themselves — and it survives the
-    // change of turn, because `wdlWhite` names its sides rather than relying
-    // on whose move it is.
-    const loss =
+
+    const versusBest = lossVersusBest(side, before, moves[i]);
+    // Both scores are taken from the mover's side, so a positive swing always
+    // means the player to move made things worse for themselves — and it
+    // survives the change of turn, because the eval names its sides rather
+    // than relying on whose move it is. Clamped: a position that improved is
+    // not a move that cost something.
+    const swing =
       after === null
-        ? 0
-        : (winChanceFor(side, before) - winChanceFor(side, after)) * 100;
+        ? null
+        : Math.max(0, (scoreFor(side, before) - scoreFor(side, after)) * 100);
+
+    const loss = versusBest ?? swing ?? 0;
+    const lossBasis: LossBasis =
+      versusBest !== null ? "alternatives" : swing !== null ? "swing" : "unknown";
+
     const bestIdx = before.bestIdx;
     out.push({
       ply: i,
@@ -176,8 +247,8 @@ export function reviewMoves(
       evalBefore: before.rootEval,
       evalAfter: after?.rootEval ?? null,
       loss,
-      quality:
-        after === null ? "good" : classify(loss, moves[i], bestIdx),
+      lossBasis,
+      quality: classify(loss, moves[i], bestIdx),
       bestIdx,
       bestNotation: null,
     });

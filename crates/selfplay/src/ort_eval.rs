@@ -69,6 +69,7 @@ const POLICY_WIDTH: usize = abalone_game::MOVE_SPACE;
 
 /// Class order of the 3-way value head, matching `model/batch.py`.
 const VALUE_WIN: usize = 0;
+const VALUE_DRAW: usize = 1;
 const VALUE_LOSS: usize = 2;
 /// Width of the 3-way value head.
 const VALUE_CLASSES: usize = 3;
@@ -176,8 +177,25 @@ impl OrtEvaluator {
     /// priors are the softmax over that position's *legal* moves only, parallel
     /// to `game.legal_moves()` — the ordering `abalone_mcts` expects.
     pub fn evaluate_batch(&mut self, games: &[Game]) -> Result<Vec<LeafEval>, OrtEvalError> {
+        self.evaluate_batch_with_wdl(games).map(|(evals, _)| evals)
+    }
+
+    /// `evaluate_batch`, also handing back the `(win, draw, loss)` the scalar
+    /// was collapsed from — each in its own position's point of view, parallel
+    /// to the evals.
+    ///
+    /// Exists for [`abalone_mcts::Search::submit_with_stats`], which needs the
+    /// distribution to report probabilities that came out of the tree rather
+    /// than off a single forward pass. Not a second collapse: the softmax is
+    /// the same one `evaluate_batch` already ran, returned instead of
+    /// discarded, so the two cannot disagree. A width-1 value head has no
+    /// distribution to report and gets the degenerate split with no draw mass.
+    pub fn evaluate_batch_with_wdl(
+        &mut self,
+        games: &[Game],
+    ) -> Result<(Vec<LeafEval>, Vec<[f32; 3]>), OrtEvalError> {
         if games.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let n = games.len();
         // Rows `n..width` stay zeroed; their outputs are discarded.
@@ -232,8 +250,14 @@ impl OrtEvaluator {
         let value_dim = value.len() / width;
 
         let mut evals = Vec::with_capacity(n);
+        let mut wdls = Vec::with_capacity(n);
         for (i, g) in games.iter().enumerate() {
-            let v = collapse_value(&value[i * value_dim..(i + 1) * value_dim])?;
+            // Both from the same row, and `collapse_value` is defined in terms
+            // of the distribution, so a second 3-element softmax is the whole
+            // cost of keeping them consistent by construction.
+            let row_value = &value[i * value_dim..(i + 1) * value_dim];
+            let v = collapse_value(row_value)?;
+            wdls.push(value_distribution(row_value)?);
             let row = &policy[i * POLICY_WIDTH..(i + 1) * POLICY_WIDTH];
             let legal_moves = g.legal_moves();
             let mut legal_logits: Vec<f32> = Vec::with_capacity(legal_moves.len());
@@ -248,7 +272,28 @@ impl OrtEvaluator {
 
         // Reclaim the staging buffer for the next call.
         self.planes = input.into_raw_vec_and_offset().0;
-        Ok(evals)
+        Ok((evals, wdls))
+    }
+}
+
+/// One row of the value head as `(win, draw, loss)` probabilities.
+///
+/// A width-1 head carries no distribution, so it is split across win and loss
+/// with nothing in the draw class — the same shape of answer, and the only one
+/// the scalar supports.
+fn value_distribution(row: &[f32]) -> Result<[f32; 3], OrtEvalError> {
+    match row.len() {
+        VALUE_CLASSES => {
+            let p = softmax_in_place(row.to_vec());
+            Ok([p[VALUE_WIN], p[VALUE_DRAW], p[VALUE_LOSS]])
+        }
+        1 => {
+            let v = row[0].clamp(-1.0, 1.0);
+            Ok([(v + 1.0) / 2.0, 0.0, (1.0 - v) / 2.0])
+        }
+        other => Err(OrtEvalError::Shape(format!(
+            "value head has width {other}, expected 3 (win, draw, loss) or 1 (scalar)"
+        ))),
     }
 }
 
@@ -257,16 +302,15 @@ impl OrtEvaluator {
 /// 3-way head: `softmax` then `P(win) - P(loss)`; the draw class contributes
 /// nothing, which is exactly right. A width-1 head is passed straight through.
 fn collapse_value(row: &[f32]) -> Result<f32, OrtEvalError> {
-    match row.len() {
-        VALUE_CLASSES => {
-            let p = softmax_in_place(row.to_vec());
-            Ok(p[VALUE_WIN] - p[VALUE_LOSS])
-        }
-        1 => Ok(row[0]),
-        other => Err(OrtEvalError::Shape(format!(
-            "value head has width {other}, expected 3 (win, draw, loss) or 1 (scalar)"
-        ))),
+    // A width-1 head is returned bit-for-bit rather than routed through
+    // `value_distribution`: splitting and re-subtracting is algebraically the
+    // identity but not numerically one, and "passed through untouched" is the
+    // contract the scalar export relies on.
+    if row.len() == 1 {
+        return Ok(row[0]);
     }
+    let p = value_distribution(row)?;
+    Ok(p[VALUE_WIN] - p[VALUE_LOSS])
 }
 
 fn softmax_in_place(mut logits: Vec<f32>) -> Vec<f32> {
