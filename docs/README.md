@@ -27,6 +27,7 @@ These are living documents and are edited in place.
 | --- | --- |
 | [MODEL.md](MODEL.md) | Target design for the network and its training. Heuristic-free: score-based termination, capture-handicap curriculum, deep batched MCTS, convolutional policy head, auxiliary heads. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Target system architecture across Rust, Python and the web UI. Component responsibilities, the generation cycle, cross-language contracts, storage layout, invariants. |
+| [NOTEBOOK.md](NOTEBOOK.md) | Running log of work sessions, newest first. Goal, what ran, results, next steps. The informal record; a result worth an argument gets its own dated document instead. |
 
 ### Dated records
 
