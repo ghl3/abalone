@@ -1,11 +1,17 @@
 # Standard run — the real one. 50 generations.
 #
-# Budget, measured on run `ruby-panther` rather than estimated: 400 games ×
-# ~107 plies × playout-cap-randomised 200/800 sims is ~15M network evaluations
-# per generation, and self-play sustains ~22 positions/s on an M1 Pro through
-# CoreML. That is **~45 minutes of self-play per generation**, so this run is
-# roughly 40 hours end to end. `use_coreml: true` is not optional: the CPU path
-# is over an order of magnitude slower.
+# Budget, measured on run `ruby-panther` rather than estimated. Self-play holds
+# **22.2 positions/s** on an M1 Pro through CoreML — steady to three
+# significant figures across generations 20–23, each position costing
+# playout-cap-randomised 200/800 sims. At 400 games and the ~150 plies the
+# higher ply cap below allows, that is ~60k positions, so **~46 min of
+# self-play per generation**. The anchor ladder adds ~26 min (see its own
+# note), training overlaps self-play and is free. Call it **~72 min a
+# generation, ~60 hours end to end** — up from ~40 h, because both the ply cap
+# and the ladder were deliberately made more expensive.
+#
+# `use_coreml: true` is not optional: the CPU path is over an order of
+# magnitude slower.
 #
 # Before starting one, check `runs/` is excluded from Spotlight. Indexing the
 # shard tree cost about 1.6 cores continuously on the previous run and grew as
@@ -74,27 +80,49 @@ self_play:
     # 351-368 unseeded games per generation once the rate reached its floor.
     min_unseeded_games: 20
     schedule: {}
-  random_opening_plies: 2
-  max_plies: 200
+  # 5, not 2. Every game starts from the same Belgian Daisy, so these plies are
+  # the only source of positional diversity outside the handicap trickle — and
+  # the value head's effective sample size is the *game* count, not the position
+  # count. `ruby-panther` began memorising per-game labels at generation 22 with
+  # 3,200 distinct games in its buffer (docs/NOTEBOOK.md, 2026-07-29). Wider
+  # openings buy distinct games at zero compute cost, which makes this the only
+  # free item on that list.
+  random_opening_plies: 5
+  # 300, not 200. At the cap `Game::adjudicate` decides on the *sign* of the
+  # marble differential, so a one-marble edge at ply 200 becomes a full ±1 value
+  # label. That was 17% of `ruby-panther`'s generation-24 games and the fraction
+  # grew every generation as defence improved: natural termination fell
+  # 0.94 → 0.83 while games lengthened 112 → 130 plies. A higher cap converts
+  # part of that into real six-capture wins. It costs only the tail of the
+  # distribution, and nothing downstream needs to know — plane 12 is
+  # `ply / max_plies` read from the game's own cap, not a constant.
+  max_plies: 300
   no_progress_plies: 0
   capture_gamma: 0.98
 
 train:
   # The arithmetic:
   #
-  #   400 games x ~100 plies   = ~40k positions per generation
-  #   replay_buffer_gens: 20   => the window tops out near 800k positions
-  #   1.5 epochs over  40k     = 1.5 *  40000 / 256 =  234 steps
-  #   1.5 epochs over 800k     = 1.5 * 800000 / 256 = 4688 steps
+  #   400 games x ~150 plies   = ~60k positions per generation
+  #   replay_buffer_gens: 20   => the window tops out near 1.2M positions
+  #   1.5 epochs over  60k     = 1.5 *   60000 / 256 =  352 steps
+  #   1.5 epochs over 1.2M     = 1.5 * 1200000 / 256 = 7031 steps
   #
-  # so steps_per_gen_min binds while the window fills (500 steps over a 40k
-  # buffer is 3.2 epochs) and the epoch target takes over from about
-  # generation 3, arriving just under steps_per_gen_max once the window is
-  # full. Each position is therefore seen ~1.5 times per generation for the 20
-  # generations it lives in the buffer — ~30 times in total, against the
+  # so steps_per_gen_min binds while the window fills (500 steps over a 60k
+  # buffer is 2.1 epochs) and the epoch target takes over from about
+  # generation 2. Each position is therefore seen ~1.5 times per generation for
+  # the 20 generations it lives in the buffer — ~30 times in total, against the
   # ~120 the old fixed cap implied.
+  #
+  # The ply figure is measured, not assumed: `ruby-panther` reached 130 plies by
+  # generation 24 under a 200 cap, and `max_plies: 300` above lets the tail run
+  # further. The old comment here said 100 plies and sized the cap from it,
+  # which is why `steps_per_gen_max` moves with it — at 5000 the *cap* would
+  # bind at 1.07 epochs instead of the epoch target, silently retuning the
+  # training regime. It is outside `config_hash`, so it can be retuned mid-run
+  # if the measured ply count lands somewhere else.
   steps_per_gen_min: 500
-  steps_per_gen_max: 5000
+  steps_per_gen_max: 8000
   target_epochs_per_gen: 1.5
   epochs_per_gen_warn: 8.0
   batch_size: 256
@@ -159,7 +187,20 @@ anchor_ladder:
   # generation instead of every fifth.
   every_gens: 1
   run_on_final_gen: true
-  games: 32
+  # 64, not 32. A 32-game rung resolves about ±120 Elo, and by generation 24
+  # `ruby-panther` was gaining ~35 Elo a generation — so the near rungs spent
+  # ten consecutive ladders reporting noise, including a −100 against `gen − 4`
+  # from a network that was in fact improving. 64 games narrows the interval by
+  # ~√2; the honest fix for the nearest rungs is to stop playing them, which is
+  # what `trailing_gens` below now does.
+  #
+  # Cost, measured on `ruby-panther`'s generation-24 ladder: a 32-game rung at
+  # ~135 mean plies took 2.6–2.9 min. This panel is 4 × 64 + 2 × 12 = 280 games,
+  # ~26 min with the higher ply cap, against ~60 min of self-play. That is ~30%
+  # overhead where the old panel was ~12% — bought deliberately. A measurement
+  # that cannot resolve the effect it is measuring is not cheap, it is free and
+  # worthless.
+  games: 64
   floor_games: 12
   simulations: 200
   # Floor anchors: losing to these is a bug, beating them is not a result.
@@ -183,8 +224,9 @@ anchor_ladder:
   # direct read on "is more training helping" than any rating number, and it
   # needs no cross-generation state at all.
   #
-  # The spread is picked from measured resolution, not taste. Run
-  # `ruby-panther` at ~85 Elo/generation, 32 games per rung
+  # The spread is picked from measured resolution, not taste, and it has now
+  # been re-picked once. At ~85 Elo/generation over `ruby-panther`'s first
+  # twelve generations, 32 games per rung
   # (docs/2026-07-28-first-strength-measurement.md):
   #
   #   1 generation back   +55  [-63, +188]   does NOT resolve — CI spans zero
@@ -193,20 +235,36 @@ anchor_ladder:
   #   6 generations back  +470 [+306, +720]  resolves, pressing the ceiling
   #   8+ generations back                    swept 32-0-0, reports a bound
   #
-  # All four offsets are kept rather than tuned to today's band, because the
-  # useful one *moves*: at ~85 Elo/gen it is 2 and 4, but as per-generation
-  # gains shrink later in a long run, 8 becomes the informative rung and 1 the
-  # useless one. A clamped rung costs ~80 s, which is a cheap premium for never
-  # being out of band. `retention.keep_last_onnx` must cover the deepest
-  # offset; `RunConfig.validate` enforces that.
-  trailing_gens: [1, 2, 4, 8]
+  # That comment predicted the useful rung would *move* as per-generation gains
+  # shrank, and generations 13–24 confirmed it (docs/NOTEBOOK.md, 2026-07-29).
+  # At ~35–55 Elo/generation the same panel measured:
+  #
+  #   1 generation back   ten readings spanning -66 to +124, every CI spanning
+  #                       zero — a rung that produced nothing for ten ladders
+  #   2 generations back  -77 to +137, resolves about a third of the time
+  #   4 generations back  +215 mean, sd 105 — the workhorse
+  #   8 generations back  +525 → +279 mean as gains shrank; still the widest
+  #                       resolving rung, and the first to escape the bound
+  #
+  # So `1` is dropped: it is not a cheap insurance rung, it is 64 games spent to
+  # learn nothing, and it will only get worse as the run goes on. `16` replaces
+  # it at the far end, for the same reason `8` was worth keeping when it was
+  # still reporting a bound — it is the rung that will still resolve at
+  # generation 50 when `2` has gone quiet. `retention.keep_last_onnx` must cover
+  # the deepest offset; `RunConfig.validate` enforces that.
+  trailing_gens: [2, 4, 8, 16]
   batch_size: 32
   c_puct: 1.4
   opening: belgian
-  random_opening_plies: 2
+  # Match self-play. More opening spread also decorrelates the games *within* a
+  # rung, which is exactly what a 64-game match needs to earn its extra games.
+  random_opening_plies: 5
   temperature_plies: 10
   temperature: 1.0
-  max_plies: 200
+  # Match self-play, so a rung measures the game the network is trained on. A
+  # ladder capped at 200 while self-play runs to 300 would adjudicate a class of
+  # positions the training distribution resolves properly.
+  max_plies: 300
   no_progress_plies: 0
   threads: null
 

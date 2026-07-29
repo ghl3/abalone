@@ -189,3 +189,45 @@ ladder pairings ran 140–157 plies against 47–65 for the floor anchors. Rough
    engine has never been measured against anything but itself, `random` and
    `heuristic@100`. "Improving against its own history" is not "playing Abalone
    well".
+
+### Addendum, same day — next steps 3 and 4 applied to the configs
+
+`medium.yaml` and `standard.yaml` only; `dry_run.yaml` and `validation.yaml` are
+instruments for checking the loop runs at all and were left alone.
+
+| knob | was | now | why |
+|---|---|---|---|
+| `anchor_ladder.games` | 32 | 64 | a 32-game rung resolves ±120 Elo; the run was gaining ~35/gen |
+| `anchor_ladder.trailing_gens` | `[1,2,4,8]` | `[2,4,8,16]` (`[2,4,8]` in medium) | the `1` rung returned ten readings from −66 to +124, every interval spanning zero. `16` is the rung that will still resolve at generation 50. Medium stops at 8 — a 12-generation run never reaches a `gen − 16`. |
+| `self_play.random_opening_plies` | 2 | 5 | distinct *games* are what the per-game heads learn from, and this buys them free |
+| `self_play.max_plies` | 200 | 300 | fewer value labels decided by the sign of a one-marble margin |
+| `train.steps_per_gen_max` (standard) | 5000 | 8000 | consequence of the above: ~150-ply games over a 20-generation window put 1.5 epochs at ~7000 steps, so the cap would have silently bound at 1.07 epochs and retuned the training regime |
+
+Ladder and self-play `max_plies` / `random_opening_plies` were moved together —
+a rung capped at 200 while self-play runs to 300 would adjudicate a class of
+position the training distribution resolves properly.
+
+**Cost, stated plainly.** Self-play holds 22.2 pos/s (steady to three figures
+over generations 20–23), so 400 games × ~150 plies is ~46 min, and the wider
+ladder is ~26 min against ~12 before. `standard.yaml` goes from ~40 h to ~60 h
+for its 50 generations. The ladder overhead roughly triples in absolute terms,
+from ~12% of a generation to ~30%. That was bought deliberately: a measurement
+that cannot resolve the effect it is measuring is not cheap, it is worthless.
+
+**Verified**: all four configs validate, `pytest tests/ -q` is 626 passed, and
+an 8-game `selfplay-batch` at the new parameters runs clean. The binary prints
+`note: ply cap 300 differs from the default 200; the ply input plane is
+normalised by it` — the plumbing for a non-default cap already existed.
+
+**One caution the smoke test surfaced.** At 32/64 simulations, 3 of 8 games ran
+to 295 plies. Play that weak is not representative, but it is a reminder that
+raising the cap *moves* adjudication rather than removing it. Whether the 17%
+of generation-24 games that capped at 200 now finish naturally, or simply run to
+300, is a measurement for the next run — `selfplay/natural_termination_rate` is
+where it will show.
+
+Note also that these edits put `self_play` outside `ruby-panther`'s
+`config_hash`, so neither config can resume it any more. Intended: this is the
+configuration for the *next* run, and next step 1 — more games per generation —
+is deliberately not applied here, because it is the one change worth its own
+run rather than a config edit.

@@ -18,10 +18,13 @@ net_preset: base
 use_coreml: true
 
 self_play:
-  # 400. MODEL.md §9 budgets 200 games x ~150 plies x playout-cap-randomised
-  # 200/800 sims at ~10M evaluations, i.e. ~5 min a generation batched, so 400
-  # games is ~10 min — still under half of what one anchor ladder costs, and it
-  # doubles the distinct positions the step budget below is spread over.
+  # 400. MODEL.md §9's estimate for this was ~10 min a generation; the measured
+  # figure on `ruby-panther` is **~38-46 min** at a steady 22.2 positions/s
+  # through CoreML, and self-play is the dominant cost of a generation rather
+  # than a fraction of the ladder's. Distinct positions are still what the step
+  # budget below is divided by — and distinct *games* are what the per-game
+  # value and score heads get, which is the tighter constraint of the two
+  # (docs/NOTEBOOK.md, 2026-07-29).
   games_per_gen: 400
   shard_games_per_file: 2
   worker_threads: null   # null = (cores - 1)
@@ -56,23 +59,31 @@ self_play:
     floor: 0.10
     min_unseeded_games: 20
     schedule: {}
-  random_opening_plies: 2
-  max_plies: 200
+  # 5, not 2 — every game otherwise starts from the same Belgian Daisy, and
+  # distinct *games* are what the per-game value and score heads learn from.
+  # Free. See standard.yaml for the full argument.
+  random_opening_plies: 5
+  # 300, not 200. At the cap the game is adjudicated on the sign of the marble
+  # differential, so a one-marble edge becomes a full ±1 value label; that was
+  # 17% of `ruby-panther`'s generation-24 games and rising. See standard.yaml.
+  max_plies: 300
   no_progress_plies: 0
   capture_gamma: 0.98
 
 train:
   # The arithmetic:
   #
-  #   400 games x ~100 plies      = ~40k positions per generation
-  #   replay_buffer_gens: 8       => the window tops out near 320k positions
-  #   1.5 epochs over  40k        = 1.5 *  40000 / 256 =  234 steps
-  #   1.5 epochs over 320k        = 1.5 * 320000 / 256 = 1875 steps
+  #   400 games x ~150 plies      = ~60k positions per generation
+  #   replay_buffer_gens: 8       => the window tops out near 480k positions
+  #   1.5 epochs over  60k        = 1.5 *  60000 / 256 =  352 steps
+  #   1.5 epochs over 480k        = 1.5 * 480000 / 256 = 2812 steps
   #
-  # so steps_per_gen_min binds for the first two or three generations (400
-  # steps over a 40k buffer is 2.6 epochs) and the epoch target binds
-  # thereafter, never approaching steps_per_gen_max. The old 4000-step cap over
-  # an early 40k buffer would have been 25.6 raw epochs in one generation.
+  # so steps_per_gen_min binds for the first two generations (400 steps over a
+  # 60k buffer is 1.7 epochs) and the epoch target binds thereafter, still not
+  # approaching steps_per_gen_max. The ply figure is measured — `ruby-panther`
+  # reached 130 plies by generation 24 under a 200 cap, and `max_plies: 300`
+  # lets the tail run further. The old 4000-step cap over an early 60k buffer
+  # would have been 17 raw epochs in one generation.
   # Self-play is CPU-bound and training is GPU-bound, so these steps run on
   # wall-clock that would otherwise be idle — but idle wall-clock is not a
   # reason to make twenty passes over the same positions.
@@ -132,11 +143,13 @@ anchor_ladder:
   # Every generation. The old every-4 cadence was priced when `eval-match` was
   # missing self-play's fixed-batch padding and a rung cost several times the
   # same games in self-play. Post-fix, `ruby-panther`'s gen-8 ladder played 128
-  # games in 5.4 min; this panel is ~152 games, ~6.5 min, against ~45 min of
-  # self-play.
+  # games in 5.4 min.
   every_gens: 1
   run_on_final_gen: true
-  games: 32
+  # 64, not 32: a 32-game rung resolves about ±120 Elo, and `ruby-panther` was
+  # down to ~35 Elo/generation by generation 24. This panel is 3 × 64 + 2 × 16 =
+  # 224 games, ~20 min against ~46 min of self-play. See standard.yaml.
+  games: 64
   floor_games: 16
   simulations: 200
   # Floor anchors only — a sanity check, not a milestone. `heuristic@800` is
@@ -148,15 +161,24 @@ anchor_ladder:
   frozen_gens: []
   # The gauntlet, and the whole measurement — `gen - k` improves as fast as the
   # network does, so it never saturates the way a fixed anchor must. Offsets
-  # from measured resolution; see standard.yaml for the table.
-  trailing_gens: [1, 2, 4, 8]
+  # from measured resolution; see standard.yaml for both tables.
+  #
+  # `1` is dropped: over `ruby-panther`'s generations 13–24 it returned ten
+  # readings from −66 to +124 with every interval spanning zero. Unlike
+  # standard.yaml this stops at 8 rather than 16 — a twelve-generation run
+  # never reaches a generation where `gen − 16` names a checkpoint, and a rung
+  # that resolves to nothing is silently dropped rather than reported.
+  trailing_gens: [2, 4, 8]
   batch_size: 32
   c_puct: 1.4
   opening: belgian
-  random_opening_plies: 2
+  # Match self-play; it also decorrelates games within a rung.
+  random_opening_plies: 5
   temperature_plies: 10
   temperature: 1.0
-  max_plies: 200
+  # Match self-play, or a rung adjudicates positions the training distribution
+  # resolves properly.
+  max_plies: 300
   no_progress_plies: 0
   threads: null
 
