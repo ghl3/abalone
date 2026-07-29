@@ -231,3 +231,122 @@ Note also that these edits put `self_play` outside `ruby-panther`'s
 configuration for the *next* run, and next step 1 — more games per generation —
 is deliberately not applied here, because it is the one change worth its own
 run rather than a config edit.
+
+### Proposals for further training
+
+Written at the end of the session, from the generation 13–24 evidence. Nothing
+here is run yet.
+
+#### The diagnosis these rest on
+
+Split the generalisation gap by head and two different stories separate cleanly.
+
+**The policy head is healthy and is not capacity-limited.** Its cross-entropy
+minus its target's entropy is the KL to its own teacher — how far the network is
+from reproducing the search that trained it:
+
+| gen | KL on train | KL on unseen | unseen − train |
+|---|---|---|---|
+| 8 | 0.870 | 0.542 | −0.328 |
+| 16 | 0.465 | 0.366 | −0.099 |
+| 24 | 0.349 | 0.321 | −0.028 |
+
+It generalises *better than it fits* at every generation, and is now within
+~0.32 nats of reproducing 200/800-simulation search on positions it has never
+seen. A head that does not overfit, whose loss is still falling, is not short of
+parameters.
+
+**The value head is the entire problem** — +0.308 of the +0.368 total gap at
+generation 24, having been negative through generation 21. Its effective sample
+size is `games_per_gen × replay_buffer_gens` = 400 × 8 = **3,200 distinct
+labels**, and games grew 77 → 130 plies, so each label is smeared over ~70% more
+positions than when that budget was set.
+
+By the run's own instrument this is nowhere near converged: the GCP proposal §7
+calls `score_vs_gen_minus_8 ≤ 0.55` converged and **> 0.65 data-limited**, and
+the last four ladders read 0.844, 0.938, 0.719, 0.750.
+
+#### Ranked interventions
+
+1. **More distinct games.** `games_per_gen` 400 → 1200 and/or
+   `replay_buffer_gens` 8 → 20. Both multiply the same quantity. This is the
+   diagnosed problem; everything below is secondary.
+2. **Fix the instrument.** *Applied this session* — see the addendum above.
+3. **Widen the openings.** *Applied.*
+4. **Raise the ply cap.** *Applied.*
+5. **More search** (`sims_full` 800 → 1200) — later. The policy head is close to
+   its teacher, so the teacher eventually becomes the ceiling; but this competes
+   for exactly the compute item 1 needs, and item 1 is the measured problem.
+6. **`net_preset: large` — not indicated, and this contradicts the existing
+   plan.** GCP proposal §11 sets the rule: *"if `val_rolling` pulls away from
+   training loss while the gauntlet flattens, the constraint is capacity, and
+   `large` is the right call."* Both conditions are now literally true, so the
+   rule as written says spend on parameters. **That would be wrong.** The rule
+   predates the per-head generalisation table; the pull-away is 88% per-game
+   heads, which is a data signature. A capacity limit would show as the *policy*
+   head plateauing with a positive train→holdout gap, and it is doing the
+   opposite on both counts. Re-read §11 before acting on it.
+
+#### How to test item 1 without losing a week
+
+**First, free, and it may make the rest unnecessary.** The *diagnosis* can be
+tested offline from shards already on disk — generations 13–24, ~600k positions
+across ~4,800 games. Train from one fixed initialisation twice at **equal
+position count** but different distinct-game count (e.g. 240k positions drawn
+from 1,900 games vs from 4,800) and compare the value head's train→rolling gap.
+If the gap tracks game count rather than position count, the diagnosis holds and
+the run below is justified. If it doesn't, the whole ranking above is wrong.
+Tens of minutes, no self-play, no money.
+
+**Then the run — and resume, do not restart.** A fresh run at 1200 games spends
+its first ~15 generations re-deriving what `ruby-panther` already knows; the
+memorisation only appeared at generation 22. Resuming from generation 24 puts
+the extra data exactly where the problem is: the 8-generation window would hold
+~9,600 distinct games instead of 3,200. Seven or eight generations yields a
+`gen 32 vs gen 24` −8 rung, four or five gen−4 readings, and eight
+per-generation readings of the value-head gap.
+
+**The blocker is a bug in the exclusion set.** `self_play.games_per_gen` is not
+in `HASH_EXCLUDED`, so changing it refuses the resume — but the set's own
+criterion is *"run identity, an outer-loop bound, or infrastructure — none of it
+changes the distribution of the data"*, and games-per-generation changes how
+many samples are drawn, not the distribution each is drawn from. It cannot
+invalidate a single existing shard. This is the same argument commit `54e037a`
+accepted for `anchor_ladder`, whose absence had locked this very run out of
+being extended. One line plus a test.
+
+Useful side effect: a resume keeps `max_plies: 200` and
+`random_opening_plies: 2`, since those *are* hash-covered. So the experiment
+moves one variable, and the changes applied above land in the next fresh run.
+
+#### On renting a machine — the GPU is not the expensive part
+
+The proposal picks `g2-standard-32` for its **32:1 vCPU-to-GPU ratio**, not for
+the L4. This is a CPU-bound workload with a GPU-shaped inner loop: the forward
+pass is 0.489 GFLOP while tree search costs ~4–5 pos/s per vCPU. You rent cores;
+the L4 comes with them.
+
+Which creates an arbitrage for a *short* run. At `base` fp32 the L4 binds at
+~50–70 pos/s against a CPU ceiling of ~110–135, so the extra 16 vCPUs of the
+32-core shape do nothing until the fp16 export exists. **A `g2-standard-16` at
+fp32 gets ~50–60 pos/s for roughly half the hourly rate**, and lets item 4 of
+the port (fp16, 2–4 h) be skipped entirely.
+
+| option | wall clock | $ | engineering | what it answers |
+|---|---|---|---|---|
+| Offline games-vs-positions ablation | ~30 min, local | 0 | none | is the diagnosis right? |
+| `g2-standard-16` fp32, resume from gen 24 @ 1200 games | 8 h | ~$5 | ~6 h port + 1-line hash fix | does the fix restore the Elo rate? |
+| `g2-standard-32` + fp16 | 8 h | ~$8 | +2–4 h | same, ~2× the generations |
+| Fresh 30-generation run, laptop | 2.5 days | 0 | none | same, slowly |
+
+Dollar figures extrapolate from the proposal's measured ~$0.90–1.00/hr spot for
+the 32-core shape and **must be verified with `gcloud` before committing**.
+Ruled out: CPU-only cloud (§2 sizes a 128-vCPU C3 under 40 pos/s at ~2× the
+price) and the cheap GPU marketplaces, which sell thin vCPU allocations — the
+wrong ratio for this workload.
+
+**Implementation caution for the port.** Item 3 of §2 proposes replacing
+`use_coreml` with `inference_backend`. `RunConfig` rejects unknown keys and
+`ruby-panther`'s archived `config.yaml` contains `use_coreml: true`, so a
+straight rename breaks resuming the very run this plan depends on. Keep
+`use_coreml` as an accepted alias.
