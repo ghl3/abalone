@@ -76,5 +76,6 @@ export function buildHoverPreview(
     ownToCells,
     oppFromCells,
     oppToPositions,
+    preview: true,
   };
 }

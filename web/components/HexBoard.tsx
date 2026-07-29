@@ -49,6 +49,11 @@ export interface MovingState {
   ownToCells: number[];
   oppFromCells: number[];
   oppToPositions: { x: number; y: number; offBoard: boolean }[];
+  /** A move being *shown* rather than a marble being dragged. The two want
+   *  opposite treatments: under a finger the marble is the thing you are
+   *  looking at and an arrow is noise, but a suggestion appears without a
+   *  gesture and has to say for itself where the pieces came from. */
+  preview?: boolean;
 }
 
 /** Where the previous move came from and went to, for the trace overlay.
@@ -75,6 +80,90 @@ interface Props {
 }
 
 const MARBLE_R = HEX_SIZE * 0.62;
+
+function centroid(cells: number[]) {
+  const pts = cells.map(cellCenter);
+  return {
+    x: pts.reduce((s, p) => s + p.x, 0) / pts.length,
+    y: pts.reduce((s, p) => s + p.y, 0) / pts.length,
+  };
+}
+
+/** The group's travel, as one arrow spanning from where it started to where it
+ *  lands. Both ends are pulled in so the shaft sits *between* the ghost and the
+ *  landing rather than covering either.
+ *
+ *  One cell long, always — because that is how far the group actually travels,
+ *  whatever its size. The tail is the rearmost origin: for an inline push that
+ *  is the square the line vacates, and for a broadside every cell ties on the
+ *  travel axis so it resolves to the group's centre. The head is one step on
+ *  from there.
+ *
+ *  Two earlier versions were wrong in opposite directions. Centroid-to-centroid
+ *  put both ends on squares occupied before *and* after an inline push, so the
+ *  arrow appeared to start mid-group. Rear-origin-to-front-destination fixed the
+ *  tail but spanned the entire line — three cells of arrow for a one-cell move,
+ *  which overstates the motion as badly as the first understated its origin.
+ *
+ *  Nothing here compensates for a flipped board, unlike the rim labels: the
+ *  arrow lives in board coordinates and *should* turn with them. Text has an
+ *  upright reading direction that a 180° spin destroys; an arrow's meaning is
+ *  its direction, so rotating it is what keeps it correct. */
+function ArrowFor({
+  fromCells,
+  toCells,
+}: {
+  fromCells: number[];
+  toCells: number[];
+}) {
+  // Direction first, from the centroids — as a *direction* they are always
+  // right, it is only as endpoints that they mislead.
+  const from0 = centroid(fromCells);
+  const to0 = centroid(toCells);
+  const dirX = to0.x - from0.x;
+  const dirY = to0.y - from0.y;
+  const dirLen = Math.hypot(dirX, dirY);
+  if (dirLen < 1) return null;
+  const ux = dirX / dirLen;
+  const uy = dirY / dirLen;
+
+  // Cells tie when they sit abreast of each other across the direction of
+  // travel; the tolerance only has to be finer than one cell's spacing.
+  const TIE = HEX_SIZE * 0.3;
+  const rank = (cells: number[], sign: 1 | -1) => {
+    const pts = cells.map(cellCenter);
+    const proj = pts.map((p) => p.x * ux + p.y * uy);
+    const limit = Math.max(...proj.map((v) => v * sign)) * sign;
+    const picked = pts.filter((_, i) => Math.abs(proj[i] - limit) <= TIE);
+    return {
+      x: picked.reduce((s, p) => s + p.x, 0) / picked.length,
+      y: picked.reduce((s, p) => s + p.y, 0) / picked.length,
+    };
+  };
+
+  // The centroids differ by exactly the move's shift — one cell — for inline
+  // and broadside alike, so adding that to the tail gives a one-step arrow
+  // without needing to know which kind of move this is.
+  const a = rank(fromCells, -1);
+  const b = { x: a.x + dirX, y: a.y + dirY };
+  const len = dirLen;
+  const trim = Math.min(HEX_SIZE * 0.42, len * 0.36);
+
+  return (
+    <line
+      x1={a.x + ux * trim}
+      y1={a.y + uy * trim}
+      x2={b.x - ux * trim}
+      y2={b.y - uy * trim}
+      stroke="var(--highlight)"
+      strokeWidth={4}
+      strokeLinecap="round"
+      markerEnd="url(#arrowhead)"
+      opacity={0.9}
+      pointerEvents="none"
+    />
+  );
+}
 
 export default function HexBoard({
   cells,
@@ -222,6 +311,17 @@ export default function HexBoard({
           <stop offset="0%" stopColor="#1b222a" />
           <stop offset="100%" stopColor="#141a20" />
         </linearGradient>
+        <marker
+          id="arrowhead"
+          markerWidth="4"
+          markerHeight="4"
+          refX="2.6"
+          refY="2"
+          orient="auto"
+          markerUnits="strokeWidth"
+        >
+          <path d="M0,0 L4,2 L0,4 Z" fill="var(--highlight)" />
+        </marker>
       </defs>
 
       <g transform={spin}>
@@ -270,7 +370,26 @@ export default function HexBoard({
           const side = owner as 0 | 1;
 
           if (ownFromSet.has(c)) {
-            return (
+            // A preview keeps a dimmed marble where the piece started, not a
+            // dashed outline: at 1.5px and 40% opacity the outline was barely
+            // separable from the cell edge, so the move read as pieces
+            // appearing rather than pieces travelling. A drag can stay light —
+            // the origin is where your finger just was.
+            return moving?.preview ? (
+              <g key={`mb-${c}`} pointerEvents="none">
+                {marble(`ghost-${c}`, x, y, side, 0.4)}
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={MARBLE_R}
+                  fill="none"
+                  stroke={side === 0 ? "var(--black-lit)" : "var(--white)"}
+                  strokeWidth={1.5}
+                  strokeDasharray="2.5,3"
+                  opacity={0.9}
+                />
+              </g>
+            ) : (
               <circle
                 key={`mb-${c}`}
                 cx={x}
@@ -366,7 +485,19 @@ export default function HexBoard({
             );
           })}
 
-        {/* 8. Rim coordinates, counter-rotated so they read upright when the
+        {/* 8. Direction of a previewed move. One arrow for the group, not one
+            per marble: three parallel arrows across adjacent hexes is more ink
+            than the fact needs, and the group moves as a unit anyway. Drawn
+            over the marbles, which is where an annotation belongs — under
+            them it disappears exactly when the move is crowded. */}
+        {moving?.preview && moving.snapped && moving.ownToCells.length > 0 && (
+          <ArrowFor
+            fromCells={moving.ownFromCells}
+            toCells={moving.ownToCells}
+          />
+        )}
+
+        {/* 9. Rim coordinates, counter-rotated so they read upright when the
             board is turned around. */}
         {rimLabels.map((l, i) => (
           <text

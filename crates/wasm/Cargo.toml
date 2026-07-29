@@ -11,13 +11,12 @@ crate-type = ["cdylib"]
 abalone-game = { path = "../game" }
 abalone-mcts = { path = "../mcts" }
 abalone-encoder = { path = "../encoder" }
-rand = { version = "0.8", features = ["small_rng"] }
 wasm-bindgen = "0.2"
 
 # `rand`/`getrandom` need explicit JS-bridge support to compile for the
-# wasm32-unknown-unknown target. We don't actually call into JS-side
-# entropy (the wasm wrapper seeds `SmallRng` deterministically), but
-# without this feature the build fails at link time.
+# wasm32-unknown-unknown target. Nothing here calls into JS-side entropy —
+# `abalone-mcts` seeds its `SmallRng` from the caller's seed — but without
+# this feature the build fails at link time.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 

@@ -23,6 +23,213 @@ gets its own dated document under `docs/` and the entry links to it.
 
 ---
 
+## 2026-07-29 — the analysis view, reviewed and rebuilt
+
+### Goal
+
+Review the analysis view as a piece of UI and act on what the review found. No
+model work; this session touched `web/`, plus the two crates it reads through.
+
+### What the review found
+
+Driving the built app rather than reading it was what produced the list — four
+of these are invisible in source and obvious within seconds of using it.
+
+- **"No legal moves." on screen during every search.** `topMoves` is empty for
+  the whole duration of a search, and the empty state said the position was
+  over. Also shown on first load while the 12 MB `best.onnx` downloads. The
+  `busy` prop's own doc comment described rows persisting from the previous
+  position; nothing implemented it.
+- **The heuristic evaluator displayed the network's numbers.** Selecting it
+  kept the `Network read · no search` block on screen, directly above a footer
+  reading "Hand-written evaluator, no network."
+- **Eval colour inverted its meaning every ply.** Evals are White-POV under a
+  heading naming the side to move, so at ply 4 Black's strongest move — 1280 of
+  2000 visits — rendered `−0.14` in red, the most alarming number in the list.
+- **Layout broke below ~700 px** (measured `scrollWidth 705` vs `clientWidth
+  585` at a 600 px viewport): eval bar and plate labels off the left edge.
+- **The move list was invisible to keyboard and screen readers** — `div`s with
+  `onClick`, no role, no tabIndex. The a11y tree contained no move entries.
+- **The eval bar stacked two estimators on one gauge**: bands from the raw
+  network read, number from search. They contradict each other whenever search
+  changes its mind.
+
+### What changed
+
+Numbers first, because the rest follows from them. One convention —
+White-positive, as in chess, never restated per mover — which forces colour to
+encode *side* rather than sentiment; `web/lib/outcomeFormat.ts` owns it.
+`Network read · no search` is gone.
+
+Then the panel stopped speaking in evals at all — see *Searched probabilities*
+below, which was the largest piece of the day and started from a mistake of
+mine.
+
+Then the engine surface. `Search::principal_variation` walks the most-visited
+path off the arena the search already built, exposed through `WasmSearch`, so
+every ranked move carries its line at no inference cost — hovering a move in
+the line replays the board to it. Progress messages now carry a full
+`SearchSnapshot` instead of a visit count, so rows refine in place (measured
+120 → 256 → 832 → 1888 visits across one Deep search, with the top move
+changing at 256) and the blank-state bug has nowhere to live. The 50–2000
+slider became Quick/Standard/Deep; visit share is drawn as a bar behind each
+row, which is the one thing four bare integers never communicated.
+
+The heuristic evaluator is gone, along with the `WasmGame::analyze` and
+`eval_white_pov` bindings that existed only to serve it. Analysis gained a flip
+control, `← →` stepping with a redo stack, and `F`; the row list became real
+buttons with labels; the layout wraps instead of overflowing (`585/585` at
+600 px, was `705/585`).
+
+### Searched probabilities — and the wrong turn on the way there
+
+The panel's units went through three states, and the middle one was wrong in a
+way worth recording because it looked entirely reasonable.
+
+Asked for win/draw/loss and a marble margin per move, I reached for the
+network: encode the position after each ranked move, one batched forward pass,
+read the `value` and `score` heads. It worked, it was cheap, and it was junk —
+a 1-ply first impression displayed in a table whose rows were *ranked* by a
+searched eval, with nothing on screen saying the two came from different
+places. On the opening position the disagreement is not subtle: the raw network
+says White 49% / draw 7% / Black 44%, and 500 simulations say White 41% /
+Black 52%. Eight points, and the version I shipped first would have shown the
+49%.
+
+The reason I reached for the network at all is that the tree genuinely does not
+hold these numbers. `collapse_value` reduces the three-way head to
+`P(win) − P(loss)` *before* anything is backed up, and the score head is never
+fed to search — so a node stores one scalar and the draw share and the margin
+are gone. The right fix was not a better source for the missing numbers; it was
+to stop destroying them.
+
+`abalone-mcts` now accumulates the full distribution and the expected margin
+alongside the scalar, under `track_outcome_stats` (default off). The algebra is
+exact rather than approximate: since `Q = P(win) − P(loss)` and the three sum
+to one, a draw share is the only missing degree of freedom, and backing it up
+recovers the rest identically.
+
+Four things keep this from touching training, which was the explicit
+constraint:
+
+- Selection reads `Node::total_value` and nothing else, so PUCT has no path to
+  the new data. Structural, not conventional.
+- The accumulators live in side vectors parallel to the arena, not in `Node` —
+  so with tracking off the node layout and footprint are *identical*, not
+  merely equivalent.
+- `LeafEval` is untouched; the distributions arrive via a separate
+  `submit_with_stats`. Not one training file changed except `search_config`,
+  which now states `track_outcome_stats: false` explicitly rather than
+  inheriting it.
+- The virtual loss got a matching term, `[(1+vl)/2, 0, (1−vl)/2]`, whose
+  collapse is exactly `virtual_loss` — so the two accumulators stay consistent
+  *during* a batch, not only after it resolves.
+
+**The invariant is the load-bearing test.** `P(win) − P(loss)` must reproduce
+the eval at every node. A point-of-view flip applied at the wrong parity still
+produces a valid-looking distribution — it just describes the position
+backwards — and nothing in the UI would show it. Asserted across batch sizes 1,
+8 and 32, so virtual loss is covered, plus a test that turning tracking on
+leaves `visits` and `q_parent_pov` bit-identical.
+
+It earned its keep immediately: the first run failed at `batch=1 child=4`,
+`-0.4199` against `-0.4901`. The backup was fine — my *test evaluator* fed a
+fixed 0.2 draw mass, which clamps the collapse for any leaf past |0.8| and made
+the distribution disagree with the scalar it was supposed to decompose. Shrink
+the mass as |v| → 1 and it passes. A test that catches a flaw in its own
+fixture before it catches one in the code is doing its job.
+
+The move table is now `move · White% · draw% · Black% · marbles`, all searched.
+No eval column, no visits column, and — after a round of "I still see eval
+here" — no signed eval anywhere in the UI at all. Both were engine units for
+things already shown better: eval is the same axis as the percentages, and
+visit share is the row's background bar. The invariant is still checked, in
+the Rust tests where it fails loudly rather than on screen where it asks a
+reader to notice. `EvalBar` became `WinBar` and `evalFormat.ts` became
+`outcomeFormat.ts`, because a component that deliberately shows no eval should
+not be named for one.
+
+Removing the per-move forward pass also gave back what it cost:
+**795 → ~1020 sims/s at Deep**.
+
+Review followed, so the two screens share a vocabulary. Move grading is now the
+winning chance given up in percentage points (`−6%`) rather than eval given up
+(`−0.12`); the bands moved from 0.08/0.2 to 4/10 points, which is the same
+measurement restated since `Δwin ≈ Δeval / 2`. The "engine wants" line reports
+the triple and the margin. The graph's *geometry* did not change and did not
+need to: `rootEval` is identically `P(win) − P(loss)`, so the curve was already
+plotting a probability difference — only the tooltip was speaking the wrong
+language.
+
+### The bug the work uncovered
+
+Adding an explicit cancel on search supersession surfaced `Session mismatch`
+from ORT, which wedged the engine permanently — play mode stuck at "thinking"
+forever. Cause: `onmessage` is `async`, so two `runSearch` calls can both be
+inside `session.run`, and `onnxruntime-web` permits exactly one run per
+session. **This was a latent race before this session, not a new one** —
+React's strict-mode double mount posts two searches on every mount, and the
+cancel only widened the window. Fixed by chaining `runSearch` through a promise
+queue in the worker, with `generation` still bumped first so the superseded
+search bails at its next batch boundary. Documented in ARCHITECTURE §7.4, where
+it now leads the load-bearing list.
+
+Also fixed while in there: a transient engine error stayed pinned under the
+board for the rest of the session, describing an engine that had recovered.
+
+### The move arrow, in three wrong shapes
+
+Small, but a good example of a thing that cannot be reviewed from source. The
+hover preview draws one arrow for the group:
+
+1. **Centroid to centroid.** For a 3-marble inline push both centroids land on
+   squares occupied *before and after*, so the arrow began mid-group and said
+   nothing about where the line came from. Looked fine for single marbles and
+   broadside slides, which is why it survived the first check.
+2. **Rearmost origin to frontmost destination.** Fixed the tail, but spanned
+   the whole line — 131 px of arrow for a move that travels 52. Overstated the
+   motion as badly as (1) understated the origin.
+3. **Rearmost origin, plus one step.** The centroid difference *is* the shift
+   vector, and it is one cell for inline and broadside alike, so adding it to
+   the tail gives a one-step arrow with no need to know which kind of move it
+   is. A broadside's cells all tie on the travel axis, so the tail resolves to
+   the group's centre; a single marble resolves to itself. All five ranked
+   moves now measure 27 px whatever their size.
+
+### Verified
+
+179 Rust tests pass, clippy clean, `next build` clean, `tsc --noEmit` clean.
+
+Driven in the browser: live row refinement, depth switching under rapid
+alternation, line hover and board stepping, flip (including that the preview
+arrow rotates with the board while rim labels stay upright), play mode with the
+engine to move, and a full review sweep — the protocol change touches
+`sweepGame`, so review was re-checked end to end.
+
+The searched-probability invariant was checked *in the browser too*, not only in
+Rust: every displayed row satisfies `White% − Black% == eval` and the three
+percentages sum to 100.
+
+Two PV tests are worth keeping honest: the line is replayed against a real
+`Game` and asserted legal at every step, because a PV that cannot be played is
+worse than no PV.
+
+### Next steps
+
+- Analysis has no move list, and that is a **decision, not a gap**: `← →` with
+  the redo stack covers stepping through a line, and a list changes the layout
+  shape enough to want its own pass. Revisit only if entering long lines starts
+  to feel lossy.
+- The PV is capped at 6 plies and only the top 5 moves are ranked (`TOP_N` in
+  the worker). Neither is a considered limit, just a default.
+- `EvalGraph` in review still colours by "up is the reviewer" rather than by
+  side. It shares the palette constants now but not the convention.
+- `track_outcome_stats` costs one `[f32; 3]` and one `f32` per node when on.
+  Unmeasured, because self-play never turns it on — but if a future tool wants
+  it at training scale, measure before assuming it is free.
+
+---
+
 ## 2026-07-29 — ruby-panther extended to 24 generations
 
 ### Goal

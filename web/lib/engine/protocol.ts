@@ -24,42 +24,56 @@ export interface SearchRequest {
   batchSize: number;
 }
 
-/** The network's opinion of the root position, straight from the heads — no
- *  search. Free to collect: the search's first batch is the root expansion, so
- *  this is the forward pass that was happening anyway.
- *
- *  Kept separate from `rootEval` on purpose. `rootEval` is the *searched* Q,
- *  a backed-up scalar that cannot be decomposed into outcome probabilities;
- *  these are the raw distributions. They can legitimately disagree, and the
- *  gap is itself informative — it is what search found. */
-export interface RootNetRead {
-  /** `[P(win), P(draw), P(loss)]` for **White**, summing to 1. */
-  wdlWhite: [number, number, number];
-  /** Expected final capture differential, signed for White (MODEL.md §6.0:
-   *  "by how much", the number that is legible to a human). Null if the model
-   *  has no `score` head. */
-  expectedScoreWhite: number | null;
-}
-
 export interface ScoredMove {
   idx: number;
   notation: string;
-  /** Q from White's POV: positive favours White. */
+  /** Q from White's POV: positive favours White. **Searched** — this is the
+   *  value backed up through the tree, and it is the number the move list
+   *  ranks and the eval bar shows. */
   evalWhite: number;
   visits: number;
+  /** `[P(win), P(draw), P(loss)]` for **White** after this move. Searched:
+   *  accumulated through the tree alongside `evalWhite` and visit-weighted the
+   *  same way, so `wdlWhite[0] - wdlWhite[2]` reproduces `evalWhite`. */
+  wdlWhite: [number, number, number] | null;
+  /** Expected final capture differential after this move, signed for White.
+   *  Also searched — the score head is backed up like the value head. Null if
+   *  the model has no `score` head. */
+  marginWhite: number | null;
+  /** The line search explored under this move — move indices along the
+   *  most-visited path, starting with this move itself. Read off the tree the
+   *  search already built, so it costs no extra inference. */
+  pv: number[];
+  /** `pv` rendered as notation, so the UI never has to call into wasm to
+   *  print a line it is only going to display. */
+  pvNotation: string[];
+}
+
+/** What the search currently believes. Identical in shape whether it comes
+ *  from a finished search or a progress tick mid-flight — the panel renders
+ *  one thing and never has to decide whether it is looking at a real answer
+ *  or a placeholder. */
+export interface SearchSnapshot {
+  /** Most-visited root move, or -1 before the root has been expanded. */
+  bestIdx: number;
+  /** Searched Q of the most-visited root child, from White's POV. */
+  rootEval: number;
+  /** The position's win/draw/loss for White, taken from the most-visited child
+   *  — the line the engine intends — rather than averaged over moves it has
+   *  already rejected. Same provenance as `rootEval`, and consistent with it:
+   *  `[0] - [2] === rootEval`. */
+  rootWdlWhite: [number, number, number] | null;
+  /** The position's expected capture differential, signed for White. */
+  rootMarginWhite: number | null;
+  topMoves: ScoredMove[];
+  /** Visits across *all* root children, not just the ones in `topMoves`. */
+  totalVisits: number;
 }
 
 export interface SearchResultMsg {
   kind: "result";
   id: number;
-  /** Most-visited root move, or -1 for a terminal position. */
-  bestIdx: number;
-  /** Searched Q of the most-visited root child, from White's POV. */
-  rootEval: number;
-  /** Raw network read of the root. Null for a terminal position. */
-  rootNet: RootNetRead | null;
-  topMoves: ScoredMove[];
-  totalVisits: number;
+  snapshot: SearchSnapshot;
   /** Wall-clock milliseconds for the whole search. */
   elapsedMs: number;
   /** Network forward passes it took. */
@@ -71,6 +85,9 @@ export interface ProgressMsg {
   id: number;
   visits: number;
   simulations: number;
+  /** The tree so far. Null only until the root expands, which is the first
+   *  forward pass — after that every tick carries usable rows. */
+  snapshot: SearchSnapshot | null;
 }
 
 export interface ReadyMsg {

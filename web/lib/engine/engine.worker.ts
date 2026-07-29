@@ -14,9 +14,9 @@
 import * as ort from "onnxruntime-web";
 import type {
   ProgressMsg,
-  RootNetRead,
   ScoredMove,
   SearchRequest,
+  SearchSnapshot,
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
@@ -33,8 +33,17 @@ const ctx = self as unknown as {
 };
 
 const TOP_N = 5;
-/** Progress messages are for a spinner, not a readout; keep them cheap. */
+/** How far to follow each move's line. Long enough to show the idea, short
+ *  enough that the tail — where visit counts thin out to single digits and the
+ *  line stops meaning much — stays off the screen. */
+const PV_LENGTH = 6;
+/** Progress ticks carry the whole tree, not just a counter, so the panel can
+ *  refine its rows in place. Still cheap: reading the root's children and six
+ *  PV nodes is arena indexing, and it is bounded by wall-clock, not by batch
+ *  count, so a fast provider does not flood the main thread. */
 const PROGRESS_INTERVAL_MS = 120;
+/** Stands in for a `score` head the model does not have. */
+const EMPTY = new Float32Array(0);
 
 let wasm: WasmModule | null = null;
 /** Resolves once the ONNX session exists. A `search` posted immediately after
@@ -48,6 +57,8 @@ let sessionPromise: Promise<{
 /** Bumped by `cancel` and by each new request: the search loop checks it
  *  between batches and abandons a superseded search rather than finishing it. */
 let generation = 0;
+/** Serialises `runSearch` calls. See the `search` branch of `onmessage`. */
+let searchQueue: Promise<void> = Promise.resolve();
 
 function post(msg: WorkerResponse) {
   ctx.postMessage(msg);
@@ -98,39 +109,73 @@ function softmax(logits: Float32Array | number[]): number[] {
   return sum > 0 ? exps.map((x) => x / sum) : exps;
 }
 
-/** Class order of the 3-way value head, matching `model/batch.py`. */
-const VALUE_WIN = 0;
-const VALUE_DRAW = 1;
-const VALUE_LOSS = 2;
-/** The score head is a softmax over a capture differential of −6..+6. */
-const SCORE_OFFSET = 6;
+/** `WasmSearch` has a private constructor — it only ever comes out of
+ *  `begin_search` — so its type is named through that return, not `InstanceType`. */
+type WasmSearchHandle = ReturnType<
+  InstanceType<WasmModule["WasmGame"]>["begin_search"]
+>;
 
-/** Pull the value and score heads out of the root's forward pass and restate
- *  them from White's POV. Both heads are side-to-move relative (the encoder's
- *  planes 0/1 are own/opponent), so playing Black means reading them backwards. */
-function readRootHeads(
-  out: ort.InferenceSession.OnnxValueMapType,
-  blackToMove: boolean
-): RootNetRead {
-  const value = out.value.data as Float32Array;
-  const p = softmax(value.subarray(0, 3));
-  const win = p[VALUE_WIN];
-  const draw = p[VALUE_DRAW];
-  const loss = p[VALUE_LOSS];
-  const wdlWhite: [number, number, number] = blackToMove
-    ? [loss, draw, win]
-    : [win, draw, loss];
+/** Read the tree as it currently stands. `result()` is valid mid-search — it
+ *  reports the arena as-is — so the same function serves a progress tick and
+ *  the final answer, and there is exactly one definition of "what the search
+ *  thinks" for the UI to render.
+ *
+ *  Everything here comes out of the tree, including the win/draw/loss split and
+ *  the marble margin: `Search` accumulates those alongside the scalar it backs
+ *  up (`track_outcome_stats`, on for the browser only). There is no forward
+ *  pass in this function and no network read anywhere on this path. */
+function readSnapshot(
+  mod: WasmModule,
+  search: WasmSearchHandle
+): SearchSnapshot | null {
+  const result = search.result();
+  if (!result) return null;
 
-  let expectedScoreWhite: number | null = null;
-  const scoreOut = out.score;
-  if (scoreOut) {
-    const logits = scoreOut.data as Float32Array;
-    const q = softmax(logits.subarray(0, 13));
-    // E[d] over the side to move, then signed for White.
-    const expected = q.reduce((s, pi, i) => s + pi * (i - SCORE_OFFSET), 0);
-    expectedScoreWhite = blackToMove ? -expected : expected;
-  }
-  return { wdlWhite, expectedScoreWhite };
+  const indices = Array.from(result.indices());
+  const evals = Array.from(result.evals());
+  const visits = Array.from(result.visits());
+  const wdl = result.wdl();
+  const margins = result.margins();
+  const rootEval = result.root_eval();
+  const rootWdlRaw = result.root_wdl();
+  const rootMargin = result.root_margin() ?? null;
+  result.free();
+
+  const triple = (src: Float32Array, i: number) =>
+    src.length >= (i + 1) * 3
+      ? ([src[i * 3], src[i * 3 + 1], src[i * 3 + 2]] as [number, number, number])
+      : null;
+
+  const all = indices.map((idx, i) => ({
+    idx,
+    evalWhite: evals[i],
+    visits: visits[i],
+    wdlWhite: triple(wdl, i),
+    marginWhite: i < margins.length ? margins[i] : null,
+  }));
+  all.sort((a, b) => b.visits - a.visits);
+
+  // Notation and the PV walk are only done for the rows that will be shown.
+  // Doing it for all ~50 legal moves on every 120 ms tick is the difference
+  // between a progress message and a stall.
+  const topMoves: ScoredMove[] = all.slice(0, TOP_N).map((m) => {
+    const pv = Array.from(search.principal_variation(m.idx, PV_LENGTH));
+    return {
+      ...m,
+      notation: mod.move_notation(m.idx),
+      pv,
+      pvNotation: pv.map((idx) => mod.move_notation(idx)),
+    };
+  });
+
+  return {
+    bestIdx: search.best_index(),
+    rootEval,
+    rootWdlWhite: triple(rootWdlRaw, 0),
+    rootMarginWhite: rootMargin,
+    topMoves,
+    totalVisits: visits.reduce((s, v) => s + v, 0),
+  };
 }
 
 /** Rebuild the position by replaying `moves` from the opening. Cheaper than it
@@ -149,11 +194,9 @@ async function runSearch(req: SearchRequest) {
 
   const myGeneration = generation;
   const game = positionFrom(mod, req);
-  const blackToMove = game.turn() === mod.WasmSide.Black;
   const started = performance.now();
   let batches = 0;
   let lastProgress = started;
-  let rootNet: RootNetRead | null = null;
 
   const search = game.begin_search(
     req.simulations,
@@ -176,14 +219,13 @@ async function runSearch(req: SearchRequest) {
       // A newer request (or a cancel) landed while inference was in flight.
       if (generation !== myGeneration) return;
 
-      // The first batch is always the root alone — that is how `Search` opens,
-      // because the root needs its priors before any descent can happen — so
-      // this reads the root's own heads with no extra inference.
-      if (batches === 0) rootNet = readRootHeads(out, blackToMove);
-
       const policy = out.policy_logits.data as Float32Array;
       const value = out.value.data as Float32Array;
-      search.submit(policy, value);
+      // The score head rides along so the margin can be backed up with
+      // everything else. A model exported without one sends an empty array,
+      // and the margin column simply has nothing to report.
+      const score = (out.score?.data as Float32Array) ?? EMPTY;
+      search.submit(policy, value, score);
       batches++;
 
       const now = performance.now();
@@ -194,40 +236,23 @@ async function runSearch(req: SearchRequest) {
           id: req.id,
           visits: search.root_visits(),
           simulations: req.simulations,
+          snapshot: readSnapshot(mod, search),
         };
         post(msg);
       }
     }
 
-    const result = search.result();
-    const topMoves: ScoredMove[] = [];
-    let totalVisits = 0;
-    let rootEval = 0;
-    if (result) {
-      const indices = Array.from(result.indices());
-      const evals = Array.from(result.evals());
-      const visits = Array.from(result.visits());
-      rootEval = result.root_eval();
-      result.free();
-      totalVisits = visits.reduce((s, v) => s + v, 0);
-      const all = indices.map((idx, i) => ({
-        idx,
-        notation: mod.move_notation(idx),
-        evalWhite: evals[i],
-        visits: visits[i],
-      }));
-      all.sort((a, b) => b.visits - a.visits);
-      topMoves.push(...all.slice(0, TOP_N));
-    }
-
     post({
       kind: "result",
       id: req.id,
-      bestIdx: search.best_index(),
-      rootEval,
-      rootNet,
-      topMoves,
-      totalVisits,
+      snapshot: readSnapshot(mod, search) ?? {
+        bestIdx: -1,
+        rootEval: 0,
+        rootWdlWhite: null,
+        rootMarginWhite: null,
+        topMoves: [],
+        totalVisits: 0,
+      },
       elapsedMs: performance.now() - started,
       batches,
     });
@@ -252,8 +277,20 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         loadMs: performance.now() - started,
       });
     } else if (msg.kind === "search") {
+      // Bump first, so a search already in flight abandons at its next batch
+      // boundary rather than spending its whole budget on a stale position.
       generation++;
-      await runSearch(msg);
+      // Then queue behind it. `onmessage` is async, so two searches posted in
+      // quick succession — a position change, a depth change, React's
+      // strict-mode double mount — would otherwise both be inside
+      // `session.run` at once, and `onnxruntime-web` permits exactly one run
+      // per session: the second throws "Session mismatch" and the engine
+      // wedges. The wait is short by construction, because the search being
+      // superseded returns as soon as its current forward pass resolves.
+      searchQueue = searchQueue
+        .catch(() => {})
+        .then(() => runSearch(msg));
+      await searchQueue;
     } else if (msg.kind === "cancel") {
       generation++;
     }

@@ -10,20 +10,23 @@ import HexBoard, {
   type LastMove,
   type MovingState,
 } from "./HexBoard";
-import EvalBar from "./EvalBar";
-import AnalysisPanel, { type AnalysisMove } from "./AnalysisPanel";
+import WinBar from "./WinBar";
+import AnalysisPanel, { DEPTHS, type DepthKey } from "./AnalysisPanel";
 import PlayerPlate from "./PlayerPlate";
 import { buildHoverPreview } from "@/lib/boardPreview";
 import ReviewView, { type ReviewGame } from "./ReviewView";
 import { useEngine } from "@/lib/engine/useEngine";
-import type { AiSide, Opening, SearchResultMsg } from "@/lib/engine/protocol";
+import type {
+  AiSide,
+  Opening,
+  SearchSnapshot,
+} from "@/lib/engine/protocol";
 
 type WasmModule = typeof import("abalone-wasm");
 
 const DRAG_THRESHOLD = 10;
 const SNAP_RADIUS = HEX_SIZE * 0.85;
 const POSITIVE_DIR_SHIFTS = [1, 10, 9];
-const ANALYSIS_TOP_N = 5;
 
 /** Leaves per forward pass. The network costs roughly the same for one
  *  position as for sixteen, so this is close to a free 16x — but each extra
@@ -32,7 +35,20 @@ const ANALYSIS_TOP_N = 5;
 const NN_BATCH_SIZE = 16;
 
 type Mode = "play" | "analysis" | "review";
-type EngineKind = "heuristic" | "network";
+
+/** What the engine currently believes about one position, plus enough state to
+ *  say whether it is still working on it. Progress ticks and the final result
+ *  write the same shape, so the panel renders live rows for the position on
+ *  screen instead of blanking until the budget is spent. */
+interface EngineRead {
+  /** The position these numbers describe, as `positionKey`. */
+  key: string;
+  snapshot: SearchSnapshot;
+  done: boolean;
+  visits: number;
+  target: number;
+  elapsedMs: number | null;
+}
 
 /** Difficulty is simulations under a friendlier name. The jumps are roughly
  *  geometric because strength goes with the log of the search budget, so
@@ -98,6 +114,10 @@ export default function GameView() {
   // removes the only other copy of the game state.
   const [opening, setOpening] = useState<Opening>("standard");
   const [history, setHistory] = useState<number[]>([]);
+  // Moves taken back but not yet overwritten, newest last. Undo alone made
+  // stepping through a line one-way: you could walk back into a position and
+  // had no way to walk out of it again except by replaying it by hand.
+  const [future, setFuture] = useState<number[]>([]);
 
   const [selection, setSelection] = useState<number[]>([]);
   const [drag, setDrag] = useState<{
@@ -114,21 +134,27 @@ export default function GameView() {
   // into. It also makes the flipped board the default orientation.
   const [playerSide, setPlayerSide] = useState<0 | 1>(0);
   const [difficulty, setDifficulty] = useState<DifficultyKey>("club");
-  const [engineKind, setEngineKind] = useState<EngineKind>("network");
-  const [analysisSims, setAnalysisSims] = useState(400);
+  const [depth, setDepth] = useState<DepthKey>("standard");
   const [hoveredAnalysisIdx, setHoveredAnalysisIdx] = useState<number | null>(
     null
   );
+  // Which side sits at the bottom in analysis. In play it follows the colour
+  // you picked, but analysis has no "your" colour to follow — so it was
+  // hardwired to White with no way to turn the board around.
+  const [analysisFlipped, setAnalysisFlipped] = useState(false);
+  /** A move within a shown line, being previewed on the board: the line's move
+   *  indices and how far along it to replay. */
+  const [linePreview, setLinePreview] = useState<{
+    moves: number[];
+    step: number;
+  } | null>(null);
 
   // Snapshotted when review is entered, so "New game" cannot pull the record
   // out from under the review that is reading it.
   const [review, setReview] = useState<ReviewGame | null>(null);
 
   const engine = useEngine();
-  const [neural, setNeural] = useState<{
-    key: string;
-    result: SearchResultMsg;
-  } | null>(null);
+  const [neural, setNeural] = useState<EngineRead | null>(null);
 
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
@@ -185,9 +211,10 @@ export default function GameView() {
 
   const playing = mode === "play";
   const reviewing = mode === "review";
+  const depthSims = (DEPTHS.find((d) => d.key === depth) ?? DEPTHS[1]).sims;
   const simulations = playing
     ? (DIFFICULTIES.find((d) => d.key === difficulty) ?? DIFFICULTIES[2]).sims
-    : analysisSims;
+    : depthSims;
 
   const inProgress =
     !!wasm && !!snapshot && snapshot.state === wasm.WasmGameState.InProgress;
@@ -198,8 +225,8 @@ export default function GameView() {
 
   // The board renders Black at the top, which reads correctly when you are
   // White. Playing Black turns it around, so your own marbles are always the
-  // near side.
-  const flipped = playing && playerSide === 0;
+  // near side; in analysis there is no "your" side, so it is yours to set.
+  const flipped = playing ? playerSide === 0 : analysisFlipped;
   const bottomSide: 0 | 1 = flipped ? 0 : 1;
   // A flipped board means a drag toward the bottom of the screen is a drag
   // toward the top of the board. Mirroring the pointer delta the moment it is
@@ -209,9 +236,13 @@ export default function GameView() {
 
   const applyMove = useCallback((idx: number) => {
     setHistory((h) => [...h, idx]);
+    // Playing a move commits to it; anything taken back beyond this point is
+    // now a line that never happened.
+    setFuture((f) => (f[f.length - 1] === idx ? f.slice(0, -1) : []));
     setSelection([]);
     setDrag(null);
     setHoveredAnalysisIdx(null);
+    setLinePreview(null);
   }, []);
 
   // `applyMove` is stable, but reading it through a ref keeps the search
@@ -220,55 +251,83 @@ export default function GameView() {
   const applyMoveRef = useRef(applyMove);
   applyMoveRef.current = applyMove;
 
-  // Heuristic analysis is synchronous and cheap enough to run inline.
-  const heuristicAnalysis = useMemo(() => {
-    if (!wasm || !game || !snapshot) return null;
-    if (playing || engineKind !== "heuristic") return null;
-    if (snapshot.legalCount === 0) return null;
-    const r = game.analyze(simulations);
-    if (!r) return null;
-    const indices = Array.from(r.indices());
-    const evals = Array.from(r.evals());
-    const visits = Array.from(r.visits());
-    const rootEval = r.root_eval();
-    r.free();
-    const moves: AnalysisMove[] = indices.map((idx, i) => ({
-      idx,
-      notation: wasm.move_notation(idx),
-      evalWhite: evals[i],
-      visits: visits[i],
-    }));
-    moves.sort((a, b) => b.visits - a.visits);
-    const totalVisits = visits.reduce((s, v) => s + v, 0);
-    return { rootEval, topMoves: moves.slice(0, ANALYSIS_TOP_N), totalVisits };
-  }, [wasm, game, snapshot, playing, engineKind, simulations]);
+  // Undo takes back a full round-trip when the network is playing, so you land
+  // back on your own move rather than immediately watching it replay the
+  // position you just left.
+  const undo = useCallback(() => {
+    const back = playing && history.length >= 2 ? 2 : 1;
+    const cut = Math.max(0, history.length - back);
+    if (cut === history.length) return;
+    // Newest-last, so a redo pops the move that was taken back most recently.
+    const taken = history.slice(cut).reverse();
+    setHistory(history.slice(0, cut));
+    setFuture((f) => [...f, ...taken]);
+    setSelection([]);
+    setDrag(null);
+    setHoveredAnalysisIdx(null);
+    setLinePreview(null);
+  }, [history, playing]);
+
+  const redo = useCallback(() => {
+    if (future.length === 0) return;
+    const next = future[future.length - 1];
+    setFuture((f) => f.slice(0, -1));
+    setHistory((h) => [...h, next]);
+    setSelection([]);
+    setDrag(null);
+    setHoveredAnalysisIdx(null);
+    setLinePreview(null);
+  }, [future]);
 
   // In play mode the network searches only on its own turn — it should not be
   // computing (or displaying) an opinion while you are thinking. In analysis it
   // evaluates every position, and that same search fills the panel.
   const wantNetwork =
-    mode !== "review" &&
-    inProgress &&
-    (snapshot?.legalCount ?? 0) > 0 &&
-    (playing ? isAiTurn : engineKind === "network");
+    mode !== "review" && inProgress && (snapshot?.legalCount ?? 0) > 0;
 
-  const { search: engineSearch } = engine;
+  const { search: engineSearch, cancel: engineCancel } = engine;
   useEffect(() => {
     if (!wantNetwork) return;
     let cancelled = false;
     const key = positionKey;
-    engineSearch({
-      opening,
-      moves: history,
-      simulations,
-      batchSize: NN_BATCH_SIZE,
-    }).then((res) => {
+    engineSearch(
+      { opening, moves: history, simulations, batchSize: NN_BATCH_SIZE },
+      // Every tick is a complete answer for *this* position, just a less
+      // settled one. Rendering it as it arrives is what removes the window
+      // where the panel had nothing to show and said so in the worst possible
+      // way — "No legal moves." — for the whole duration of every search.
+      (p) => {
+        if (cancelled || !p.snapshot) return;
+        setNeural({
+          key,
+          snapshot: p.snapshot,
+          done: false,
+          visits: p.visits,
+          target: p.simulations,
+          elapsedMs: null,
+        });
+      }
+    ).then((res) => {
       if (cancelled || !res) return;
-      setNeural({ key, result: res });
-      if (isAiTurn && res.bestIdx >= 0) applyMoveRef.current(res.bestIdx);
+      setNeural({
+        key,
+        snapshot: res.snapshot,
+        done: true,
+        visits: res.snapshot.totalVisits,
+        target: simulations,
+        elapsedMs: res.elapsedMs,
+      });
+      if (isAiTurn && res.snapshot.bestIdx >= 0) {
+        applyMoveRef.current(res.snapshot.bestIdx);
+      }
     });
     return () => {
       cancelled = true;
+      // Abandon the in-flight search rather than letting it run out its budget
+      // against a position nobody is looking at any more. Matters most when
+      // the budget itself is what changed: switching to Deep mid-search should
+      // stop the Quick one, not race it.
+      engineCancel();
     };
   }, [
     wantNetwork,
@@ -278,22 +337,32 @@ export default function GameView() {
     isAiTurn,
     simulations,
     engineSearch,
+    engineCancel,
   ]);
 
-  const neuralFresh = neural?.key === positionKey ? neural.result : null;
+  const neuralFresh = neural?.key === positionKey ? neural : null;
+  const analysis = neuralFresh?.snapshot ?? null;
+  const thinking = wantNetwork && !(neuralFresh?.done ?? false);
 
-  const analysis =
-    engineKind === "network"
-      ? neuralFresh
-        ? {
-            rootEval: neuralFresh.rootEval,
-            topMoves: neuralFresh.topMoves,
-            totalVisits: neuralFresh.totalVisits,
-          }
-        : null
-      : heuristicAnalysis;
-
-  const thinking = wantNetwork && !neuralFresh;
+  // Analysis only. In play the arrows would mean taking back the engine's
+  // reply as well as your own, which is a different thing from stepping
+  // through a line and deserves the explicit button it already has.
+  const analysing = mode === "analysis";
+  useEffect(() => {
+    if (!analysing) return;
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "ArrowLeft") undo();
+      else if (e.key === "ArrowRight") redo();
+      else if (e.key === "f" || e.key === "F") setAnalysisFlipped((f) => !f);
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [analysing, undo, redo]);
 
   const finalizeGesture = useCallback(() => {
     const d = dragRef.current;
@@ -443,7 +512,7 @@ export default function GameView() {
   }, [wasm, game, history]);
 
   const hoverPreview: MovingState | null = useMemo(() => {
-    if (drag) return null;
+    if (drag || linePreview) return null;
     if (hoveredAnalysisIdx == null || !game || !snapshot || !wasm) return null;
     return buildHoverPreview(
       game,
@@ -452,15 +521,48 @@ export default function GameView() {
       snapshot.turn,
       hoveredAnalysisIdx
     );
-  }, [drag, hoveredAnalysisIdx, game, snapshot, wasm]);
+  }, [drag, linePreview, hoveredAnalysisIdx, game, snapshot, wasm]);
 
   const moving = dragMoving ?? hoverPreview;
+
+  // The board a few moves into a line the engine is showing. Built by replaying
+  // from the opening, then read and freed inside this memo — the review made
+  // the rule explicit and it holds here too: never let a wasm handle outlive a
+  // render, because strict-mode remount will hand back one it already freed.
+  const lineView = useMemo(() => {
+    if (!wasm || !linePreview) return null;
+    const played = linePreview.moves.slice(0, linePreview.step + 1);
+    if (played.length === 0) return null;
+    const g =
+      opening === "belgian" ? wasm.WasmGame.belgian_daisy() : new wasm.WasmGame();
+    try {
+      for (const idx of history) g.apply_index(idx);
+      for (const idx of played) g.apply_index(idx);
+      const cells = new Int8Array(81);
+      for (let c = 0; c < 81; c++) cells[c] = g.cell(c);
+
+      const last = played[played.length - 1];
+      const from = Array.from(g.move_source_cells(last)).filter(
+        (c) => c !== 0xff
+      );
+      const shift = DIR_SHIFTS[wasm.move_motion_dir(last)];
+      return {
+        cells,
+        lastMove: { fromCells: from, toCells: from.map((c) => c + shift) },
+        lostBlack: g.lost(wasm.WasmSide.Black),
+        lostWhite: g.lost(wasm.WasmSide.White),
+        turn: g.turn() as 0 | 1,
+        depth: played.length,
+      };
+    } finally {
+      g.free();
+    }
+  }, [wasm, linePreview, opening, history]);
 
   if (!wasm || !game || !snapshot) {
     return <div style={{ color: "var(--muted)" }}>Loading engine…</div>;
   }
 
-  const turnLabel = snapshot.turn === 0 ? "Black" : "White";
   const stateLabel =
     snapshot.state === wasm.WasmGameState.InProgress
       ? "In progress"
@@ -470,28 +572,15 @@ export default function GameView() {
           ? "White wins"
           : "Draw";
 
-  // Eval bar source: prefer the search's root eval; fall back to the static
-  // heuristic while the network is still thinking about this position.
-  const evalForBar = analysis ? analysis.rootEval : game.eval_white_pov();
-
   const reset = (kind: Opening) => {
     setOpening(kind);
     setHistory([]);
+    setFuture([]);
     setSelection([]);
     setDrag(null);
     setHoveredAnalysisIdx(null);
+    setLinePreview(null);
     setNeural(null);
-  };
-
-  // Undo takes back a full round-trip when the network is playing, so you land
-  // back on your own move rather than immediately watching it replay the
-  // position you just left.
-  const undo = () => {
-    const back = playing && history.length >= 2 ? 2 : 1;
-    setHistory((h) => h.slice(0, Math.max(0, h.length - back)));
-    setSelection([]);
-    setDrag(null);
-    setHoveredAnalysisIdx(null);
   };
 
   const startReview = () => {
@@ -526,7 +615,6 @@ export default function GameView() {
   };
 
   const engineFooter = (() => {
-    if (engineKind !== "network") return "Hand-written evaluator, no network.";
     if (engine.status === "error") {
       return `Network unavailable: ${engine.error ?? "unknown error"}`;
     }
@@ -535,11 +623,13 @@ export default function GameView() {
     }
     const provider = engine.info?.provider ?? "wasm";
     const threads = engine.info?.threads ?? 1;
-    const timing = neuralFresh
-      ? ` · ${(neuralFresh.elapsedMs / 1000).toFixed(1)}s · ${Math.round(
-          (neuralFresh.totalVisits / neuralFresh.elapsedMs) * 1000
-        )} sims/s`
-      : "";
+    const elapsed = neuralFresh?.done ? neuralFresh.elapsedMs : null;
+    const timing =
+      elapsed && elapsed > 0
+        ? ` · ${(elapsed / 1000).toFixed(1)}s · ${Math.round(
+            (neuralFresh!.snapshot.totalVisits / elapsed) * 1000
+          )} sims/s`
+        : "";
     return `best.onnx · ${provider}${provider === "wasm" ? ` ×${threads}` : ""}${timing}`;
   })();
 
@@ -552,9 +642,14 @@ export default function GameView() {
   const topSide: 0 | 1 = bottomSide === 0 ? 1 : 0;
   const sideName = (s: 0 | 1) => (s === 0 ? "Black" : "White");
   // Captures are the *opponent's* losses: you score by pushing their marbles
-  // off, and six of them ends the game.
+  // off, and six of them ends the game. While a line is being shown these
+  // track the previewed position — a line whose whole point is a capture
+  // should show the capture.
   const capturesBy = (s: 0 | 1) =>
-    s === 1 ? snapshot.lostBlack : snapshot.lostWhite;
+    s === 1
+      ? (lineView?.lostBlack ?? snapshot.lostBlack)
+      : (lineView?.lostWhite ?? snapshot.lostWhite);
+  const shownTurn = lineView?.turn ?? snapshot.turn;
   const difficultyLabel =
     DIFFICULTIES.find((d) => d.key === difficulty)?.label ?? "";
 
@@ -573,8 +668,8 @@ export default function GameView() {
               : undefined
         }
         captures={capturesBy(s)}
-        isTurn={!gameOver && snapshot.turn === s}
-        thinking={thinking && snapshot.turn === s}
+        isTurn={!gameOver && shownTurn === s}
+        thinking={thinking && !lineView && snapshot.turn === s}
       />
     );
   };
@@ -733,15 +828,13 @@ export default function GameView() {
               </select>
             </>
           ) : (
-            <select
-              className="select"
-              aria-label="Evaluator"
-              value={engineKind}
-              onChange={(e) => setEngineKind(e.target.value as EngineKind)}
+            <button
+              className="btn"
+              onClick={() => setAnalysisFlipped((f) => !f)}
+              title="Turn the board around (F)"
             >
-              <option value="network">Trained network</option>
-              <option value="heuristic">Heuristic</option>
-            </select>
+              Flip board
+            </button>
           )}
 
           {!reviewing && (
@@ -762,9 +855,22 @@ export default function GameView() {
             className="btn"
             onClick={undo}
             disabled={history.length === 0}
+            title={playing ? "Take back your move" : "Step back (←)"}
           >
             Undo
           </button>
+          {/* Only in analysis: in play, "redo" would mean replaying the
+              engine's reply for it, which is not a move you own. */}
+          {!playing && (
+            <button
+              className="btn"
+              onClick={redo}
+              disabled={future.length === 0}
+              title="Step forward (→)"
+            >
+              Redo
+            </button>
+          )}
           {/* Reachable mid-game as well as from the result banner: "why am I
               losing this?" is the same question as "where did I go wrong?",
               asked earlier. */}
@@ -805,21 +911,25 @@ export default function GameView() {
           onExit={() => setMode(playing ? "play" : "analysis")}
         />
       ) : (
-
+      // Wraps rather than overflowing: at 280px of panel plus a board that
+      // cannot shrink, a narrow window used to push the eval bar off the left
+      // edge and hand you a horizontal scrollbar. The board keeps its natural
+      // size — its drag maths is in unscaled SVG units — and the panel drops
+      // underneath it instead.
       <div
         style={{
           display: "flex",
           gap: 18,
           alignItems: "flex-start",
           justifyContent: "center",
+          flexWrap: "wrap",
         }}
       >
         {!playing && (
-          <EvalBar
-            evalWhitePov={evalForBar}
-            wdlWhite={neuralFresh?.rootNet?.wdlWhite ?? null}
-            expectedScoreWhite={neuralFresh?.rootNet?.expectedScoreWhite ?? null}
+          <WinBar
+            wdlWhite={analysis?.rootWdlWhite ?? null}
             bottomSide={bottomSide}
+            busy={thinking}
           />
         )}
 
@@ -835,13 +945,13 @@ export default function GameView() {
         >
           {plateFor(topSide)}
           <HexBoard
-            cells={snapshot.cells}
-            selection={selection}
+            cells={lineView?.cells ?? snapshot.cells}
+            selection={lineView ? [] : selection}
             moving={moving}
-            lastMove={lastMove}
+            lastMove={lineView?.lastMove ?? lastMove}
             onCellPointerDown={onCellPointerDown}
             flipped={flipped}
-            idle={!!isAiTurn}
+            idle={!!isAiTurn || !!lineView}
           />
           {plateFor(bottomSide)}
 
@@ -856,7 +966,13 @@ export default function GameView() {
             }}
           >
             <span>Ply {snapshot.ply}</span>
-            {playing && (
+            {lineView && (
+              <span style={{ color: "var(--highlight)" }}>
+                · showing the line, {lineView.depth} move
+                {lineView.depth === 1 ? "" : "s"} ahead
+              </span>
+            )}
+            {playing && !lineView && (
               <>
                 <span>·</span>
                 <span>{engineFooter}</span>
@@ -874,20 +990,29 @@ export default function GameView() {
           <AnalysisPanel
             topMoves={analysis?.topMoves ?? []}
             totalVisits={analysis?.totalVisits ?? 0}
-            turnLabel={turnLabel}
+            turnSide={snapshot.turn}
             hoveredIdx={hoveredAnalysisIdx}
-            onHover={setHoveredAnalysisIdx}
+            onHover={(idx) => {
+              setHoveredAnalysisIdx(idx);
+              if (idx === null) setLinePreview(null);
+            }}
+            onHoverLine={(rootIdx, step) => {
+              if (step === null) {
+                setLinePreview(null);
+                return;
+              }
+              const m = analysis?.topMoves.find((t) => t.idx === rootIdx);
+              if (m) setLinePreview({ moves: m.pv, step });
+            }}
             onApply={applyAnalysisMove}
-            simulations={analysisSims}
-            onSimulationsChange={setAnalysisSims}
-            engineLabel={
-              engineKind === "network" ? "Network" : "Heuristic engine"
-            }
+            depth={depth}
+            onDepthChange={setDepth}
             busy={thinking}
-            busyVisits={engine.progress?.visits ?? 0}
+            busyVisits={neuralFresh?.visits ?? 0}
+            busyTarget={simulations}
             footer={engineFooter}
-            wdlWhite={neuralFresh?.rootNet?.wdlWhite ?? null}
-            expectedScoreWhite={neuralFresh?.rootNet?.expectedScoreWhite ?? null}
+            marginWhite={analysis?.rootMarginWhite ?? null}
+            terminal={gameOver}
           />
         )}
       </div>
@@ -909,7 +1034,7 @@ export default function GameView() {
           ? "Scrub with the slider or the ← → keys. Click the graph or a move to jump there; hover a flagged move to see what the engine wanted instead."
           : playing
             ? "Click a marble to select it, or click along a line for a 2- or 3-piece group. Drag to move — the group snaps onto a legal landing when you get close."
-            : "Click a marble to select it, or click along a line for a 2- or 3-piece group. Drag to move. Hover a suggested move to preview it, click to play it."}
+            : "Drag a marble, or click along a line for a 2- or 3-piece group. Hover a suggested move to see it on the board and click to play it; hover along its line to walk the board forward. ← → step, F flips."}
       </p>
       </div>
     </div>

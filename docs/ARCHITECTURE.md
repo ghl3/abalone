@@ -116,6 +116,39 @@ path.
 entirely. It remains only as a fixed benchmark opponent for the Elo ladder and as
 a test fixture — never as a teacher.
 
+**Outcome statistics** (`track_outcome_stats`, default off) are an analysis
+readout bolted to the side of the search, and the design is deliberately
+defensive about staying that way.
+
+Search backs up one scalar. `collapse_value` reduces the three-way value head to
+`P(win) − P(loss)` before anything is stored, and the score head is not consumed
+at all — so a tree holds no draw probability and no marble margin, and neither
+can be recovered from it afterwards. That is why the browser once resorted to
+re-reading the network per candidate move, and why the numbers it showed were an
+unsearched first impression wearing a searched label.
+
+With tracking on, the full distribution and the expected margin are accumulated
+alongside the scalar: identical paths, identical visit weighting, and the same
+point-of-view flip at each ply — swap win and loss, negate the margin, draw is
+invariant. Four things keep it from touching the AlphaZero search self-play runs:
+
+- **Selection never reads it.** PUCT reads `Node::total_value` and nothing else,
+  so the accumulators are write-only from the search's perspective. This is
+  structural, not a convention.
+- **`Node` is unchanged.** The accumulators live in side vectors parallel to the
+  arena, allocated only when tracking is on, so with it off the node layout and
+  memory footprint are identical rather than merely equivalent.
+- **`LeafEval` is unchanged.** The extra distributions arrive through a separate
+  `submit_with_stats`; `submit` is byte-for-byte the path the trainer takes.
+- **The virtual loss has a matching term.** A pending visit contributes
+  `[(1+vl)/2, 0, (1−vl)/2]`, whose collapse is exactly `virtual_loss`, so the
+  two accumulators stay consistent *during* a batch and not merely after it.
+
+The invariant `P(win) − P(loss) == eval` holds at every node by construction and
+is asserted across batch sizes in the tests. It is the only cheap check on the
+flips: apply one at the wrong parity and the distribution still looks like a
+distribution — it just describes the position backwards.
+
 ### 2.3 `abalone-selfplay` — trajectory generation and inference
 
 The bridge between search and training data.
@@ -443,12 +476,69 @@ Two tabs, because the two jobs want opposite things from the same engine:
 - **Play vs engine** — pick a side and a difficulty (a named simulation budget,
   from `Beginner` = raw policy with no search up to `Maximum` = 1600). The board
   rotates 180° when you take Black so your own marbles are always the near side,
-  and the pointer delta is mirrored with it. No eval bar and no move list: the
+  and the pointer delta is mirrored with it. No win bar and no move list: the
   network searches on its own turn only, so it is neither computing nor
   displaying an opinion while you think.
-- **Analysis** — both sides played by hand, with the eval bar, the ranked move
-  list, hover preview and click-to-play, and a choice of evaluator (trained
-  network or the heuristic benchmark).
+- **Analysis** — both sides played by hand, with the win bar (`WinBar.tsx`), the
+  ranked move list, hover preview and click-to-play. Board orientation is a
+  control here rather than a consequence of the colour you picked (`F`), and
+  `← →` step back and forward through the line you have entered.
+
+There is no evaluator picker. Analysis briefly offered a choice between the
+network and the hand-written heuristic, which stopped being a question worth
+asking once the network was unambiguously the stronger of the two; the
+`WasmGame::analyze` and `eval_white_pov` bindings that existed to serve it are
+gone with it. The heuristic itself remains in `abalone-mcts` where the trainer
+and the benchmarks use it.
+
+**The search budget is three named settings** — Quick (120), Standard (500),
+Deep (2000) — not a slider. Strength goes with the log of the budget, so a
+50-step slider over 50–2000 offered forty settings nobody could distinguish;
+worse, it searched on every step of a drag, so crossing the range spawned and
+abandoned dozens of searches.
+
+**The panel refines rather than blanks.** Progress messages carry the whole
+tree, not a counter (§7.4), so the rows on screen are always this position's,
+updating as visits accumulate. The earlier design showed nothing at all until
+the budget was spent — and, because "no rows" and "no legal moves" were the
+same state, spent every search telling you the position was over.
+
+**The panel speaks in probabilities, and they are searched.** Each ranked move
+shows the chance the game is won, drawn or lost from there, plus the expected
+final capture differential in marbles. Both come out of the tree — see the
+outcome statistics in §2.2 — not from a forward pass on the resulting position.
+
+That distinction is the whole design. An earlier version read the network's
+heads directly for each candidate move, which put a searched eval and an
+unsearched first impression side by side in the same table with nothing saying
+which was which. On the opening position the two disagree by eight points:
+the raw network says White 49% / draw 7% / Black 44%, and 500 simulations say
+White 41% / Black 52%. Displaying the first while ranking by the second is not
+a presentation choice, it is a wrong number.
+
+**One scale, not three.** `eval` and win/draw/loss are the same axis in
+different units, so only the probabilities are shown; the marble margin is a
+genuinely different axis and survives alongside them, because probabilities
+saturate — at 92% they stop discriminating between grinding out one marble and
+taking four, which is exactly where a human still wants to know.
+
+The signed eval appears **nowhere in the UI**: not in the table, not in the move
+detail, not on the win bar. It remains the tree's internal scalar and the thing
+the `P(win) − P(loss)` invariant is asserted against, but that check belongs in
+the Rust tests where it fails loudly, not on screen where it asks a reader to
+notice. Visit counts went the same way — the row's background bar shows search
+concentration without a unit, which is the only part of "412 visits" that meant
+anything without also knowing the budget.
+
+What is left follows one rule: numbers are White-positive, and colour names the
+*side* (the marble ramp) rather than good-versus-bad, which would invert every
+ply. `web/lib/outcomeFormat.ts` owns it.
+
+**Each ranked move carries the line search explored under it** — the
+most-visited path from that root child, walked off the tree the search already
+built (`Search::principal_variation`), so it costs no extra inference. Hovering
+a move in that line replays the board to it, which is the cheapest way to make
+"why is this move ranked first" answerable without playing it.
 
 ### 7.2 Game review — your own games
 
@@ -462,15 +552,23 @@ turns, so the interesting half of the record — yours — has never been looked
 at. Afterwards it is cheap: a position costs well under a tenth of a second on
 WebGPU, so a full game is seconds.
 
-Each move is then graded by what the eval did across it, from the mover's POV,
-into best / good / inaccuracy / blunder. The bands are deliberately wide and
-the grades few: the underlying eval is a 3M-parameter network at a few hundred
-simulations, and a scale nobody trusts is worse than a coarse one they do.
+Each move is then graded by **the winning chance the mover gave up**, in
+percentage points, into best / good / inaccuracy / blunder. Points rather than
+eval units for the same reason the analysis panel dropped the eval column:
+"this cost you 6 points of winning chances" is a sentence, and `−0.12` is a
+unit that has to be taught. It is the same measurement — `Δwin ≈ Δeval / 2` at
+a fixed draw share — so the 4-point and 10-point bands are the old 0.08 and 0.2
+restated, not loosened. The bands are deliberately wide and the grades few: the
+underlying estimate is a 3M-parameter network at a few hundred simulations, and
+a scale nobody trusts is worse than a coarse one they do.
 
 The screen is a board with a ply scrubber (slider, transport buttons, ← →),
-an eval graph over the game, and the move list. The graph plots on a square
+a graph over the game, and the move list. The graph's curve is `rootEval`,
+which is *identically* `P(win) − P(loss)` — so its shape is already a
+probability difference, and only the readout needed changing: the tooltip gives
+the full win/draw/loss triple rather than a signed decimal. It plots on a square
 root scale — real games sit inside ±0.2, which a linear [-1, 1] axis renders as
-a flat line — with the raw number in the tooltip. Hovering a flagged move
+a flat line. Hovering a flagged move
 previews what the engine wanted instead, using the same overlay the analysis
 panel uses.
 
@@ -517,8 +615,17 @@ fallback; the provider that took is reported in the analysis panel. The worker
 keeps the UI thread responsive during search. The network is the same ONNX
 artifact the trainer exports, served from `web/public/models/`.
 
-Three things are load-bearing and easy to get wrong:
+Four things are load-bearing and easy to get wrong:
 
+- **One `run()` per session, ever.** `onmessage` is `async`, so two searches
+  posted in quick succession — a position change, a depth change, React's
+  strict-mode double mount — will both be inside `session.run` at once unless
+  something stops them. `onnxruntime-web` permits exactly one run per session:
+  the second throws `Session mismatch` and the engine wedges for the rest of
+  the page's life. The worker therefore chains `runSearch` calls through a
+  promise queue. Bumping `generation` first is what keeps the wait short — the
+  superseded search returns as soon as its current forward pass resolves,
+  rather than spending its whole budget on a position nobody is looking at.
 - **Masking and collapsing happen in Rust**, not JS. The worker hands
   `policy_logits` and `value` back to `WasmSearch::submit` exactly as the graph
   emitted them; the legal-move gather, the softmax over them and the
@@ -530,12 +637,19 @@ Three things are load-bearing and easy to get wrong:
   against the hashed webpack chunk URL and the first session 404s, so
   `scripts/copy-ort-assets.mjs` stages the binaries into `public/ort/`.
 
-The root position's own heads come free: the search's first batch *is* the root
-expansion, so the worker reads `value` and `score` from that pass and reports
-the outcome distribution and expected capture differential alongside the
-searched Q. They are kept distinct on purpose — the searched Q is a backed-up
-scalar that cannot be decomposed into probabilities, and the gap between the two
-is exactly what search found.
+The `score` head rides along with `policy_logits` and `value` into
+`WasmSearch::submit`, which softmaxes both and hands the distributions to
+`submit_with_stats`. Everything the panel displays therefore comes off the tree
+in one read, and there is no second forward pass anywhere on this path — an
+earlier design ran one per progress tick to annotate the ranked moves, which
+cost about 8% of throughput to produce numbers that were not searched.
+
+Progress messages carry a full `SearchSnapshot` — ranked moves, visit counts,
+win/draw/loss, margins, principal variations — and not just a visit count, which
+is what lets the panel refine in place. It stays cheap because it is bounded by
+wall-clock (120 ms) rather than by batch count, and because notation and the PV
+walk are done only for the five rows that will be displayed rather than for all
+~50 legal moves.
 
 ### 7.5 Game format and notation
 

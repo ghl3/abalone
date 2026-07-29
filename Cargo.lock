@@ -52,7 +52,6 @@ dependencies = [
  "abalone-game",
  "abalone-mcts",
  "getrandom 0.2.17",
- "rand",
  "wasm-bindgen",
 ]
 

@@ -186,6 +186,17 @@ pub struct SearchConfig {
     /// Weight of the Dirichlet noise at the root. `0` disables it (the
     /// default: only self-play wants noise).
     pub dirichlet_eps: f32,
+    /// Accumulate the full outcome distribution and the expected capture
+    /// differential alongside the scalar PUCT backs up. **Off by default, and
+    /// read by nothing inside the search.**
+    ///
+    /// This is an analysis readout, not part of the AlphaZero search the
+    /// trainer runs. Selection reads `Node::total_value` and only that, so
+    /// turning this on cannot change which move is chosen or how the tree is
+    /// shaped — it adds two side vectors that are written during backup and
+    /// read by [`Search::result`]. With it off, the vectors are never
+    /// allocated and each backup path skips them on an empty-slice check.
+    pub track_outcome_stats: bool,
 }
 
 impl Default for SearchConfig {
@@ -198,8 +209,17 @@ impl Default for SearchConfig {
             fpu_reduction: 0.25,
             dirichlet_alpha: 0.2,
             dirichlet_eps: 0.0,
+            track_outcome_stats: false,
         }
     }
+}
+
+/// Win / draw / loss, in the point of view of whoever is to move at the node
+/// holding it. Flipping point of view swaps win and loss; draw is invariant.
+pub type Wdl = [f32; 3];
+
+fn flip(w: Wdl) -> Wdl {
+    [w[2], w[1], w[0]]
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +231,20 @@ pub struct SearchResult {
     /// `visits`. Sign convention: positive = good for the side to move at
     /// the root. Children with zero visits are reported as `0.0`.
     pub q_parent_pov: Vec<f32>,
+    /// Visit-weighted win/draw/loss for each child, root player's POV,
+    /// parallel to `visits`. Empty unless `track_outcome_stats` was set.
+    ///
+    /// Satisfies `wdl[0] - wdl[2] == q_parent_pov[i]` to float tolerance, by
+    /// construction: both are averages of the same leaves over the same
+    /// visits, and the scalar the search backs up *is* `P(win) - P(loss)`.
+    /// That identity is the check on the point-of-view flips — get one wrong
+    /// and the distribution still looks plausible while describing the
+    /// position backwards.
+    pub wdl_parent_pov: Vec<Wdl>,
+    /// Visit-weighted expected final capture differential for each child,
+    /// root player's POV (positive = the root player ends up ahead).
+    /// Empty unless `track_outcome_stats` was set.
+    pub score_parent_pov: Vec<f32>,
 }
 
 /// One in-flight simulation: the path it took and the batch slot holding the
@@ -250,6 +284,12 @@ pub struct Search {
     batch: Vec<Game>,
     batch_leaf: Vec<NodeId>,
     noise_buf: Vec<f32>,
+    /// Outcome accumulators, parallel to `nodes` and indexed the same way.
+    /// Deliberately *beside* `Node` rather than inside it: with tracking off
+    /// these stay empty, so `Node` keeps its size and layout and the trainer's
+    /// memory behaviour is identical rather than merely equivalent.
+    wdl_acc: Vec<Wdl>,
+    score_acc: Vec<f32>,
     sims_started: u32,
     sims_completed: u32,
     sims_target: u32,
@@ -275,15 +315,34 @@ impl Search {
             batch: Vec::with_capacity(batch_size),
             batch_leaf: Vec::with_capacity(batch_size),
             noise_buf: Vec::new(),
+            wdl_acc: Vec::new(),
+            score_acc: Vec::new(),
             sims_started: 0,
             sims_completed: 0,
             sims_target: cfg.simulations,
             done: false,
         };
+        s.sync_stats_len();
         if game.is_terminal() || game.legal_moves().is_empty() {
             s.done = true;
         }
         s
+    }
+
+    /// Grow the accumulators to match `nodes`. A no-op when tracking is off,
+    /// which is what keeps that path free.
+    fn sync_stats_len(&mut self) {
+        if !self.cfg.track_outcome_stats {
+            return;
+        }
+        self.wdl_acc.resize(self.nodes.len(), [0.0; 3]);
+        self.score_acc.resize(self.nodes.len(), 0.0);
+    }
+
+    /// True when the accumulators are live. Checked rather than the config flag
+    /// so a `reroot` that dropped them cannot be read as if it had not.
+    fn tracking(&self) -> bool {
+        !self.wdl_acc.is_empty()
     }
 
     /// Positions needing evaluation, parallel to the `evals` slice that
@@ -336,6 +395,36 @@ impl Search {
     /// # Panics
     /// If `evals.len()` differs from the last batch length.
     pub fn submit(&mut self, evals: &[LeafEval]) {
+        self.submit_inner(evals, None);
+    }
+
+    /// `submit` with the distributions the scalar was collapsed from.
+    ///
+    /// `wdl` is the value head as three probabilities and `score` the expected
+    /// capture differential, both in each leaf's own point of view and both
+    /// parallel to `evals`. Supplying them is what fills
+    /// [`SearchResult::wdl_parent_pov`] and [`SearchResult::score_parent_pov`];
+    /// they are otherwise unused, and the scalar in `evals` remains the only
+    /// thing that steers the search.
+    ///
+    /// Callers that do not need the readout should use [`submit`](Self::submit)
+    /// — that is the path the trainer takes, and it is unchanged.
+    pub fn submit_with_stats(
+        &mut self,
+        evals: &[LeafEval],
+        wdl: &[Wdl],
+        score: &[f32],
+    ) {
+        assert_eq!(wdl.len(), evals.len(), "submit_with_stats(): wdl length");
+        assert_eq!(score.len(), evals.len(), "submit_with_stats(): score length");
+        self.submit_inner(evals, Some((wdl, score)));
+    }
+
+    fn submit_inner(
+        &mut self,
+        evals: &[LeafEval],
+        stats: Option<(&[Wdl], &[f32])>,
+    ) {
         assert_eq!(
             evals.len(),
             self.batch.len(),
@@ -365,12 +454,21 @@ impl Search {
         }
         for i in 0..self.sims.len() {
             let sim = self.sims[i];
-            let v = evals[sim.slot as usize].value;
+            let slot = sim.slot as usize;
+            let v = evals[slot].value;
             self.backup_pending(
                 sim.path_start as usize,
                 sim.path_len as usize,
                 v,
             );
+            if let Some((wdl, score)) = stats {
+                self.backup_pending_stats(
+                    sim.path_start as usize,
+                    sim.path_len as usize,
+                    wdl[slot],
+                    score[slot],
+                );
+            }
             self.sims_completed += 1;
         }
         self.sims.clear();
@@ -410,6 +508,39 @@ impl Search {
                 }
             })
             .collect();
+        // Same negation as `q_parent_pov`: a child stores in its own POV, and
+        // the root sees the opposite of it — win and loss swap, draw does not.
+        let (wdl_parent_pov, score_parent_pov) = if self.tracking() {
+            let kids = root.child_start as usize
+                ..(root.child_start + root.child_len) as usize;
+            let w = kids
+                .clone()
+                .map(|cid| {
+                    let n = self.nodes[cid].n_visits;
+                    if n == 0 {
+                        [0.0, 0.0, 0.0]
+                    } else {
+                        let a = self.wdl_acc[cid];
+                        let inv = 1.0 / n as f32;
+                        flip([a[0] * inv, a[1] * inv, a[2] * inv])
+                    }
+                })
+                .collect();
+            let s = kids
+                .map(|cid| {
+                    let n = self.nodes[cid].n_visits;
+                    if n == 0 {
+                        0.0
+                    } else {
+                        -(self.score_acc[cid] / n as f32)
+                    }
+                })
+                .collect();
+            (w, s)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         let best = visits
             .iter()
             .max_by_key(|&&(_, n)| n)
@@ -419,7 +550,57 @@ impl Search {
             best,
             visits,
             q_parent_pov,
+            wdl_parent_pov,
+            score_parent_pov,
         })
+    }
+
+    /// The line search actually explored under `mv`: that root child, then
+    /// repeatedly the most-visited child beneath it. Starts with `mv` itself
+    /// and is capped at `max_len`. Empty if `mv` is not a child of the root,
+    /// or if the root has not been expanded yet.
+    ///
+    /// Only *visited* children are followed. An unvisited child has no
+    /// backed-up value — it is a move the search listed and never looked at —
+    /// so descending into one would report a continuation nothing believes in,
+    /// which is the opposite of what a principal variation is for. The line
+    /// therefore ends where the search's own knowledge does, and its length is
+    /// itself informative: a one-move PV means the tree is a stub.
+    pub fn principal_variation(&self, mv: Move, max_len: usize) -> Vec<Move> {
+        let mut line = Vec::new();
+        let root = self.nodes[0];
+        if max_len == 0 || !root.expanded {
+            return line;
+        }
+        let mut cur = match (root.child_start..root.child_start + root.child_len)
+            .find(|&cid| self.nodes[cid as usize].mv == mv)
+        {
+            Some(cid) => cid as usize,
+            None => return line,
+        };
+        line.push(mv);
+
+        while line.len() < max_len {
+            let n = self.nodes[cur];
+            if !n.expanded || n.child_len == 0 {
+                break;
+            }
+            let kids = n.child_start as usize..(n.child_start + n.child_len) as usize;
+            let best = self.nodes[kids.clone()]
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, c)| c.n_visits)
+                .filter(|(_, c)| c.n_visits > 0)
+                .map(|(i, _)| kids.start + i);
+            match best {
+                Some(cid) => {
+                    line.push(self.nodes[cid].mv);
+                    cur = cid;
+                }
+                None => break,
+            }
+        }
+        line
     }
 
     /// Position at the root of the tree.
@@ -466,6 +647,20 @@ impl Search {
 
         let mut nodes: Vec<Node> =
             Vec::with_capacity(node_reserve(self.cfg.simulations));
+        // The accumulators are indexed by node id, so they have to be carried
+        // through the same re-indexing the BFS applies to `nodes` — a retained
+        // subtree keeps its distributions exactly as it keeps its visits.
+        let track = self.tracking();
+        let mut wdl_acc: Vec<Wdl> = Vec::new();
+        let mut score_acc: Vec<f32> = Vec::new();
+        let carry = |wdl_acc: &mut Vec<Wdl>,
+                         score_acc: &mut Vec<f32>,
+                         old: usize| {
+            if track {
+                wdl_acc.push(self.wdl_acc[old]);
+                score_acc.push(self.score_acc[old]);
+            }
+        };
         match old_root {
             Some(cid) => {
                 let mut n = self.nodes[cid as usize];
@@ -473,6 +668,7 @@ impl Search {
                 n.child_start = 0;
                 n.child_len = 0;
                 nodes.push(n);
+                carry(&mut wdl_acc, &mut score_acc, cid as usize);
                 // BFS: siblings stay contiguous, so `(start, len)` ranges hold.
                 let mut queue: Vec<(NodeId, NodeId)> = vec![(cid, 0)];
                 let mut head = 0usize;
@@ -485,11 +681,13 @@ impl Search {
                     }
                     let start = nodes.len() as u32;
                     for k in 0..o.child_len {
-                        let mut c = self.nodes[(o.child_start + k) as usize];
+                        let old_id = (o.child_start + k) as usize;
+                        let mut c = self.nodes[old_id];
                         c.child_start = 0;
                         c.child_len = 0;
                         nodes.push(c);
-                        if self.nodes[(o.child_start + k) as usize].expanded {
+                        carry(&mut wdl_acc, &mut score_acc, old_id);
+                        if self.nodes[old_id].expanded {
                             queue.push((o.child_start + k, start + k));
                         }
                     }
@@ -497,7 +695,13 @@ impl Search {
                     nodes[new as usize].child_len = o.child_len;
                 }
             }
-            None => nodes.push(Node::root()),
+            None => {
+                nodes.push(Node::root());
+                if track {
+                    wdl_acc.push([0.0; 3]);
+                    score_acc.push(0.0);
+                }
+            }
         }
 
         let retained = nodes[0].n_visits;
@@ -512,6 +716,8 @@ impl Search {
             batch: self.batch,
             batch_leaf: self.batch_leaf,
             noise_buf: self.noise_buf,
+            wdl_acc,
+            score_acc,
             sims_started: 0,
             sims_completed: 0,
             sims_target: 0,
@@ -562,6 +768,17 @@ impl Search {
             // No network needed: the outcome is known exactly.
             let v = outcome_from_pov(state.turn, &state);
             self.backup(path_start, path_len, v);
+            if self.tracking() {
+                // A finished game is a certainty, not an estimate — and its
+                // margin is counted off the board rather than predicted, which
+                // is the one place the score accumulator carries a fact.
+                self.backup_stats(
+                    path_start,
+                    path_len,
+                    outcome_wdl(v),
+                    margin_from_pov(state.turn, &state),
+                );
+            }
             self.path_buf.truncate(path_start);
             self.sims_completed += 1;
             return;
@@ -631,6 +848,7 @@ impl Search {
         p.child_start = start;
         p.child_len = n as u32;
         p.expanded = true;
+        self.sync_stats_len();
     }
 
     /// Mix `Dir(alpha)` noise into the root's priors. No-op when
@@ -667,16 +885,36 @@ impl Search {
         }
     }
 
+    /// The virtual loss expressed as an outcome distribution, so the two
+    /// accumulators stay consistent while a batch is in flight rather than
+    /// only after it resolves. Its collapse is exactly `virtual_loss`:
+    /// `(1+vl)/2 - (1-vl)/2 = vl`. At the default `vl = 1.0` it is `[1, 0, 0]`
+    /// — a pure virtual win for the mover, which is what the scalar means.
+    fn virtual_wdl(&self) -> Wdl {
+        let vl = self.cfg.virtual_loss;
+        [(1.0 + vl) / 2.0, 0.0, (1.0 - vl) / 2.0]
+    }
+
     /// `n_visits += 1`, `total_value += virtual_loss` in each node's own POV —
     /// a virtual win for the mover there, hence a virtual loss for the parent
     /// that selected it.
     fn apply_virtual_loss(&mut self, start: usize, len: usize) {
         let vl = self.cfg.virtual_loss;
+        let vw = self.virtual_wdl();
+        let track = self.tracking();
         for i in start..start + len {
             let nid = self.path_buf[i] as usize;
             let n = &mut self.nodes[nid];
             n.n_visits += 1;
             n.total_value += vl;
+            if track {
+                // Un-flipped, like the scalar: this is each node's own POV.
+                let a = &mut self.wdl_acc[nid];
+                a[0] += vw[0];
+                a[1] += vw[1];
+                a[2] += vw[2];
+                // A virtual visit asserts nothing about the margin.
+            }
         }
     }
 
@@ -687,6 +925,25 @@ impl Search {
             let n = &mut self.nodes[nid];
             n.n_visits += 1;
             n.total_value += v * sign;
+            sign = -sign;
+        }
+    }
+
+    /// `backup` with the distributions alongside. `wdl` and `score` are in the
+    /// leaf's own POV, like `v`, and flip with it on the way up.
+    fn backup_stats(&mut self, start: usize, len: usize, wdl: Wdl, score: f32) {
+        if !self.tracking() {
+            return;
+        }
+        let mut sign = 1.0f32;
+        for i in (start..start + len).rev() {
+            let nid = self.path_buf[i] as usize;
+            let w = if sign > 0.0 { wdl } else { flip(wdl) };
+            let a = &mut self.wdl_acc[nid];
+            a[0] += w[0];
+            a[1] += w[1];
+            a[2] += w[2];
+            self.score_acc[nid] += score * sign;
             sign = -sign;
         }
     }
@@ -705,6 +962,32 @@ impl Search {
         }
     }
 
+    /// The distribution half of `backup_pending`: subtract the virtual visit's
+    /// contribution and add the real one.
+    fn backup_pending_stats(
+        &mut self,
+        start: usize,
+        len: usize,
+        wdl: Wdl,
+        score: f32,
+    ) {
+        if !self.tracking() {
+            return;
+        }
+        let vw = self.virtual_wdl();
+        let mut sign = 1.0f32;
+        for i in (start..start + len).rev() {
+            let nid = self.path_buf[i] as usize;
+            let w = if sign > 0.0 { wdl } else { flip(wdl) };
+            let a = &mut self.wdl_acc[nid];
+            a[0] += w[0] - vw[0];
+            a[1] += w[1] - vw[1];
+            a[2] += w[2] - vw[2];
+            self.score_acc[nid] += score * sign;
+            sign = -sign;
+        }
+    }
+
     /// Undo an un-submitted batch: revert its virtual loss and un-count the
     /// simulations it started.
     fn abandon_pending(&mut self) {
@@ -713,6 +996,8 @@ impl Search {
             return;
         }
         let vl = self.cfg.virtual_loss;
+        let vw = self.virtual_wdl();
+        let track = self.tracking();
         for i in 0..self.sims.len() {
             let sim = self.sims[i];
             for k in sim.path_start..sim.path_start + sim.path_len {
@@ -720,6 +1005,12 @@ impl Search {
                 let n = &mut self.nodes[nid];
                 n.n_visits -= 1;
                 n.total_value -= vl;
+                if track {
+                    let a = &mut self.wdl_acc[nid];
+                    a[0] -= vw[0];
+                    a[1] -= vw[1];
+                    a[2] -= vw[2];
+                }
             }
         }
         self.sims_started -= self.sims.len() as u32;
@@ -823,6 +1114,26 @@ fn simulate_random<R: Rng + ?Sized>(state: Game, rng: &mut R) -> f32 {
         g.apply(moves[i]);
     }
     outcome_from_pov(leaf_pov, &g)
+}
+
+/// A settled outcome as a distribution: certainty, with all the mass on one
+/// class. `v` is `+1`, `-1` or `0` from `outcome_from_pov`.
+fn outcome_wdl(v: f32) -> Wdl {
+    if v > 0.5 {
+        [1.0, 0.0, 0.0]
+    } else if v < -0.5 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+/// Final capture differential from `pov`: marbles taken off the opponent minus
+/// marbles lost. Positive means `pov` finished ahead.
+fn margin_from_pov(pov: Side, g: &Game) -> f32 {
+    let own_lost = f32::from(g.board.lost(pov));
+    let opp_lost = f32::from(g.board.lost(pov.other()));
+    opp_lost - own_lost
 }
 
 fn outcome_from_pov(pov: Side, g: &Game) -> f32 {
@@ -1018,6 +1329,10 @@ mod tests {
             best,
             visits,
             q_parent_pov,
+            // The reference implementation exists to check the scalar path;
+            // it does not model the readout.
+            wdl_parent_pov: Vec::new(),
+            score_parent_pov: Vec::new(),
         })
     }
 
@@ -1182,6 +1497,203 @@ mod tests {
                 s
             };
             assert_eq!(s.root_visits(), c.simulations, "batch_size={bs}");
+        }
+    }
+
+    /// Drive a search to completion, feeding the value head as a real
+    /// distribution rather than only its collapse. `wdl` is derived from the
+    /// fake net's scalar so the two are consistent by construction, which is
+    /// what makes the identity below a test of the *backup* rather than of the
+    /// evaluator.
+    fn run_with_stats(g: &Game, c: &SearchConfig) -> Search {
+        let mut s = Search::begin(g, c, 0);
+        loop {
+            let batch: Vec<Game> = s.next_batch().to_vec();
+            if batch.is_empty() {
+                break;
+            }
+            let evals: Vec<LeafEval> = batch.iter().map(fake_net).collect();
+            // Draw mass with the rest split so the collapse reproduces the
+            // scalar exactly: win - loss == value, win + draw + loss == 1.
+            // The mass has to shrink as |value| approaches 1 — a leaf the net
+            // is 95% sure about has no room for a 20% draw, and forcing one
+            // makes the distribution disagree with the very scalar it is
+            // supposed to decompose.
+            let wdl: Vec<Wdl> = evals
+                .iter()
+                .map(|e| {
+                    let v = e.value.clamp(-1.0, 1.0);
+                    let d = 0.2f32.min(1.0 - v.abs());
+                    [(v + 1.0 - d) / 2.0, d, (1.0 - d - v) / 2.0]
+                })
+                .collect();
+            let score: Vec<f32> = evals.iter().map(|e| e.value * 3.0).collect();
+            s.submit_with_stats(&evals, &wdl, &score);
+        }
+        s
+    }
+
+    /// The identity that guards every point-of-view flip in the distribution
+    /// backup: `P(win) - P(loss)` must reproduce the scalar the search backs up,
+    /// because both are averages of the same leaves over the same visits. A
+    /// flip applied at the wrong parity still yields a plausible-looking
+    /// distribution — it just describes the position backwards — so this is the
+    /// only cheap way to catch it.
+    #[test]
+    fn searched_wdl_reproduces_the_searched_eval() {
+        let g = Game::new_standard();
+        for &bs in &[1usize, 8, 32] {
+            let c = SearchConfig {
+                simulations: 400,
+                batch_size: bs,
+                track_outcome_stats: true,
+                ..Default::default()
+            };
+            let r = run_with_stats(&g, &c).result().unwrap();
+            assert_eq!(r.wdl_parent_pov.len(), r.visits.len());
+            assert_eq!(r.score_parent_pov.len(), r.visits.len());
+
+            for (i, &(_, n)) in r.visits.iter().enumerate() {
+                if n == 0 {
+                    continue;
+                }
+                let w = r.wdl_parent_pov[i];
+                let sum = w[0] + w[1] + w[2];
+                assert!(
+                    (sum - 1.0).abs() < 1e-3,
+                    "batch={bs} child={i}: wdl sums to {sum}, not 1"
+                );
+                assert!(
+                    w.iter().all(|p| *p >= -1e-4 && *p <= 1.0 + 1e-4),
+                    "batch={bs} child={i}: wdl {w:?} outside [0, 1]"
+                );
+                let collapsed = w[0] - w[2];
+                let q = r.q_parent_pov[i];
+                assert!(
+                    (collapsed - q).abs() < 1e-3,
+                    "batch={bs} child={i}: P(win)-P(loss) = {collapsed} but eval = {q}"
+                );
+            }
+        }
+    }
+
+    /// Tracking is a readout. Turning it on must not move a single visit, or
+    /// it is not a readout — it is a change to the search the trainer runs.
+    #[test]
+    fn tracking_outcome_stats_does_not_change_the_search() {
+        let g = Game::new_standard();
+        let base = SearchConfig {
+            simulations: 300,
+            batch_size: 8,
+            ..Default::default()
+        };
+        let tracked = SearchConfig {
+            track_outcome_stats: true,
+            ..base.clone()
+        };
+
+        let plain = {
+            let mut s = Search::begin(&g, &base, 0);
+            loop {
+                let batch: Vec<Game> = s.next_batch().to_vec();
+                if batch.is_empty() {
+                    break;
+                }
+                let evals: Vec<LeafEval> = batch.iter().map(fake_net).collect();
+                s.submit(&evals);
+            }
+            s.result().unwrap()
+        };
+        let with_stats = run_with_stats(&g, &tracked).result().unwrap();
+
+        assert_eq!(plain.best, with_stats.best);
+        assert_eq!(plain.visits, with_stats.visits);
+        for (a, b) in plain.q_parent_pov.iter().zip(&with_stats.q_parent_pov) {
+            assert_eq!(a, b, "q must be bit-identical, not merely close");
+        }
+        assert!(plain.wdl_parent_pov.is_empty(), "off by default");
+    }
+
+    /// The margin is signed for whoever is to move at the node holding it, so
+    /// it flips on the way up exactly as the scalar does. Feeding a score that
+    /// is a fixed multiple of the value makes the expected relationship
+    /// checkable at the root's children.
+    #[test]
+    fn searched_margin_follows_the_eval_sign() {
+        let g = Game::new_standard();
+        let c = SearchConfig {
+            simulations: 400,
+            batch_size: 8,
+            track_outcome_stats: true,
+            ..Default::default()
+        };
+        let r = run_with_stats(&g, &c).result().unwrap();
+        for (i, &(_, n)) in r.visits.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let expected = r.q_parent_pov[i] * 3.0;
+            assert!(
+                (r.score_parent_pov[i] - expected).abs() < 1e-2,
+                "child={i}: margin {} does not track 3x eval {expected}",
+                r.score_parent_pov[i]
+            );
+        }
+    }
+
+    /// The PV is only worth showing if it can actually be played out, so the
+    /// test walks it against a real `Game` rather than checking its length.
+    #[test]
+    fn principal_variation_is_a_playable_line() {
+        let g = Game::new_standard();
+        let c = SearchConfig {
+            simulations: 400,
+            batch_size: 8,
+            ..Default::default()
+        };
+        let mut s = Search::begin(&g, &c, 0);
+        while !s.next_batch().is_empty() {
+            let evals: Vec<LeafEval> = s.batch.iter().map(fake_net).collect();
+            s.submit(&evals);
+        }
+        let best = s.result().unwrap().best;
+
+        let pv = s.principal_variation(best, 8);
+        assert_eq!(pv[0], best, "PV must open with the move it was asked for");
+        assert!(pv.len() > 1, "400 simulations should reach past the root");
+        assert!(pv.len() <= 8, "PV must respect max_len");
+
+        let mut replay = g;
+        for (i, &mv) in pv.iter().enumerate() {
+            assert!(
+                replay.legal_moves().contains(&mv),
+                "PV move {i} is not legal in the position it is reached in"
+            );
+            replay.apply(mv);
+        }
+    }
+
+    #[test]
+    fn principal_variation_rejects_moves_outside_the_root() {
+        let g = Game::new_standard();
+        let c = cfg(50);
+        let mut s = Search::begin(&g, &c, 0);
+        // Before any submit the root is unexpanded: no line to report.
+        assert!(s.principal_variation(g.legal_moves()[0], 4).is_empty());
+
+        while !s.next_batch().is_empty() {
+            let evals: Vec<LeafEval> = s.batch.iter().map(fake_net).collect();
+            s.submit(&evals);
+        }
+        let best = s.result().unwrap().best;
+        assert!(s.principal_variation(best, 0).is_empty(), "max_len 0");
+
+        // A move that is legal *somewhere* but is not a child of this root.
+        let mut other = g;
+        other.apply(best);
+        let alien = other.legal_moves()[0];
+        if !g.legal_moves().contains(&alien) {
+            assert!(s.principal_variation(alien, 4).is_empty());
         }
     }
 

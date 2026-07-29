@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  ProgressMsg,
   ReadyMsg,
   SearchRequest,
   SearchResultMsg,
@@ -10,10 +11,12 @@ import type {
 
 export type EngineStatus = "idle" | "loading" | "ready" | "error";
 
-export interface EngineProgress {
-  visits: number;
-  simulations: number;
-}
+/** Called as the search runs, with the tree as it currently stands. Delivered
+ *  per *call* rather than through shared state on purpose: a superseded search
+ *  can still have a message in flight, and routing progress back to the caller
+ *  that asked for it is what stops the old position's rows landing in the new
+ *  position's panel. */
+export type ProgressHandler = (p: ProgressMsg) => void;
 
 /** Drives the engine worker. The worker is created on first use rather than on
  *  mount, so a visitor who never turns the network on never downloads the
@@ -23,12 +26,16 @@ export function useEngine(modelPath = "/models/best.onnx") {
   const [status, setStatus] = useState<EngineStatus>("idle");
   const [info, setInfo] = useState<ReadyMsg | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<EngineProgress | null>(null);
 
-  /** Resolvers for in-flight searches, keyed by request id. A search that is
-   *  superseded resolves `null` — the caller wanted the newest answer, not
-   *  every answer. */
-  const pending = useRef(new Map<number, (r: SearchResultMsg | null) => void>());
+  /** In-flight searches, keyed by request id. A search that is superseded
+   *  resolves `null` — the caller wanted the newest answer, not every answer —
+   *  and stops receiving progress at the same moment. */
+  const pending = useRef(
+    new Map<
+      number,
+      { resolve: (r: SearchResultMsg | null) => void; onProgress?: ProgressHandler }
+    >()
+  );
   const nextId = useRef(1);
 
   const ensureWorker = useCallback(() => {
@@ -42,19 +49,24 @@ export function useEngine(modelPath = "/models/best.onnx") {
         setStatus("ready");
         setInfo(msg);
       } else if (msg.kind === "result") {
-        setProgress(null);
-        pending.current.get(msg.id)?.(msg);
+        // A search that completes clears whatever the last one complained
+        // about. Without this a single transient failure stays pinned under
+        // the board for the rest of the session, describing an engine that
+        // has since recovered.
+        setError(null);
+        pending.current.get(msg.id)?.resolve(msg);
         pending.current.delete(msg.id);
       } else if (msg.kind === "progress") {
-        setProgress({ visits: msg.visits, simulations: msg.simulations });
+        // Nothing to route to means the search was superseded while this tick
+        // was on the wire. Dropping it is the point.
+        pending.current.get(msg.id)?.onProgress?.(msg);
       } else if (msg.kind === "error") {
         // A failed search is not a failed engine: keep `ready` so the panel
         // still reports the provider, and surface the message either way.
         setStatus((s) => (s === "ready" && msg.id !== undefined ? s : "error"));
         setError(msg.message);
-        setProgress(null);
         if (msg.id !== undefined) {
-          pending.current.get(msg.id)?.(null);
+          pending.current.get(msg.id)?.resolve(null);
           pending.current.delete(msg.id);
         }
       }
@@ -73,23 +85,27 @@ export function useEngine(modelPath = "/models/best.onnx") {
     return () => {
       workerRef.current?.terminate();
       workerRef.current = null;
-      for (const resolve of pending.current.values()) resolve(null);
+      for (const p of pending.current.values()) p.resolve(null);
       pending.current.clear();
     };
   }, []);
 
-  /** Search a position. Any earlier in-flight search is abandoned, so calling
-   *  this on every position change costs one wasted forward pass at most. */
+  /** Search a position, reporting the tree as it builds through `onProgress`.
+   *  Any earlier in-flight search is abandoned, so calling this on every
+   *  position change costs one wasted forward pass at most. */
   const search = useCallback(
-    (req: Omit<SearchRequest, "id">): Promise<SearchResultMsg | null> => {
+    (
+      req: Omit<SearchRequest, "id">,
+      onProgress?: ProgressHandler
+    ): Promise<SearchResultMsg | null> => {
       const worker = ensureWorker();
       const id = nextId.current++;
-      for (const [oldId, resolve] of pending.current) {
-        resolve(null);
+      for (const [oldId, p] of pending.current) {
+        p.resolve(null);
         pending.current.delete(oldId);
       }
       return new Promise((resolve) => {
-        pending.current.set(id, resolve);
+        pending.current.set(id, { resolve, onProgress });
         worker.postMessage({ kind: "search", id, ...req });
       });
     },
@@ -98,10 +114,9 @@ export function useEngine(modelPath = "/models/best.onnx") {
 
   const cancel = useCallback(() => {
     workerRef.current?.postMessage({ kind: "cancel" });
-    for (const resolve of pending.current.values()) resolve(null);
+    for (const p of pending.current.values()) p.resolve(null);
     pending.current.clear();
-    setProgress(null);
   }, []);
 
-  return { status, info, error, progress, search, cancel, ensureWorker };
+  return { status, info, error, search, cancel, ensureWorker };
 }

@@ -8,18 +8,19 @@
 
 use abalone_encoder::{encode_planes, PLANE_SIZE};
 use abalone_game::{decode, encode, Game, GameState, Move, Side, MOVE_SPACE};
-use abalone_mcts::eval::{evaluate, Weights};
-use abalone_mcts::{heuristic, search, LeafEval, Search, SearchConfig};
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
+use abalone_mcts::{LeafEval, Search, SearchConfig};
 use wasm_bindgen::prelude::*;
 
 /// Class order of the 3-way value head, matching `model/batch.py` and
 /// `ort_eval.rs`. The browser must collapse it the same way the trainer does
 /// or the eval bar and the search disagree with self-play.
 const VALUE_WIN: usize = 0;
+const VALUE_DRAW: usize = 1;
 const VALUE_LOSS: usize = 2;
 const VALUE_CLASSES: usize = 3;
+/// The score head is a softmax over a capture differential of −6..+6.
+const SCORE_CLASSES: usize = 13;
+const SCORE_OFFSET: usize = 6;
 
 #[wasm_bindgen]
 #[derive(Copy, Clone)]
@@ -218,71 +219,6 @@ impl WasmGame {
         format!("{}", self.inner.board)
     }
 
-    /// Heuristic eval of the current position from White's POV (positive
-    /// = White advantage, negative = Black advantage). Range [-1, 1].
-    /// O(1); useful as the eval-bar value when the analysis panel is off
-    /// or while MCTS is computing.
-    pub fn eval_white_pov(&self) -> f32 {
-        let pov_to_move =
-            evaluate(&self.inner.board, self.inner.turn, &Weights::default());
-        match self.inner.turn {
-            Side::White => pov_to_move,
-            Side::Black => -pov_to_move,
-        }
-    }
-
-    /// Run heuristic-MCTS for `simulations` iterations from the current
-    /// position and return ranked children with their Q-values (white POV)
-    /// and visit counts. Returns `None` if the game is terminal.
-    pub fn analyze(&self, simulations: u32) -> Option<AnalysisResult> {
-        if self.inner.is_terminal() {
-            return None;
-        }
-        let cfg = SearchConfig {
-            simulations: simulations.max(1),
-            c_puct: 1.4,
-            ..Default::default()
-        };
-        // Heuristic eval is deterministic given a position; rng is only
-        // needed to satisfy the search signature.
-        let mut rng = SmallRng::seed_from_u64(0);
-        let res = search(&self.inner, &cfg, &mut rng, heuristic)?;
-
-        let to_white_sign = if self.inner.turn == Side::White {
-            1.0f32
-        } else {
-            -1.0f32
-        };
-
-        let n = res.visits.len();
-        let mut indices = Vec::with_capacity(n);
-        let mut evals = Vec::with_capacity(n);
-        let mut visits = Vec::with_capacity(n);
-        for (&(mv, v), &q) in res.visits.iter().zip(res.q_parent_pov.iter()) {
-            indices.push(encode(mv));
-            evals.push(q * to_white_sign);
-            visits.push(v);
-        }
-
-        // Root eval: the Q-value of the most-visited child (the engine's
-        // recommended line) from white POV. This gives the eval bar a
-        // search-derived value, not just a static heuristic snapshot.
-        let root_eval = res
-            .visits
-            .iter()
-            .zip(res.q_parent_pov.iter())
-            .max_by_key(|((_, v), _)| *v)
-            .map(|(_, q)| *q * to_white_sign)
-            .unwrap_or(0.0);
-
-        Some(AnalysisResult {
-            indices,
-            evals,
-            visits,
-            root_eval,
-        })
-    }
-
     /// Start a network-guided search from the current position, to be driven
     /// from JS as a coroutine (see [`WasmSearch`]). Nothing is evaluated here:
     /// the caller alternates [`WasmSearch::next_batch`] and
@@ -301,6 +237,10 @@ impl WasmGame {
             // Exploration noise is a self-play device; a browser opponent
             // should play its best move, not a deliberately noised one.
             dirichlet_eps: 0.0,
+            // The browser is the analysis client, and the only caller that
+            // wants the readout. Self-play leaves this off and runs the
+            // AlphaZero search unchanged.
+            track_outcome_stats: true,
             ..Default::default()
         };
         WasmSearch {
@@ -308,6 +248,7 @@ impl WasmGame {
             batch: Vec::with_capacity(cfg.batch_size),
             planes: Vec::new(),
             root_turn: self.inner.turn,
+            score_available: false,
         }
     }
 }
@@ -337,6 +278,10 @@ pub struct WasmSearch {
     /// Reused staging buffer for the encoded batch.
     planes: Vec<f32>,
     root_turn: Side,
+    /// Whether the last `submit` carried a usable `score` head. A model
+    /// exported without one is still perfectly playable; it just has no margin
+    /// to report, and reporting zeroes would be worse than reporting nothing.
+    score_available: bool,
 }
 
 #[wasm_bindgen]
@@ -374,6 +319,7 @@ impl WasmSearch {
         &mut self,
         policy_logits: &[f32],
         value: &[f32],
+        score: &[f32],
     ) -> Result<(), JsError> {
         let n = self.batch.len();
         if n == 0 {
@@ -394,9 +340,17 @@ impl WasmSearch {
         }
         let value_dim = value.len() / n;
 
+        // A `score` row per leaf is optional: a model without the head passes
+        // an empty array and the margin column simply has nothing to show.
+        let has_score = score.len() == n * SCORE_CLASSES;
+        self.score_available = has_score;
+
         let mut evals = Vec::with_capacity(n);
+        let mut wdl = Vec::with_capacity(n);
+        let mut margins = Vec::with_capacity(n);
         for (i, g) in self.batch.iter().enumerate() {
-            let v = collapse_value(&value[i * value_dim..(i + 1) * value_dim])?;
+            let row_value = &value[i * value_dim..(i + 1) * value_dim];
+            let v = collapse_value(row_value)?;
             let row = &policy_logits[i * MOVE_SPACE..(i + 1) * MOVE_SPACE];
             let legal = g.legal_moves();
             let logits: Vec<f32> =
@@ -405,8 +359,18 @@ impl WasmSearch {
                 value: v,
                 priors: Some(softmax(logits)),
             });
+            wdl.push(distribute_value(row_value, v));
+            margins.push(if has_score {
+                expected_margin(&score[i * SCORE_CLASSES..(i + 1) * SCORE_CLASSES])
+            } else {
+                0.0
+            });
         }
-        self.inner.submit(&evals);
+        // The scalar in `evals` is the only thing that steers the search; the
+        // two extra arrays are backed up alongside it purely so the panel can
+        // report probabilities and a margin that came out of the tree rather
+        // than off a single forward pass.
+        self.inner.submit_with_stats(&evals, &wdl, &margins);
         Ok(())
     }
 
@@ -420,9 +384,13 @@ impl WasmSearch {
         self.inner.root_visits()
     }
 
-    /// Ranked root children, in the same shape [`WasmGame::analyze`] returns.
+    /// Ranked root children with their visit counts and Q-values.
     /// `None` until the first [`submit`](Self::submit) has expanded the root,
     /// and for a terminal position.
+    ///
+    /// Safe to call *during* a search, not only at the end: it reads the tree
+    /// as it stands, which is what lets the panel refine its rows as visits
+    /// accumulate instead of blanking until the budget is spent.
     pub fn result(&self) -> Option<AnalysisResult> {
         let res = self.inner.result()?;
         let to_white_sign = if self.root_turn == Side::White {
@@ -439,19 +407,68 @@ impl WasmSearch {
             evals.push(q * to_white_sign);
             visits.push(v);
         }
-        let root_eval = res
+
+        // Restated for White, like the evals. Swapping win and loss is the
+        // POV flip for a distribution; negating is the flip for a margin.
+        let white = to_white_sign > 0.0;
+        let mut wdl = Vec::with_capacity(n * 3);
+        for w in &res.wdl_parent_pov {
+            if white {
+                wdl.extend_from_slice(&[w[0], w[1], w[2]]);
+            } else {
+                wdl.extend_from_slice(&[w[2], w[1], w[0]]);
+            }
+        }
+        let margins: Vec<f32> = if self.score_available {
+            res.score_parent_pov
+                .iter()
+                .map(|s| s * to_white_sign)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // The engine's own reading of the position is the line it intends to
+        // play, so every root-level number is taken from the most-visited
+        // child rather than averaged over children it rejected.
+        let best_slot = res
             .visits
             .iter()
-            .zip(res.q_parent_pov.iter())
-            .max_by_key(|((_, v), _)| *v)
-            .map(|(_, q)| *q * to_white_sign)
-            .unwrap_or(0.0);
+            .enumerate()
+            .max_by_key(|(_, (_, v))| *v)
+            .map(|(i, _)| i);
+        let root_eval = best_slot.map_or(0.0, |i| res.q_parent_pov[i] * to_white_sign);
+        let root_wdl = best_slot
+            .filter(|_| !wdl.is_empty())
+            .map(|i| vec![wdl[i * 3], wdl[i * 3 + 1], wdl[i * 3 + 2]])
+            .unwrap_or_default();
+        let root_margin = best_slot.and_then(|i| margins.get(i).copied());
+
         Some(AnalysisResult {
             indices,
             evals,
             visits,
+            wdl,
+            margins,
             root_eval,
+            root_wdl,
+            root_margin,
         })
+    }
+
+    /// The line search explored under root move `idx`: move indices along the
+    /// most-visited path, starting with `idx` itself, capped at `max_len`.
+    /// Empty if `idx` is not a root child of this search.
+    ///
+    /// This is read off the tree the search already built — no extra
+    /// inference — so a panel can show *why* a move is ranked where it is and
+    /// not just that it was.
+    pub fn principal_variation(&self, idx: u16, max_len: usize) -> Vec<u16> {
+        self.inner
+            .principal_variation(decode(idx), max_len)
+            .into_iter()
+            .map(encode)
+            .collect()
     }
 
     /// Move index the search would play: the most-visited root child.
@@ -480,6 +497,34 @@ fn collapse_value(row: &[f32]) -> Result<f32, JsError> {
     }
 }
 
+/// The value head as three probabilities, in the same POV `collapse_value`
+/// returns its scalar in.
+///
+/// `collapsed` is passed in rather than recomputed so the two cannot drift: the
+/// search backs up that exact number, and the distribution has to decompose
+/// *it*. A width-1 head carries no draw information at all, so it is spread
+/// across win and loss — which keeps `P(win) - P(loss) == collapsed` true, and
+/// that identity is what the whole readout is checked against.
+fn distribute_value(row: &[f32], collapsed: f32) -> [f32; 3] {
+    if row.len() == VALUE_CLASSES {
+        let p = softmax(row.to_vec());
+        [p[VALUE_WIN], p[VALUE_DRAW], p[VALUE_LOSS]]
+    } else {
+        let v = collapsed.clamp(-1.0, 1.0);
+        [(v + 1.0) / 2.0, 0.0, (1.0 - v) / 2.0]
+    }
+}
+
+/// Expected final capture differential from the score head: a softmax over
+/// `-6..=6`, reduced to its mean. Side-to-move POV, like the value head.
+fn expected_margin(row: &[f32]) -> f32 {
+    let p = softmax(row.to_vec());
+    p.iter()
+        .enumerate()
+        .map(|(i, q)| q * (i as f32 - SCORE_OFFSET as f32))
+        .sum()
+}
+
 fn softmax(mut logits: Vec<f32>) -> Vec<f32> {
     if logits.is_empty() {
         return logits;
@@ -505,7 +550,14 @@ pub struct AnalysisResult {
     indices: Vec<u16>,
     evals: Vec<f32>,
     visits: Vec<u32>,
+    /// Win/draw/loss per move, White's POV, flattened three-per-move.
+    wdl: Vec<f32>,
+    /// Expected capture differential per move, White's POV. Empty if the
+    /// model has no `score` head.
+    margins: Vec<f32>,
     root_eval: f32,
+    root_wdl: Vec<f32>,
+    root_margin: Option<f32>,
 }
 
 #[wasm_bindgen]
@@ -523,10 +575,41 @@ impl AnalysisResult {
     pub fn visits(&self) -> Vec<u32> {
         self.visits.clone()
     }
+    /// Searched win/draw/loss for each move, White's POV, flattened three per
+    /// move in the same order as [`indices`](Self::indices). Empty if the
+    /// search was not tracking outcome statistics.
+    ///
+    /// These come out of the tree, not off a forward pass: every leaf the
+    /// search reached contributed its distribution, backed up and visit-
+    /// weighted exactly as the scalar eval is. `wdl[0] - wdl[2]` reproduces
+    /// [`evals`](Self::evals) — the identity the Rust tests assert.
+    pub fn wdl(&self) -> Vec<f32> {
+        self.wdl.clone()
+    }
+
+    /// Searched expected capture differential for each move, White's POV.
+    /// Empty if the model has no `score` head.
+    pub fn margins(&self) -> Vec<f32> {
+        self.margins.clone()
+    }
+
     /// Engine's evaluation of the current root position (white POV) — the
     /// Q-value of the most-visited child.
     pub fn root_eval(&self) -> f32 {
         self.root_eval
+    }
+
+    /// Win/draw/loss of the position, White's POV: the most-visited child's,
+    /// so it describes the line the engine intends rather than an average over
+    /// moves it has already rejected.
+    pub fn root_wdl(&self) -> Vec<f32> {
+        self.root_wdl.clone()
+    }
+
+    /// Expected capture differential of the position, White's POV. `None` if
+    /// the model has no `score` head.
+    pub fn root_margin(&self) -> Option<f32> {
+        self.root_margin
     }
 }
 

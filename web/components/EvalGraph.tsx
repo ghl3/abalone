@@ -3,6 +3,9 @@
 import { useState } from "react";
 import { QUALITY_COLOR, type PlyRead, type ReviewedMove } from "@/lib/engine/review";
 
+/** Bare number — the tooltip is tight and already says which side each is. */
+const pct = (p: number) => `${Math.round(p * 100)}`;
+
 interface Props {
   reads: PlyRead[];
   moves: ReviewedMove[];
@@ -144,27 +147,42 @@ export default function EvalGraph({
         />
       )}
 
+      {/* The curve is `P(win) − P(loss)`, so its *shape* is already a
+          probability difference — but the readout says so in words rather than
+          making anyone decode a signed decimal. */}
       {hover !== null && activeRead && (
         <g
-          transform={`translate(${Math.min(W - 96, Math.max(2, x(hover) + 8))}, 6)`}
+          transform={`translate(${Math.min(W - 132, Math.max(2, x(hover) + 8))}, 6)`}
           pointerEvents="none"
         >
           <rect
-            width={92}
-            height={20}
+            width={128}
+            height={32}
             rx={4}
             fill="var(--surface-raised)"
             stroke="var(--border)"
           />
           <text
             x={7}
-            y={14}
-            fontSize={11}
+            y={13}
+            fontSize={10}
+            fill="var(--faint)"
+            fontFamily="var(--mono)"
+          >
+            ply {activeRead.ply}
+          </text>
+          <text
+            x={7}
+            y={26}
+            fontSize={10}
             fill="var(--text)"
             fontFamily="var(--mono)"
           >
-            ply {activeRead.ply} · {activeRead.rootEval >= 0 ? "+" : ""}
-            {activeRead.rootEval.toFixed(2)}
+            {activeRead.wdlWhite
+              ? `W ${pct(activeRead.wdlWhite[0])} D ${pct(
+                  activeRead.wdlWhite[1]
+                )} B ${pct(activeRead.wdlWhite[2])}`
+              : `${activeRead.rootEval >= 0 ? "+" : ""}${activeRead.rootEval.toFixed(2)}`}
           </text>
         </g>
       )}

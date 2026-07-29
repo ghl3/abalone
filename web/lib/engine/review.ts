@@ -14,12 +14,24 @@ import type { Opening, ScoredMove, SearchResultMsg } from "./protocol";
 export interface PlyRead {
   /** Number of moves played before this position; 0 is the opening. */
   ply: number;
-  /** Searched Q of the best root move, White's POV. */
+  /** Searched Q of the best root move, White's POV. Identically
+   *  `P(win) − P(loss)`, which is why the graph can plot it as "who is ahead"
+   *  while every number on screen is a probability. */
   rootEval: number;
+  /** Searched `[P(win), P(draw), P(loss)]` for White. */
   wdlWhite: [number, number, number] | null;
   expectedScoreWhite: number | null;
   bestIdx: number;
   topMoves: ScoredMove[];
+}
+
+/** The mover's chance of winning, from a read. `wdlWhite` is White's, so Black
+ *  reads it from the other end. Falls back to splitting the eval when a read
+ *  predates the searched distributions. */
+export function winChanceFor(side: 0 | 1, read: PlyRead): number {
+  if (read.wdlWhite) return side === 1 ? read.wdlWhite[0] : read.wdlWhite[2];
+  const q = side === 1 ? read.rootEval : -read.rootEval;
+  return (q + 1) / 2;
 }
 
 /** Severity of a played move. Deliberately three grades, not five: at review
@@ -36,18 +48,23 @@ export interface ReviewedMove {
   side: 0 | 1;
   evalBefore: number;
   evalAfter: number | null;
-  /** Eval given up by this move, from the mover's POV. Positive is worse. */
+  /** Percentage points of winning chance the mover gave up. Positive is worse.
+   *
+   *  Points rather than eval units because "this cost you 6 points of winning
+   *  chances" is a sentence, and "−0.12" is a unit you have to be taught. The
+   *  two are the same measurement — `Δwin ≈ Δeval / 2` at a fixed draw share —
+   *  so the bands below are the old ones restated, not loosened. */
   loss: number;
   quality: MoveQuality;
   bestIdx: number;
   bestNotation: string | null;
 }
 
-/** Eval given up, in [0, 2] units of the searched Q. The bands are wide
- *  because the underlying eval is a 3M-parameter network at a few hundred
+/** Winning chance given up, in percentage points. The bands are wide because
+ *  the underlying estimate is a 3M-parameter network at a few hundred
  *  simulations, not a tablebase. */
-const INACCURACY = 0.08;
-const BLUNDER = 0.2;
+const INACCURACY = 4;
+const BLUNDER = 10;
 
 export function classify(loss: number, played: number, best: number): MoveQuality {
   if (played === best) return "best";
@@ -116,14 +133,14 @@ export async function sweepGame(opts: SweepOptions): Promise<PlyRead[]> {
     if (!res) break;
     reads.push({
       ply,
-      rootEval: res.rootEval,
-      wdlWhite: res.rootNet?.wdlWhite ?? null,
-      expectedScoreWhite: res.rootNet?.expectedScoreWhite ?? null,
-      bestIdx: res.bestIdx,
-      topMoves: res.topMoves,
+      rootEval: res.snapshot.rootEval,
+      wdlWhite: res.snapshot.rootWdlWhite,
+      expectedScoreWhite: res.snapshot.rootMarginWhite,
+      bestIdx: res.snapshot.bestIdx,
+      topMoves: res.snapshot.topMoves,
     });
     opts.onProgress?.(ply + 1, total);
-    if (res.bestIdx < 0) break; // terminal
+    if (res.snapshot.bestIdx < 0) break; // terminal
   }
   return reads;
 }
@@ -142,11 +159,14 @@ export function reviewMoves(
     if (!before) break;
     const after = reads[i + 1] ?? null;
     const side: 0 | 1 = i % 2 === 0 ? 0 : 1;
-    // Q is White's POV throughout; flip it for Black so "loss" always means
-    // the player to move made things worse for themselves.
-    const sign = side === 1 ? 1 : -1;
+    // Both reads are taken from the mover's side, so "loss" always means the
+    // player to move made things worse for themselves — and it survives the
+    // change of turn, because `wdlWhite` names its sides rather than relying
+    // on whose move it is.
     const loss =
-      after === null ? 0 : sign * before.rootEval - sign * after.rootEval;
+      after === null
+        ? 0
+        : (winChanceFor(side, before) - winChanceFor(side, after)) * 100;
     const bestIdx = before.bestIdx;
     out.push({
       ply: i,

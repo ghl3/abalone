@@ -6,6 +6,7 @@ import PlayerPlate from "./PlayerPlate";
 import EvalGraph from "./EvalGraph";
 import { buildHoverPreview } from "@/lib/boardPreview";
 import { useEngine } from "@/lib/engine/useEngine";
+import { SIDE_TINT, formatMargin, percent, tintFor } from "@/lib/outcomeFormat";
 import type { Opening } from "@/lib/engine/protocol";
 import {
   QUALITY_COLOR,
@@ -38,6 +39,7 @@ interface Props {
  *  not — but still low enough that a 60-move game sweeps in a few seconds. */
 const REVIEW_SIMS = 200;
 const NN_BATCH_SIZE = 16;
+const SIDE_NAME = ["Black", "White"] as const;
 
 export default function ReviewView({ wasm, game, onExit }: Props) {
   const engine = useEngine();
@@ -158,9 +160,7 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
   const bottomSide: 0 | 1 = flipped ? 0 : 1;
   const name = (s: 0 | 1) =>
     game.playerSide === null
-      ? s === 0
-        ? "Black"
-        : "White"
+      ? SIDE_NAME[s]
       : s === game.playerSide
         ? "You"
         : "Network";
@@ -169,7 +169,10 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
     <PlayerPlate
       side={s}
       name={name(s)}
-      detail={s === 0 ? "Black" : "White"}
+      // Only when it adds something. A game played by hand on both sides has
+      // no "you", so `name` is already the colour and the detail line was
+      // rendering "Black" under "Black".
+      detail={name(s) === SIDE_NAME[s] ? undefined : SIDE_NAME[s]}
       captures={s === 1 ? snapshot.lostBlack : snapshot.lostWhite}
       isTurn={snapshot.turn === s}
     />
@@ -328,23 +331,48 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
               color: "var(--muted)",
               borderTop: "1px solid var(--border)",
               paddingTop: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 3,
             }}
           >
-            engine wants{" "}
-            <span
-              style={{ color: "var(--accent)", cursor: "pointer" }}
-              onMouseEnter={() => setHoveredIdx(read.bestIdx)}
-              onMouseLeave={() => setHoveredIdx(null)}
-            >
-              {read.bestIdx >= 0 ? wasm.move_notation(read.bestIdx) : "—"}
-            </span>
-            {read.expectedScoreWhite != null && (
-              <>
-                {" · "}
-                {read.expectedScoreWhite >= 0 ? "+" : ""}
-                {read.expectedScoreWhite.toFixed(1)} marbles (White)
-              </>
-            )}
+            <div>
+              engine wants{" "}
+              <span
+                style={{ color: "var(--accent)", cursor: "pointer" }}
+                onMouseEnter={() => setHoveredIdx(read.bestIdx)}
+                onMouseLeave={() => setHoveredIdx(null)}
+              >
+                {read.bestIdx >= 0 ? wasm.move_notation(read.bestIdx) : "—"}
+              </span>
+            </div>
+            <div style={{ fontSize: 10, display: "flex", gap: 8 }}>
+              {read.wdlWhite && (
+                <>
+                  <span>
+                    White{" "}
+                    <span style={{ color: SIDE_TINT.white }}>
+                      {percent(read.wdlWhite[0])}
+                    </span>
+                  </span>
+                  <span>draw {percent(read.wdlWhite[1])}</span>
+                  <span>
+                    Black{" "}
+                    <span style={{ color: SIDE_TINT.black }}>
+                      {percent(read.wdlWhite[2])}
+                    </span>
+                  </span>
+                </>
+              )}
+              {read.expectedScoreWhite != null && (
+                <span>
+                  <span style={{ color: tintFor(read.expectedScoreWhite) }}>
+                    {formatMargin(read.expectedScoreWhite)}
+                  </span>{" "}
+                  marbles
+                </span>
+              )}
+            </div>
           </div>
         )}
 
@@ -409,14 +437,19 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
                     {label}
                   </span>
                 )}
+                {/* Winning chance handed over, in percentage points. Below
+                    half a point there is nothing to report: at review depth
+                    that is noise, and a column of "-0.3" on every move would
+                    bury the two moves that mattered. */}
                 <span
                   style={{
-                    color: m.loss > 0.08 ? "var(--illegal)" : "var(--faint)",
+                    color: m.loss >= 4 ? "var(--illegal)" : "var(--faint)",
                     minWidth: 40,
                     textAlign: "right",
                   }}
+                  title="Winning chance given up by this move"
                 >
-                  {m.loss > 0.005 ? `-${m.loss.toFixed(2)}` : ""}
+                  {m.loss >= 0.5 ? `-${Math.round(m.loss)}%` : ""}
                 </span>
               </div>
             );

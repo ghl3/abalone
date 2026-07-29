@@ -142,6 +142,11 @@ impl SelfPlayConfig {
             fpu_reduction: self.fpu_reduction,
             dirichlet_alpha: self.dirichlet_alpha,
             dirichlet_eps: self.dirichlet_eps,
+            // Off, and stated rather than defaulted: self-play runs the
+            // AlphaZero search and nothing else. The outcome accumulators are
+            // a browser analysis readout — they cost memory per node and
+            // produce data no training target consumes.
+            track_outcome_stats: false,
         }
     }
 
