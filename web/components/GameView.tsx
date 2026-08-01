@@ -16,6 +16,7 @@ import PlayerPlate from "./PlayerPlate";
 import { buildHoverPreview } from "@/lib/boardPreview";
 import ReviewView, { type ReviewGame } from "./ReviewView";
 import { useEngine } from "@/lib/engine/useEngine";
+import { loadSession, saveSession } from "@/lib/session";
 import type {
   AiSide,
   Opening,
@@ -170,6 +171,103 @@ export default function GameView() {
       cancelled = true;
     };
   }, []);
+
+  // Restore the persisted session, once the wasm module is here to vouch for
+  // it. Trust comes from replaying with legality checks, not from parsing: a
+  // stale or hand-edited record that merely *parses* would otherwise reach
+  // `apply_index`, whose behaviour on illegal indices is debug-asserted —
+  // that is, undefined in the release build. Nothing restores unless every
+  // move in it was legal in sequence under today's rules.
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    if (!wasm || hydrated) return;
+    const s = loadSession();
+    if (s) {
+      const replays = (o: Opening, moves: number[]): boolean => {
+        if (!Array.isArray(moves)) return false;
+        if (!moves.every((m) => Number.isInteger(m) && m >= 0)) return false;
+        const g =
+          o === "belgian" ? wasm.WasmGame.belgian_daisy() : new wasm.WasmGame();
+        try {
+          for (const idx of moves) {
+            if (!g.legal_indices().includes(idx)) return false;
+            g.apply_index(idx);
+          }
+          return true;
+        } catch {
+          return false;
+        } finally {
+          g.free();
+        }
+      };
+      const openingOk = s.opening === "standard" || s.opening === "belgian";
+      // The future replays *after* the history, reversed: it is the redo
+      // stack, newest last, and that is exactly the line redo would walk.
+      const gameOk =
+        openingOk &&
+        Array.isArray(s.future) &&
+        replays(s.opening, [...s.history, ...[...s.future].reverse()]);
+      if (gameOk) {
+        setOpening(s.opening);
+        setHistory(s.history);
+        setFuture(s.future);
+        if (s.playerSide === 0 || s.playerSide === 1) setPlayerSide(s.playerSide);
+        const diff = DIFFICULTIES.find((d) => d.key === s.difficulty);
+        if (diff) setDifficulty(diff.key);
+        const dep = DEPTHS.find((d) => d.key === s.depth);
+        if (dep) setDepth(dep.key);
+        setAnalysisFlipped(s.analysisFlipped === true);
+        const reviewOk =
+          s.review != null &&
+          (s.review.opening === "standard" || s.review.opening === "belgian") &&
+          (s.review.playerSide === 0 ||
+            s.review.playerSide === 1 ||
+            s.review.playerSide === null) &&
+          (typeof s.review.difficulty === "string" ||
+            s.review.difficulty === null) &&
+          s.review.moves.length > 0 &&
+          replays(s.review.opening, s.review.moves);
+        if (reviewOk) setReview(s.review);
+        if (
+          s.mode === "play" ||
+          s.mode === "analysis" ||
+          (s.mode === "review" && reviewOk)
+        ) {
+          setMode(s.mode);
+        }
+      }
+    }
+    setHydrated(true);
+  }, [wasm, hydrated]);
+
+  // ...and persist it on every change after that. Gated on `hydrated` so the
+  // defaults of a mounting component cannot clobber the session they are
+  // about to be replaced by.
+  useEffect(() => {
+    if (!hydrated) return;
+    saveSession({
+      opening,
+      history,
+      future,
+      mode,
+      playerSide,
+      difficulty,
+      depth,
+      analysisFlipped,
+      review,
+    });
+  }, [
+    hydrated,
+    opening,
+    history,
+    future,
+    mode,
+    playerSide,
+    difficulty,
+    depth,
+    analysisFlipped,
+    review,
+  ]);
 
   const game = useMemo(() => {
     if (!wasm) return null;
@@ -1031,7 +1129,7 @@ export default function GameView() {
         }}
       >
         {reviewing
-          ? "Scrub with the slider or the ← → keys. Click the graph or a move to jump there; hover a flagged move to see what the engine wanted instead."
+          ? "Scrub with the slider or the ← → keys. Click the graph or a move to jump to the position it was played from — the panel shows every move the engine weighed there, with yours tagged. Hover one to see it; hover along its line to walk the board forward."
           : playing
             ? "Click a marble to select it, or click along a line for a 2- or 3-piece group. Drag to move — the group snaps onto a legal landing when you get close."
             : "Drag a marble, or click along a line for a 2- or 3-piece group. Hover a suggested move to see it on the board and click to play it; hover along its line to walk the board forward. ← → step, F flips."}

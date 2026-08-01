@@ -18,10 +18,14 @@ export type EngineStatus = "idle" | "loading" | "ready" | "error";
  *  position's panel. */
 export type ProgressHandler = (p: ProgressMsg) => void;
 
+/** The model every part of the app runs unless told otherwise. Exported for
+ *  the review cache, which keys on this file's identity. */
+export const DEFAULT_MODEL_PATH = "/models/best.onnx";
+
 /** Drives the engine worker. The worker is created on first use rather than on
  *  mount, so a visitor who never turns the network on never downloads the
  *  12 MB runtime or the 12 MB model. */
-export function useEngine(modelPath = "/models/best.onnx") {
+export function useEngine(modelPath = DEFAULT_MODEL_PATH) {
   const workerRef = useRef<Worker | null>(null);
   const [status, setStatus] = useState<EngineStatus>("idle");
   const [info, setInfo] = useState<ReadyMsg | null>(null);

@@ -1,14 +1,31 @@
 "use client";
 
 import { useState } from "react";
+import { formatMargin } from "@/lib/outcomeFormat";
 import { QUALITY_COLOR, type PlyRead, type ReviewedMove } from "@/lib/engine/review";
 
 /** Bare number — the tooltip is tight and already says which side each is. */
 const pct = (p: number) => `${Math.round(p * 100)}`;
 
-/** Marble counts are small integers, so they get a sign rather than a decimal;
- *  `±0` says "level" without claiming a direction it does not have. */
-const signedInt = (n: number) => (n > 0 ? `+${n}` : n < 0 ? `${n}` : "±0");
+/** Parity filter for the plotted curves: `[1, 2, 1] / 4`, edges clamped.
+ *
+ *  Measured, not assumed (review-probe, docs/NOTEBOOK.md 2026-07-30): each
+ *  fresh search revises the position toward the side about to move by
+ *  +0.9…+1.8 points of expected score *even when the move played was that
+ *  search's own best pick*, and ~90% of all transitions lean the new mover's
+ *  way. Every read is optimistic for its mover — the most-visited child's Q
+ *  is a max-biased estimate, and the depth barely helps (the bias at 800
+ *  simulations is within noise of 200) — so the raw series carries a
+ *  per-ply sawtooth that is a property of the estimator, not of the game.
+ *  The sqrt axis below then amplifies it ~5× near the centreline, which is
+ *  where real games live.
+ *
+ *  A binomial 3-tap has zero gain at exactly the alternating frequency, so
+ *  it removes what the measurement showed to be artefact while leaving
+ *  trends and multi-ply swings standing. The tooltip keeps quoting the raw
+ *  searched numbers; only the drawn shape is filtered. */
+const smooth = (vals: number[]): number[] =>
+  vals.map((v, i) => ((vals[i - 1] ?? v) + 2 * v + (vals[i + 1] ?? v)) / 4);
 
 interface Props {
   reads: PlyRead[];
@@ -21,21 +38,18 @@ interface Props {
   /** Plies expected in total, so a partial sweep still lays out to full width
    *  instead of stretching and re-scaling as results arrive. */
   totalPlies: number;
-  /** Capture differential in each position, signed for White, straight off the
-   *  game record. Owes nothing to the sweep: it is what happened, not what the
-   *  search thinks will happen, which is the whole reason it earns its own
-   *  band. */
-  captureDiffs: number[];
 }
 
-/** Geometry is in viewBox units and the panel renders the box at roughly 0.6,
- *  so a 16-unit label lands at about 10px. Height is left to the aspect ratio
- *  (`height: auto`) rather than pinned: a fixed `height` with a 100% width
- *  letterboxes the drawing inside a taller box and wastes the difference. */
+/** Geometry is in viewBox units. The graph sits under the board and stretches
+ *  to its width, which renders the box at roughly full scale — so an 11-unit
+ *  label lands at about 10px, in keeping with the rest of the chrome. Height
+ *  is left to the aspect ratio (`height: auto`) rather than pinned: a fixed
+ *  `height` with a 100% width letterboxes the drawing inside a taller box and
+ *  wastes the difference. */
 const W = 520;
 const EVAL_H = 96;
 /** Room for the band's own caption, between the two plots. */
-const LABEL_H = 22;
+const LABEL_H = 20;
 const MARBLE_H = 44;
 const H = EVAL_H + LABEL_H + MARBLE_H;
 const PAD_Y = 6;
@@ -53,7 +67,6 @@ export default function EvalGraph({
   onSeek,
   upSide,
   totalPlies,
-  captureDiffs,
 }: Props) {
   const [hover, setHover] = useState<number | null>(null);
 
@@ -75,34 +88,46 @@ export default function EvalGraph({
   };
   const mid = y(0);
 
-  const pts = reads.map((r) => ({ x: x(r.ply), y: y(r.rootEval), read: r }));
+  // Reads arrive in ply order, so index and ply agree; the map is for the
+  // markers and cursor below, which look up by ply.
+  const smoothedEval = smooth(reads.map((r) => r.rootEval));
+  const evalAt = new Map(reads.map((r, i) => [r.ply, smoothedEval[i]]));
+  const pts = reads.map((r, i) => ({ x: x(r.ply), y: y(smoothedEval[i]) }));
   const line = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
   const lastX = pts[pts.length - 1].x;
   // Two areas clipped to their own half so the fill reads as "who is ahead"
   // rather than a single blob hanging off one edge.
   const area = `${line} L${lastX},${mid} L${pts[0].x},${mid} Z`;
 
-  // The marble band. Linear and stepped, deliberately unlike the curve above
-  // it: captures are discrete events at a known ply, and interpolating between
-  // them would draw a marble leaving the board over four moves. Scaled to the
-  // largest lead the game reached, floored at two so an early capture is a step
-  // rather than a spike to the ceiling — six marbles is the whole game, and a
-  // band fixed at ±6 leaves every real lead flat against the axis.
-  const diffs = captureDiffs.length > 0 ? captureDiffs : [0];
-  const peak = Math.max(2, ...diffs.map((d) => Math.abs(d)));
+  // The marble band: the sweep's expected final capture differential at every
+  // position. A prediction, exactly like the curve above it — it was the
+  // realised count for a while, which answered "what has happened" under a
+  // curve answering "what will happen" and the two disagreed whenever it
+  // mattered. Drawn continuous for the same reason: a forecast revises, it
+  // does not step. Scaled to the largest predicted lead, floored at two so a
+  // quiet game reads as flat rather than as noise stretched to the ceiling.
+  const rawMargins = reads.flatMap((r) =>
+    r.expectedScoreWhite == null
+      ? []
+      : [{ x: x(r.ply), v: r.expectedScoreWhite }]
+  );
+  // Same estimator, same backup, same mover optimism — same filter.
+  const smoothedMargins = smooth(rawMargins.map((p) => p.v));
+  const marginPts = rawMargins.map((p, i) => ({ x: p.x, v: smoothedMargins[i] }));
+  const peak = Math.max(2, ...marginPts.map((p) => Math.abs(p.v)));
   const mBase = EVAL_H + LABEL_H + MARBLE_H / 2;
-  const my = (d: number) =>
-    mBase - (Math.max(-peak, Math.min(peak, d * sign)) / peak) * (MARBLE_H / 2 - 3);
-  let mLine = `M0,${my(diffs[0])}`;
-  for (let p = 1; p < diffs.length; p++) {
-    mLine += ` L${x(p)},${my(diffs[p - 1])} L${x(p)},${my(diffs[p])}`;
-  }
-  const mLastX = x(diffs.length - 1);
-  const mArea = `${mLine} L${mLastX},${mBase} L0,${mBase} Z`;
+  const my = (v: number) =>
+    mBase - (Math.max(-peak, Math.min(peak, v * sign)) / peak) * (MARBLE_H / 2 - 3);
+  const mLine = marginPts
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${my(p.v)}`)
+    .join(" ");
+  const mArea =
+    marginPts.length > 0
+      ? `${mLine} L${marginPts[marginPts.length - 1].x},${mBase} L${marginPts[0].x},${mBase} Z`
+      : "";
 
   const active = hover ?? currentPly;
   const activeRead = reads.find((r) => r.ply === active);
-  const activeDiff = captureDiffs[active] ?? 0;
 
   const seekFromEvent = (e: React.PointerEvent<SVGSVGElement>) => {
     const box = e.currentTarget.getBoundingClientRect();
@@ -124,7 +149,7 @@ export default function EvalGraph({
       onPointerLeave={() => setHover(null)}
       onPointerDown={(e) => onSeek(seekFromEvent(e))}
       role="img"
-      aria-label={`Evaluation and marble lead across ${totalPlies} plies, positive is ${
+      aria-label={`Win probability and predicted marble lead across ${totalPlies} plies, positive is ${
         upSide === 0 ? "Black" : "White"
       }`}
     >
@@ -165,7 +190,9 @@ export default function EvalGraph({
           <circle
             key={m.ply}
             cx={x(m.ply + 1)}
-            cy={y(m.evalAfter ?? m.evalBefore)}
+            // On the drawn (filtered) curve, not the raw read — a marker
+            // floating off its own line reads as a second data series.
+            cy={y(evalAt.get(m.ply + 1) ?? m.evalAfter ?? m.evalBefore)}
             r={4}
             fill={QUALITY_COLOR[m.quality]}
             stroke="var(--surface)"
@@ -176,15 +203,19 @@ export default function EvalGraph({
 
       <text
         x={1}
-        y={EVAL_H + 15}
-        fontSize={15}
+        y={EVAL_H + 14}
+        fontSize={11}
         fill="var(--faint)"
         fontFamily="var(--mono)"
       >
-        marble lead
+        predicted marble lead
       </text>
-      <path d={mArea} fill={UP_FILL} opacity={0.34} clipPath="url(#eg-m-up)" />
-      <path d={mArea} fill={DOWN_FILL} opacity={0.42} clipPath="url(#eg-m-down)" />
+      {marginPts.length > 0 && (
+        <>
+          <path d={mArea} fill={UP_FILL} opacity={0.34} clipPath="url(#eg-m-up)" />
+          <path d={mArea} fill={DOWN_FILL} opacity={0.42} clipPath="url(#eg-m-down)" />
+        </>
+      )}
       <line
         x1="0"
         y1={mBase}
@@ -193,10 +224,19 @@ export default function EvalGraph({
         stroke="var(--border-strong)"
         strokeWidth={1}
       />
-      <path d={mLine} fill="none" stroke="var(--text)" strokeWidth={1.5} opacity={0.55} />
+      {marginPts.length > 0 && (
+        <path
+          d={mLine}
+          fill="none"
+          stroke="var(--text)"
+          strokeWidth={1.5}
+          opacity={0.55}
+        />
+      )}
 
       {/* One cursor for both plots: the point of stacking them on a shared x is
-          that a capture and the swing that paid for it line up vertically. */}
+          that a swing and the marbles it is expected to cost line up
+          vertically. */}
       <line
         x1={x(active)}
         y1={0}
@@ -209,7 +249,7 @@ export default function EvalGraph({
       {activeRead && (
         <circle
           cx={x(active)}
-          cy={y(activeRead.rootEval)}
+          cy={y(evalAt.get(active) ?? activeRead.rootEval)}
           r={4.5}
           fill="var(--accent)"
           stroke="var(--surface)"
@@ -219,33 +259,33 @@ export default function EvalGraph({
 
       {/* The curve is `P(win) − P(loss)`, so its *shape* is already a
           probability difference — but the readout says so in words rather than
-          making anyone decode a signed decimal. Sized against the 0.6 render
-          scale: the old 10-unit text arrived on screen at six pixels. */}
+          making anyone decode a signed decimal. The margin is formatted by the
+          same rule as everywhere else: marbles, signed for White. */}
       {hover !== null && activeRead && (
         <g
-          transform={`translate(${Math.min(W - 206, Math.max(2, x(hover) + 10))}, 6)`}
+          transform={`translate(${Math.min(W - 162, Math.max(2, x(hover) + 10))}, 6)`}
           pointerEvents="none"
         >
           <rect
-            width={204}
-            height={62}
+            width={160}
+            height={52}
             rx={5}
             fill="var(--surface-raised)"
             stroke="var(--border)"
           />
           <text
-            x={10}
-            y={21}
-            fontSize={15}
+            x={8}
+            y={15}
+            fontSize={11}
             fill="var(--faint)"
             fontFamily="var(--mono)"
           >
             ply {activeRead.ply}
           </text>
           <text
-            x={10}
-            y={39}
-            fontSize={16}
+            x={8}
+            y={31}
+            fontSize={12}
             fill="var(--text)"
             fontFamily="var(--mono)"
           >
@@ -255,15 +295,17 @@ export default function EvalGraph({
                 )} B ${pct(activeRead.wdlWhite[2])}`
               : `${activeRead.rootEval >= 0 ? "+" : ""}${activeRead.rootEval.toFixed(2)}`}
           </text>
-          <text
-            x={10}
-            y={56}
-            fontSize={15}
-            fill="var(--faint)"
-            fontFamily="var(--mono)"
-          >
-            marbles {signedInt(activeDiff)}
-          </text>
+          {activeRead.expectedScoreWhite != null && (
+            <text
+              x={8}
+              y={46}
+              fontSize={11}
+              fill="var(--faint)"
+              fontFamily="var(--mono)"
+            >
+              marbles {formatMargin(activeRead.expectedScoreWhite)}
+            </text>
+          )}
         </g>
       )}
     </svg>

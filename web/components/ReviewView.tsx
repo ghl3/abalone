@@ -4,10 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import HexBoard, { DIR_SHIFTS, type LastMove, type MovingState } from "./HexBoard";
 import PlayerPlate from "./PlayerPlate";
 import EvalGraph from "./EvalGraph";
+import MoveTable, { type MoveRowData } from "./MoveTable";
 import { buildHoverPreview } from "@/lib/boardPreview";
 import { useEngine } from "@/lib/engine/useEngine";
-import { SIDE_TINT, formatMargin, percent, tintFor } from "@/lib/outcomeFormat";
+import { formatMargin, tintFor } from "@/lib/outcomeFormat";
 import type { Opening } from "@/lib/engine/protocol";
+import { loadReview, reviewKey, saveReview } from "@/lib/engine/reviewCache";
 import {
   INACCURACY_POINTS,
   QUALITY_COLOR,
@@ -50,7 +52,9 @@ interface Props {
  *  4× sweep buys the feature its premise.
  *
  *  Not free: the sweep is one search per position, so a 60-move game is 4× the
- *  work it was. The progress bar was already there; this is what it is for. */
+ *  work it was. The progress bar was already there; this is what it is for —
+ *  and a finished sweep is cached (reviewCache.ts), so it is paid once per
+ *  game per model rather than once per page load. */
 const REVIEW_SIMS = 800;
 const NN_BATCH_SIZE = 16;
 const SIDE_NAME = ["Black", "White"] as const;
@@ -61,6 +65,12 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
   const [done, setDone] = useState(0);
   const [ply, setPly] = useState(0);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  /** A move within a shown line, being previewed on the board: the line's move
+   *  indices and how far along it to replay. Same shape as analysis. */
+  const [linePreview, setLinePreview] = useState<{
+    moves: number[];
+    step: number;
+  } | null>(null);
 
   const total = game.moves.length + 1;
   const upSide: 0 | 1 = game.playerSide ?? 1;
@@ -71,29 +81,56 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
     let cancelled = false;
     setReads([]);
     setDone(0);
-    sweepGame({
-      opening: game.opening,
-      moves: game.moves,
-      simulations: REVIEW_SIMS,
-      batchSize: NN_BATCH_SIZE,
-      search,
-      isCancelled: () => cancelled,
-      onProgress: (d) => {
-        if (!cancelled) setDone(d);
-      },
-    }).then((r) => {
-      if (!cancelled) setReads(r);
-    });
+    (async () => {
+      // The cache is consulted under the model's identity, which needs one
+      // HEAD request the first time; after that this is synchronous in
+      // practice. A hit skips the sweep entirely — same reads, no work.
+      const key = await reviewKey({
+        opening: game.opening,
+        moves: game.moves,
+        sims: REVIEW_SIMS,
+      });
+      if (cancelled) return;
+      const cached = loadReview(key);
+      if (cached) {
+        setReads(cached);
+        setDone(total);
+        return;
+      }
+      const r = await sweepGame({
+        opening: game.opening,
+        moves: game.moves,
+        simulations: REVIEW_SIMS,
+        batchSize: NN_BATCH_SIZE,
+        search,
+        isCancelled: () => cancelled,
+        onProgress: (d) => {
+          if (!cancelled) setDone(d);
+        },
+      });
+      if (cancelled) return;
+      setReads(r);
+      // Only a finished sweep is worth remembering: it either read every
+      // position or stopped at a terminal one. A sweep abandoned mid-game
+      // would otherwise be served forever as if it were the whole answer.
+      const complete =
+        r.length === total || (r.length > 0 && r[r.length - 1].bestIdx < 0);
+      if (complete) saveReview(key, r);
+    })();
     return () => {
       cancelled = true;
     };
-  }, [game, search]);
+  }, [game, search, total]);
 
   // Everything the board needs, derived in one pass that creates the position,
   // reads it, and frees it before returning. Holding a wasm handle across
   // renders and freeing it from an effect is what produced "null pointer
   // passed to rust": React's strict-mode remount runs the unmount cleanup and
   // then reuses the memoised handle it just freed. Plain data cannot dangle.
+  //
+  // A hovered line replays here too — the game to `ply`, then the line as far
+  // as the pointer has walked it — so the board, the plates and the turn light
+  // all describe the previewed position for free.
   const view = useMemo(() => {
     const g =
       game.opening === "belgian"
@@ -101,18 +138,27 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
         : new wasm.WasmGame();
     try {
       for (let i = 0; i < ply; i++) g.apply_index(game.moves[i]);
+      const lineMoves = linePreview
+        ? linePreview.moves.slice(0, linePreview.step + 1)
+        : [];
+      for (const idx of lineMoves) g.apply_index(idx);
 
       const cells = new Int8Array(81);
       for (let c = 0; c < 81; c++) cells[c] = g.cell(c);
       const turn = g.turn() as 0 | 1;
 
+      const lastIdx =
+        lineMoves.length > 0
+          ? lineMoves[lineMoves.length - 1]
+          : ply > 0
+            ? game.moves[ply - 1]
+            : null;
       let lastMove: LastMove | null = null;
-      if (ply > 0) {
-        const idx = game.moves[ply - 1];
-        const from = Array.from(g.move_source_cells(idx)).filter(
+      if (lastIdx != null) {
+        const from = Array.from(g.move_source_cells(lastIdx)).filter(
           (c) => c !== 0xff
         );
-        const shift = DIR_SHIFTS[wasm.move_motion_dir(idx)];
+        const shift = DIR_SHIFTS[wasm.move_motion_dir(lastIdx)];
         lastMove = { fromCells: from, toCells: from.map((c) => c + shift) };
       }
 
@@ -120,7 +166,7 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
       // rather than in its own memo. Replaying a game costs microseconds; a
       // second lifetime to reason about does not.
       const suggestion: MovingState | null =
-        hoveredIdx == null
+        lineMoves.length > 0 || hoveredIdx == null
           ? null
           : buildHoverPreview(g, wasm, cells, turn, hoveredIdx);
 
@@ -131,43 +177,17 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
         lostWhite: g.lost(wasm.WasmSide.White),
         lastMove,
         suggestion,
+        lineDepth: lineMoves.length,
       };
     } finally {
       g.free();
     }
-  }, [wasm, game, ply, hoveredIdx]);
-
-  const snapshot = view;
-  const lastMove = view.lastMove;
-  const suggestion = view.suggestion;
+  }, [wasm, game, ply, hoveredIdx, linePreview]);
 
   const notations = useMemo(
     () => game.moves.map((m) => wasm.move_notation(m)),
     [game.moves, wasm]
   );
-
-  // Capture differential in every position, signed for White. One replay of the
-  // record, in the same freed-before-return shape as `view` above — this is
-  // ground truth off the game rather than anything the search produced, so it
-  // is complete from the first render and does not wait on the sweep.
-  const captureDiffs = useMemo(() => {
-    const g =
-      game.opening === "belgian"
-        ? wasm.WasmGame.belgian_daisy()
-        : new wasm.WasmGame();
-    try {
-      const diff = () =>
-        g.lost(wasm.WasmSide.Black) - g.lost(wasm.WasmSide.White);
-      const out = [diff()];
-      for (const m of game.moves) {
-        g.apply_index(m);
-        out.push(diff());
-      }
-      return out;
-    } finally {
-      g.free();
-    }
-  }, [wasm, game]);
 
   const reviewed = useMemo(
     () => reviewMoves(game.moves, notations, reads),
@@ -175,7 +195,12 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
   );
 
   const seek = useCallback(
-    (p: number) => setPly(Math.max(0, Math.min(total - 1, p))),
+    (p: number) => {
+      setPly(Math.max(0, Math.min(total - 1, p)));
+      // A previewed move or line belongs to the position it was read from.
+      setHoveredIdx(null);
+      setLinePreview(null);
+    },
     [total]
   );
 
@@ -211,8 +236,8 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
       // no "you", so `name` is already the colour and the detail line was
       // rendering "Black" under "Black".
       detail={name(s) === SIDE_NAME[s] ? undefined : SIDE_NAME[s]}
-      captures={s === 1 ? snapshot.lostBlack : snapshot.lostWhite}
-      isTurn={snapshot.turn === s}
+      captures={s === 1 ? view.lostBlack : view.lostWhite}
+      isTurn={view.turn === s}
     />
   );
 
@@ -239,8 +264,97 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
     (m) => game.playerSide === null || m.side === game.playerSide
   );
 
+  // Who moves from the position on screen — by parity off the record, not
+  // from `view`, which follows a hovered line: the panel describes the
+  // position the game was at, whatever the board is momentarily showing.
+  const baseTurn: 0 | 1 = ply % 2 === 0 ? 0 : 1;
+  const terminal = read !== null && read.bestIdx < 0;
+
+  // What the panel on the right shows: the searched candidates for this
+  // position, with the move actually played tagged and, when it fell outside
+  // the displayed five, appended at its true rank. `allMoves` covers every
+  // legal move precisely so that a human move — often nowhere near the top —
+  // still has a row to point at.
+  const panelRows = useMemo<MoveRowData[]>(() => {
+    if (!read || read.bestIdx < 0) return [];
+    const rows: MoveRowData[] = read.topMoves.map((m, i) => ({
+      move: m,
+      rank: i + 1,
+    }));
+    if (ply < game.moves.length) {
+      const playedIdx = game.moves[ply];
+      const quality = reviewed[ply]?.quality;
+      const tag = {
+        label: "played",
+        // The tag doubles as the verdict, in the same colours as the move
+        // list. "Good" has no colour of its own there (its label is empty),
+        // so it falls back to muted rather than to transparent text.
+        color:
+          quality && QUALITY_COLOR[quality] !== "transparent"
+            ? QUALITY_COLOR[quality]
+            : "var(--muted)",
+      };
+      const inTop = rows.find((r) => r.move.idx === playedIdx);
+      if (inTop) {
+        inTop.tag = tag;
+      } else {
+        const rank = read.allMoves.findIndex((m) => m.idx === playedIdx);
+        if (rank >= 0) {
+          const am = read.allMoves[rank];
+          rows.push({
+            move: {
+              idx: playedIdx,
+              notation: notations[ply],
+              evalWhite: am.evalWhite,
+              visits: am.visits,
+              // The sweep keeps full outcome rows only for the top five; the
+              // table prints "·" for what was not retained.
+              wdlWhite: null,
+              marginWhite: null,
+              pv: [],
+              pvNotation: [],
+            },
+            rank: rank + 1,
+            tag,
+          });
+        }
+      }
+    }
+    return rows;
+  }, [read, ply, game.moves, notations, reviewed]);
+
+  const handleHover = useCallback((idx: number | null) => {
+    setHoveredIdx(idx);
+    if (idx === null) setLinePreview(null);
+  }, []);
+
+  const handleHoverLine = useCallback(
+    (rootIdx: number, step: number | null) => {
+      if (step === null) {
+        setLinePreview(null);
+        return;
+      }
+      const row = panelRows.find((r) => r.move.idx === rootIdx);
+      if (row && row.move.pv.length > 0) {
+        setLinePreview({ moves: row.move.pv, step });
+      }
+    },
+    [panelRows]
+  );
+
   return (
-    <div style={{ display: "flex", gap: 18, alignItems: "flex-start" }}>
+    <div
+      style={{
+        display: "flex",
+        gap: 18,
+        alignItems: "flex-start",
+        justifyContent: "center",
+        flexWrap: "wrap",
+      }}
+    >
+      {/* The game, top to bottom in the order you read it: position (board),
+          trajectory (graph), record (move list). All three share an x — click
+          anywhere in any of them and the other two follow. */}
       <div
         style={{
           display: "flex",
@@ -251,10 +365,10 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
       >
         {plate(topSide)}
         <HexBoard
-          cells={snapshot.cells}
+          cells={view.cells}
           selection={[]}
-          moving={suggestion}
-          lastMove={lastMove}
+          moving={view.suggestion}
+          lastMove={view.lastMove}
           onCellPointerDown={() => {}}
           flipped={flipped}
           idle
@@ -295,234 +409,282 @@ export default function ReviewView({ wasm, game, onExit }: Props) {
             {ply}/{total - 1}
           </span>
         </div>
+
+        {/* Fixed height whether or not a line is being walked, so the panel
+            below does not jump when a hover starts. */}
+        <div
+          style={{
+            height: 14,
+            fontSize: 11,
+            color: "var(--highlight)",
+            padding: "0 2px",
+          }}
+        >
+          {view.lineDepth > 0 &&
+            `showing the line, ${view.lineDepth} move${
+              view.lineDepth === 1 ? "" : "s"
+            } ahead`}
+        </div>
+
+        <div
+          className="panel"
+          style={{
+            alignSelf: "stretch",
+            padding: "12px 14px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Game review</div>
+            <button
+              className="btn"
+              style={{ padding: "3px 8px", fontSize: 11 }}
+              onClick={onExit}
+            >
+              Close
+            </button>
+          </div>
+
+          {sweeping ? (
+            <div style={{ fontSize: 12, color: "var(--muted)" }}>
+              Analysing {done}/{total} positions…
+              <div
+                style={{
+                  marginTop: 6,
+                  height: 3,
+                  borderRadius: 2,
+                  background: "var(--well)",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${(done / total) * 100}%`,
+                    height: "100%",
+                    background: "var(--accent)",
+                    transition: "width 200ms",
+                  }}
+                />
+              </div>
+            </div>
+          ) : (
+            <>
+              <EvalGraph
+                reads={reads}
+                moves={reviewed}
+                currentPly={ply}
+                onSeek={seek}
+                upSide={upSide}
+                totalPlies={total}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: 10,
+                  color: "var(--faint)",
+                }}
+              >
+                <span>▲ {name(upSide)} ahead</span>
+                <span>▼ {name(upSide === 0 ? 1 : 0)} ahead</span>
+              </div>
+            </>
+          )}
+
+        </div>
       </div>
 
+      {/* The position and the record share the right column: what the options
+          were, then where the game went. The list used to sit under the graph,
+          which pushed it below the fold — the record is consulted constantly
+          while scrubbing, and it belongs beside the board, not beneath it. */}
       <div
-        className="panel"
         style={{
-          width: 340,
-          alignSelf: "stretch",
-          padding: 14,
+          width: 360,
           display: "flex",
           flexDirection: "column",
-          gap: 10,
+          gap: 18,
         }}
       >
         <div
+          className="panel"
           style={{
+            padding: 14,
             display: "flex",
-            justifyContent: "space-between",
-            alignItems: "baseline",
+            flexDirection: "column",
+            gap: 10,
           }}
         >
-          <div style={{ fontSize: 13, fontWeight: 600 }}>Game review</div>
-          <button
-            className="btn"
-            style={{ padding: "3px 8px", fontSize: 11 }}
-            onClick={onExit}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+            }}
           >
-            Close
-          </button>
-        </div>
-
-        {sweeping ? (
-          <div style={{ fontSize: 12, color: "var(--muted)" }}>
-            Analysing {done}/{total} positions…
-            <div
-              style={{
-                marginTop: 6,
-                height: 3,
-                borderRadius: 2,
-                background: "var(--well)",
-                overflow: "hidden",
-              }}
-            >
+            <div style={{ fontSize: 13, fontWeight: 600 }}>
+              {terminal ? "Game over" : `${SIDE_NAME[baseTurn]} to move`}
+            </div>
+            {read?.expectedScoreWhite != null && (
               <div
                 style={{
-                  width: `${(done / total) * 100}%`,
-                  height: "100%",
-                  background: "var(--accent)",
-                  transition: "width 200ms",
+                  fontSize: 11,
+                  color: "var(--muted)",
+                  fontFamily: "var(--mono)",
                 }}
-              />
-            </div>
+                title="Expected final capture differential for this position, White-positive. Searched, from the engine's intended line."
+              >
+                <span style={{ color: tintFor(read.expectedScoreWhite) }}>
+                  {formatMargin(read.expectedScoreWhite)}
+                </span>{" "}
+                marbles
+              </div>
+            )}
           </div>
-        ) : (
-          <>
-            <div style={{ fontSize: 11, color: "var(--muted)" }}>
-              {yourBlunders.length === 0
+
+          <MoveTable
+            rows={panelRows}
+            hoveredIdx={hoveredIdx}
+            onHover={handleHover}
+            onHoverLine={handleHoverLine}
+            emptyText={
+              sweeping
+                ? "Analysing…"
+                : terminal
+                  ? "Game over — no moves to search."
+                  : "This position was not analysed."
+            }
+          />
+
+          <div
+            style={{
+              paddingTop: 8,
+              borderTop: "1px solid var(--border)",
+              color: "var(--faint)",
+              fontSize: 10,
+              lineHeight: 1.5,
+            }}
+          >
+            Chances of each result, and the margin in marbles, after each move —
+            searched at review depth, {REVIEW_SIMS} simulations per position.
+            Hover a move to see it on the board; hover along its line to walk
+            forward.
+          </div>
+        </div>
+
+        <div
+          className="panel"
+          style={{
+            padding: "10px 8px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <div style={{ fontSize: 11, color: "var(--muted)", padding: "0 6px" }}>
+            {sweeping
+              ? "Moves grade as the sweep reaches them."
+              : yourBlunders.length === 0
                 ? "No blunders found."
                 : `${yourBlunders.length} blunder${
                     yourBlunders.length === 1 ? "" : "s"
                   } — click one to jump there.`}
-            </div>
-            <EvalGraph
-              reads={reads}
-              moves={reviewed}
-              currentPly={ply}
-              onSeek={seek}
-              upSide={upSide}
-              totalPlies={total}
-              captureDiffs={captureDiffs}
-            />
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                fontSize: 10,
-                color: "var(--faint)",
-                // Was pulled up by 6 to close a gap the svg no longer leaves:
-                // it used to be a fixed-height box letterboxing a 0.6-scale
-                // drawing, and the slack under the curve was padding by
-                // accident. Both bands sit flush now.
-                marginTop: 0,
-              }}
-            >
-              <span>▲ {name(upSide)} ahead</span>
-              <span>▼ {name(upSide === 0 ? 1 : 0)} ahead</span>
-            </div>
-          </>
-        )}
-
-        {read && (
+          </div>
           <div
+            ref={listRef}
             style={{
-              fontFamily: "var(--mono)",
-              fontSize: 11,
-              color: "var(--muted)",
-              borderTop: "1px solid var(--border)",
-              paddingTop: 8,
               display: "flex",
               flexDirection: "column",
-              gap: 3,
+              gap: 1,
+              overflowY: "auto",
+              maxHeight: 330,
+              borderTop: "1px solid var(--border)",
+              paddingTop: 6,
             }}
           >
-            <div>
-              engine wants{" "}
-              <span
-                style={{ color: "var(--accent)", cursor: "pointer" }}
-                onMouseEnter={() => setHoveredIdx(read.bestIdx)}
-                onMouseLeave={() => setHoveredIdx(null)}
-              >
-                {read.bestIdx >= 0 ? wasm.move_notation(read.bestIdx) : "—"}
-              </span>
-            </div>
-            <div style={{ fontSize: 10, display: "flex", gap: 8 }}>
-              {read.wdlWhite && (
-                <>
-                  <span>
-                    White{" "}
-                    <span style={{ color: SIDE_TINT.white }}>
-                      {percent(read.wdlWhite[0])}
-                    </span>
-                  </span>
-                  <span>draw {percent(read.wdlWhite[1])}</span>
-                  <span>
-                    Black{" "}
-                    <span style={{ color: SIDE_TINT.black }}>
-                      {percent(read.wdlWhite[2])}
-                    </span>
-                  </span>
-                </>
-              )}
-              {read.expectedScoreWhite != null && (
-                <span>
-                  <span style={{ color: tintFor(read.expectedScoreWhite) }}>
-                    {formatMargin(read.expectedScoreWhite)}
-                  </span>{" "}
-                  marbles
-                </span>
-              )}
-            </div>
-          </div>
-        )}
-
-        <div
-          ref={listRef}
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 1,
-            overflowY: "auto",
-            maxHeight: 340,
-            marginTop: 2,
-          }}
-        >
-          {reviewed.map((m) => {
-            const isCurrent = m.ply === ply - 1;
-            const label = QUALITY_LABEL[m.quality];
-            return (
-              <div
-                key={m.ply}
-                ref={isCurrent ? currentRowRef : undefined}
-                onClick={() => seek(m.ply + 1)}
-                onMouseEnter={() =>
-                  m.quality !== "best" && m.bestIdx >= 0
-                    ? setHoveredIdx(m.bestIdx)
-                    : undefined
-                }
-                onMouseLeave={() => setHoveredIdx(null)}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "26px 14px 1fr auto auto",
-                  gap: 6,
-                  alignItems: "center",
-                  padding: "4px 6px",
-                  borderRadius: 4,
-                  cursor: "pointer",
-                  fontSize: 12,
-                  fontFamily: "var(--mono)",
-                  background: isCurrent ? "var(--accent-soft)" : "transparent",
-                }}
-              >
-                <span style={{ color: "var(--faint)" }}>{m.ply + 1}.</span>
-                <span
-                  aria-hidden
+            {reviewed.map((m) => {
+              // Clicking a move lands *before* it — the position it was
+              // played from, with the panel showing the choice that was
+              // open. The highlighted row is therefore the move about to be
+              // made, which is also the row the panel tags "played": the
+              // record and the candidates agree on what "here" means.
+              const isCurrent = m.ply === ply;
+              const label = QUALITY_LABEL[m.quality];
+              return (
+                <div
+                  key={m.ply}
+                  ref={isCurrent ? currentRowRef : undefined}
+                  onClick={() => seek(m.ply)}
                   style={{
-                    width: 9,
-                    height: 9,
-                    borderRadius: "50%",
-                    background:
-                      m.side === 0 ? "var(--black)" : "var(--white)",
-                    border: "1px solid var(--border-strong)",
+                    display: "grid",
+                    gridTemplateColumns: "26px 14px 1fr auto auto",
+                    gap: 6,
+                    alignItems: "center",
+                    padding: "4px 6px",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    fontSize: 12,
+                    fontFamily: "var(--mono)",
+                    background: isCurrent ? "var(--accent-soft)" : "transparent",
                   }}
-                />
-                <span>{m.notation}</span>
-                {label && (
+                >
+                  <span style={{ color: "var(--faint)" }}>{m.ply + 1}.</span>
+                  <span
+                    aria-hidden
+                    style={{
+                      width: 9,
+                      height: 9,
+                      borderRadius: "50%",
+                      background:
+                        m.side === 0 ? "var(--black)" : "var(--white)",
+                      border: "1px solid var(--border-strong)",
+                    }}
+                  />
+                  <span>{m.notation}</span>
+                  {label && (
+                    <span
+                      style={{
+                        color: QUALITY_COLOR[m.quality],
+                        fontSize: 10,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.04em",
+                      }}
+                    >
+                      {label}
+                    </span>
+                  )}
+                  {/* Expected score handed over, in points. Below half a point
+                      there is nothing to report: at review depth that is noise,
+                      and a column of "-0.3" on every move would bury the two
+                      moves that mattered. A move the engine itself picked reads
+                      zero and so prints nothing — the label has already said the
+                      only thing there is to say about it. */}
                   <span
                     style={{
-                      color: QUALITY_COLOR[m.quality],
-                      fontSize: 10,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.04em",
+                      color: m.loss >= INACCURACY_POINTS ? "var(--illegal)" : "var(--faint)",
+                      minWidth: 40,
+                      textAlign: "right",
                     }}
+                    title={
+                      m.lossBasis === "swing"
+                        ? "How much worse the position got across this move — measured across two searches, so it carries the engine's own second thoughts as well as yours"
+                        : "Expected score given up against the engine's best move, both read from the same search"
+                    }
                   >
-                    {label}
+                    {m.loss >= 0.5 ? `-${Math.round(m.loss)}%` : ""}
                   </span>
-                )}
-                {/* Expected score handed over, in points. Below half a point
-                    there is nothing to report: at review depth that is noise,
-                    and a column of "-0.3" on every move would bury the two
-                    moves that mattered. A move the engine itself picked reads
-                    zero and so prints nothing — the label has already said the
-                    only thing there is to say about it. */}
-                <span
-                  style={{
-                    color: m.loss >= INACCURACY_POINTS ? "var(--illegal)" : "var(--faint)",
-                    minWidth: 40,
-                    textAlign: "right",
-                  }}
-                  title={
-                    m.lossBasis === "swing"
-                      ? "How much worse the position got across this move — measured across two searches, so it carries the engine's own second thoughts as well as yours"
-                      : "Expected score given up against the engine's best move, both read from the same search"
-                  }
-                >
-                  {m.loss >= 0.5 ? `-${Math.round(m.loss)}%` : ""}
-                </span>
-              </div>
-            );
-          })}
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>

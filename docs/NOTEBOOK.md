@@ -23,6 +23,146 @@ gets its own dated document under `docs/` and the entry links to it.
 
 ---
 
+## 2026-07-30 — the graph's sawtooth is the estimator, not the game
+
+### Goal
+
+The review graph looked spiky, with an apparent discontinuity at every turn
+change. Establish whether that is a bug in the eval plumbing, real per-move
+signal, or something else — then tighten the review layout (move list up
+beside the board, graph stays under it).
+
+### What ran
+
+Code audit first: the POV chain (`mcts::result` negamax negation →
+`wasm` White-flip → worker snapshot) is coherent and test-asserted; each
+sweep search is a fresh tree with a deterministic per-position seed. No sign
+bug. Then measurement: `review-probe` on two 80-ply games (weak side
+alternating colours), swept at 200 and 800 simulations, 274 positions. For
+every transition p → p+1, the eval jump *signed for the side about to move
+at p+1*, split by whether the move producing it was the search's own best.
+
+### Results
+
+Jump toward the new mover, in points of expected score (game 0 / game 1):
+
+| | 200 sims | 800 sims |
+|---|---|---|
+| played **was** engine best | +1.04 / +1.80 | +0.93 / +1.25 |
+| played was not | +2.92 / +2.32 | +2.97 / +3.32 |
+| transitions favouring new mover | 87% / 76% | 89% / 90% |
+
+The first row is the verdict. When the move played was the search's *own
+pick*, a consistent estimator would average zero; instead every fresh search
+finds the position ~1–1.8 points better for whoever is about to move. The
+most-visited child's Q is a max-biased estimate for the mover, and 4× the
+simulations barely moves it — so part of it is the net's own learned
+optimism for the side to move, not just selection noise. Player error stacks
+on top *in the same alternating direction* (a mistake by the previous mover
+reads as a gain for the next), and the graph's sqrt axis then amplifies a
+±0.03-eval oscillation to ±22% of the half-band. Spiky, at every turn, by
+construction.
+
+### What changed
+
+- `EvalGraph` now draws both curves through a `[1,2,1]/4` binomial filter —
+  zero gain at exactly the per-ply alternating frequency, so it removes the
+  measured artefact and leaves trends and multi-ply swings standing.
+  Tooltip still quotes the raw searched numbers; markers and cursor ride the
+  drawn curve. On the browser smoke game the curve went from hash to a
+  legible trend, and that game is *random* moves — the worst case.
+- Not attempted: subtracting a fitted per-game bias (10–40 best-move
+  transitions per game, sd ≈ the mean — too noisy to estimate), or plotting
+  visit-weighted root Q instead of best-child Q (still mover-biased, loses
+  the "engine's intended line" semantics).
+- Layout: the move list moved out from under the graph into the right column
+  below the position panel — record beside the board, graph under it. Review
+  page height 1357 → 1066 px on the smoke game; everything relevant is now
+  above the fold at 1450×1003.
+
+### Next steps
+
+- The mover-optimism number (+1…+1.8 pts at 800 sims) is a property of the
+  *model + search*, worth re-measuring after the next real training run; if
+  it shrinks, the filter can stay (it is harmless on unbiased data).
+
+---
+
+## 2026-07-29 — review rebuilt around the position, cached across reloads
+
+### Goal
+
+Three asks against the review page: the graph's marble band should be the
+*predicted* lead, not the realised one; a move's alternatives should be
+visible, in the analysis view's own idiom (layout per discussion: Lichess-style
+— graph and move list under the board, position panel on the right); and a
+finished review should survive a page reload instead of re-running.
+
+### What changed
+
+- **Marble band is now the sweep's prediction.** `EvalGraph` plots
+  `expectedScoreWhite` (the searched score head) per position instead of
+  `captureDiffs` read off the record; the realised count still lives on the
+  player plates. Drawn continuous rather than stepped — a forecast revises, it
+  does not step — and captioned "predicted marble lead" so nobody has to
+  guess. The old band was realised *by design* (its comment argued "what
+  happened" earned its own band); that argument lost to the one it sat under:
+  a what-happened band directly below a what-will-happen curve disagreed
+  whenever it mattered.
+- **The candidate table is one component now** (`MoveTable.tsx`), extracted
+  from `AnalysisPanel` and rendered by both views: same columns
+  (W/D/B/marbles), same visit-share bars, same hover-preview and PV-walking.
+  Review feeds it from the sweep's stored `topMoves`/`allMoves` — no new
+  search, purely presentation of data the sweep already kept.
+- **The played move gets a row at its true rank.** If it is outside the top
+  five it is synthesised from `allMoves` (eval + visits; outcome columns print
+  "·" since only the top five retain full rows) and tagged `played` in its
+  quality colour. Rank 22-of-40 on screen is the lesson itself.
+- **Click semantics flipped:** clicking a move in the list or graph now lands
+  *before* it — the position it was played from — so the panel immediately
+  shows the choice that was open, tagged with what was chosen. The
+  highlighted list row is the move about to be made, which is also the row
+  the panel tags; the two agree on what "here" means.
+- **Reviews cache in localStorage** (`reviewCache.ts`), keyed on model
+  identity (ETag of `best.onnx` via HEAD request — promotion invalidates the
+  cache), opening, record, and sim count. Four entries kept, LRU by age.
+  Only complete sweeps are stored. Measured: reload-to-review-ready 0 ms vs a
+  full re-sweep (~90 s for 41 positions at 800 sims on webgpu).
+- **The session persists too** (`session.ts`): opening, history, redo stack,
+  mode, sides, review snapshot. Without it the cache was unreachable — the
+  game evaporated with the tab. Restore is validated by *replay with legality
+  checks* against wasm, not by parsing: `apply_index` on an illegal index is
+  debug-asserted, i.e. undefined in release, so nothing restores unless every
+  move was legal in sequence.
+
+### What ran
+
+`tsc --noEmit` clean; browser smoke test via a scratch Rust binary emitting a
+40-move legal random game (path-dep on `crates/game`, `move_index::encode`),
+seeded into the session, then driven through: restore → sweep → cache write →
+reload (instant, no re-sweep) → click-to-before-move → PV walk ("showing the
+line, 3 moves ahead") → hover ghost (6 reduced-opacity elements for a 3-marble
+inline move). Analysis view re-verified after the extraction.
+
+### Fixed en route
+
+Broadside notation ("H4-H5:SW") wrapped at its hyphen inside the tagged row,
+doubling row height: rank column 22→20px, column gap 8→6, `white-space:
+nowrap` on the notation cell. The old list-row hover previewed `bestIdx` on
+whatever position was showing — wrong whenever the row was not the current
+ply's — and is gone; the panel now owns previews, always against the position
+on screen.
+
+### Next steps
+
+- Reads land all at once when the sweep resolves; streaming them per-position
+  would let the graph fill left-to-right again (the comment in `review.ts`
+  still promises this).
+- The synthesised played-row keeps no W/D/B; retaining a sixth full row for
+  the played move during the sweep would fill the dots.
+
+---
+
 ## 2026-07-29 — the review charged players for the search's own noise
 
 ### Goal
